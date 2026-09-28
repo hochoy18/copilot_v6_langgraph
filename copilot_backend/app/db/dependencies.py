@@ -22,6 +22,7 @@ from app.auth.local import LocalLoginService
 from app.auth.login import OIDCLoginService, OIDCStateStore
 from app.auth.oidc import OIDCAdapter
 from app.auth.tokens import RefreshTokenService
+from app.conversations.service import ConversationService
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.credentials import CredentialRepository
@@ -218,4 +219,28 @@ def get_local_login_service(
         settings=settings,
         user_repository=user_repo,
         refresh_service=refresh_service,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Conversation service (T10 / #40)
+# ---------------------------------------------------------------------------
+
+
+def get_conversation_service(
+    conversation_repo: ConversationRepository = Depends(get_conversation_repository),  # noqa: B008
+    turn_repo: TurnRepository = Depends(get_turn_repository),  # noqa: B008
+    plan_repo: PlanRepository = Depends(get_plan_repository),  # noqa: B008
+) -> ConversationService:
+    """FastAPI dependency: build a `ConversationService` for this request.
+
+    Stateless beyond the three repository references; a fresh
+    instance per request is the same cost as a singleton. Tests
+    override this dependency to swap in a fixture-built instance
+    without touching the lifespan.
+    """
+    return ConversationService(
+        conversation_repository=conversation_repo,
+        turn_repository=turn_repo,
+        plan_repository=plan_repo,
     )

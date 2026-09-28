@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
+from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
 from app.auth.login import build_state_store
 from app.auth.oidc import OIDCAdapter
@@ -122,6 +123,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Routers
     app.include_router(health_router)
     app.include_router(auth_router)
+    # T10 / #40 — conversation CRUD endpoints
+    # (`POST /conversations`, `GET` list/detail, `POST /archive`).
+    # Lives after `auth_router` so the OpenAPI tag order reads
+    # auth → conversations; the load order has no runtime effect.
+    app.include_router(conversations_router)
     # T09 / #10 — `/admin/me` lives alongside the rest of the
     # auth-owned endpoints; `admin_router` (declared in `app.api.auth`)
     # owns the `admin` OpenAPI tag and groups the future admin-only

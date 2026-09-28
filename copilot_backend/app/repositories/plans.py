@@ -111,6 +111,26 @@ class PlanRepository(BaseRepository[Plan, PlanCreate, PlanUpdate]):
         cursor = self._collection.find({"turn_id": turn_id}).sort("created_at", -1)
         return [_to_read(doc) async for doc in cursor]
 
+    async def list_by_conversation(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[Plan]:
+        """Every Plan in a conversation, newest first.
+
+        T10's detail endpoint composes this with
+        `TurnRepository.list_by_conversation` to render the Frontend's
+        session-level history. Limit defaults to a defensive ceiling
+        (T11's audit / admin read path will widen this if needed).
+        """
+        cursor = (
+            self._collection.find({"conversation_id": conversation_id})
+            .sort("created_at", -1)
+            .limit(limit)
+        )
+        return [_to_read(doc) async for doc in cursor]
+
     async def list_by_status(self, status: PlanStatus) -> list[Plan]:
         """All Plans in a given lifecycle state.
 
