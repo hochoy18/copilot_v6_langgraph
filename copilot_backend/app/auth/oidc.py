@@ -40,11 +40,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import hmac
 import json
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -56,6 +55,7 @@ from app.auth.errors import (
     OIDCIDTokenInvalidError,
     OIDCTokenExchangeError,
 )
+from app.security.jwt import decode_jwt
 from app.settings import Settings
 
 # `code_verifier` length per RFC 7636 §4.1 — 43–128 chars of
@@ -231,7 +231,7 @@ class OIDCAdapter:
         settings: Settings,
         *,
         http_client: httpx.AsyncClient | None = None,
-        clock: Any = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._settings = settings
         self._owns_client = http_client is None
@@ -488,53 +488,47 @@ class OIDCAdapter:
             expected_nonce: the nonce bound to this login session.
                 Mismatch is a compromise signal (replay of a token
                 from a different session).
-            id_token_signing_key: when the IdP signs with HS256
-                (and shares the secret with us), pass the key. For
-                RS256-signing IdPs leave this `None`; the algorithm
-                allow-list + claim checks still run, but signature
-                verification is delegated to a future JWKS-aware
-                ticket. Either way, `iss` / `aud` / `nonce` / `exp`
-                are always enforced.
+            id_token_signing_key: the IdP's HS256 secret. T08 only
+                accepts HS256-signing IdPs; RS256 is rejected because
+                JWKS-based signature verification isn't wired up yet
+                (T35). Production deployments with RS256-signing IdPs
+                must wait for T35 before turning on real SSO.
 
         Returns:
             The verified claims.
 
         Raises:
-            OIDCIDTokenInvalidError: malformed JWT, unsupported alg,
-                signature mismatch, or non-JSON payload.
+            OIDCIDTokenInvalidError: malformed JWT, unsupported alg
+                (anything other than HS256 — RS256 is rejected until
+                T35 lands JWKS), signature mismatch, or non-JSON payload.
             OIDCClaimsMismatchError: `iss` / `aud` / `nonce` / `exp`
                 didn't match expectations.
         """
+        if id_token_signing_key is None:
+            raise OIDCIDTokenInvalidError(
+                details={"error": "id_token signing key not configured"},
+            )
+
+        # Signature verification + header/payload decode in one go
+        # via the shared `decode_jwt` helper. Any malformed-token
+        # failure mode (bad segment count, bad base64url, non-JSON,
+        # wrong alg, signature mismatch) surfaces as ValueError.
         try:
-            header, payload = _decode_unsigned(id_token)
+            payload = decode_jwt(id_token, signing_key=id_token_signing_key)
         except ValueError as exc:
             raise OIDCIDTokenInvalidError(
                 details={"error": str(exc)},
             ) from exc
 
-        alg = header.get("alg")
-        if alg not in ("HS256", "RS256"):
-            raise OIDCIDTokenInvalidError(
-                details={"error": f"unsupported alg: {alg!r}"},
-            )
-
-        if alg == "HS256":
-            if id_token_signing_key is None:
-                raise OIDCIDTokenInvalidError(
-                    details={"error": "HS256 id_token requires signing_key"},
-                )
-            if not _verify_hs256(id_token, id_token_signing_key):
-                raise OIDCIDTokenInvalidError(details={"error": "signature_mismatch"})
-        # RS256 path: signature verification deferred to T35 (JWKS
-        # rotation). For T08 the algorithm allow-list + claim check
-        # below is the gate; production RS256 deployments will plug
-        # in JWKS verification alongside.
-
         # Claims — iss / aud / nonce / exp.
+        # `iss` comparison is symmetric: both sides are stripped of
+        # any trailing `/` so an IdP that emits "https://x/" matches
+        # our configured "https://x".
         iss = payload.get("iss")
-        if iss != self._settings.oidc_issuer_url.rstrip("/"):
+        expected_iss = self._settings.oidc_issuer_url.rstrip("/")
+        if not isinstance(iss, str) or iss.rstrip("/") != expected_iss:
             raise OIDCClaimsMismatchError(
-                details={"claim": "iss", "expected": self._settings.oidc_issuer_url, "got": iss},
+                details={"claim": "iss", "expected": expected_iss, "got": iss},
             )
 
         aud = payload.get("aud")
@@ -591,7 +585,7 @@ class OIDCAdapter:
             email=email,
             email_verified=email_verified,
             name=name,
-            issuer=iss,
+            issuer=expected_iss,
             audience=self._settings.oidc_audience,
             nonce=nonce,
             expires_at=exp,
@@ -613,50 +607,6 @@ def _safe_body(text: str, *, limit: int = 256) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "…"
-
-
-def _b64url_decode(data: str) -> bytes:
-    padding = "=" * ((4 - len(data) % 4) % 4)
-    return base64.urlsafe_b64decode(data + padding)
-
-
-def _decode_unsigned(token: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Decode the header + payload of a JWS without checking it.
-
-    Returns `("header", "payload")` as dicts. Raises `ValueError` on
-    malformed input.
-    """
-    parts = token.split(".")
-    if len(parts) != 3:
-        raise ValueError("JWT must have 3 segments")
-    try:
-        header = json.loads(_b64url_decode(parts[0]))
-        payload = json.loads(_b64url_decode(parts[1]))
-    except (ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("JWT segment is not valid JSON") from exc
-    if not isinstance(header, dict) or not isinstance(payload, dict):
-        raise ValueError("JWT header/payload must be objects")
-    return header, payload
-
-
-def _verify_hs256(token: str, signing_key: str) -> bool:
-    parts = token.split(".")
-    if len(parts) != 3:
-        return False
-    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
-    expected = hmac.new(
-        signing_key.encode("utf-8"),
-        signing_input,
-        hashlib.sha256,
-    ).digest()
-    try:
-        actual = _b64url_decode(parts[2])
-    except Exception:  # noqa: BLE001 — binascii raises ValueError
-        return False
-    return hmac.compare_digest(
-        base64.urlsafe_b64encode(actual).rstrip(b"="),
-        base64.urlsafe_b64encode(expected).rstrip(b"="),
-    )
 
 
 __all__ = [

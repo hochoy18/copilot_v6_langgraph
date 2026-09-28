@@ -37,7 +37,6 @@ separate modules makes the dependency arrow
 """
 from __future__ import annotations
 
-import asyncio
 import time
 from collections.abc import MutableMapping
 from dataclasses import dataclass
@@ -45,20 +44,18 @@ from dataclasses import dataclass
 from app.auth.errors import OIDCStateMismatchError, UserInactiveError
 from app.auth.oidc import (
     OIDCAdapter,
+    VerifiedIDTokenClaims,
     derive_code_challenge,
     generate_code_verifier,
     generate_nonce,
     generate_state,
 )
 from app.auth.tokens import RefreshTokenService
-from app.db.schemas import User
+from app.db.errors import NotFoundError
+from app.db.schemas import User, UserCreate, UserUpdate
 from app.repositories.users import UserRepository
 from app.security.jwt import AccessTokenClaims, mint_access_token, new_jti, now_unix
 from app.settings import Settings
-
-# ---------------------------------------------------------------------------
-# State store
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -268,11 +265,7 @@ class OIDCLoginService:
             id_token_signing_key=signing_key,
         )
 
-        user, _created = await self._users.upsert_sso_user(
-            sso_subject=claims.sub,
-            email=claims.email,
-            display_name=claims.name,
-        )
+        user = await self._upsert_sso_user(claims)
 
         if not user.is_active:
             # The IdP can vouch for identity; it can't vouch for our
@@ -282,7 +275,8 @@ class OIDCLoginService:
 
         refresh_raw, _refresh_row = await self._refresh.issue(user.id)
 
-        access_token, expires_in = self._mint_access_token(user)
+        access_token = self._mint_access_token(user)
+        expires_in = self._settings.oidc_access_token_ttl_seconds
 
         return LoginCompleteResult(
             user=user,
@@ -293,13 +287,50 @@ class OIDCLoginService:
         )
 
     # ------------------------------------------------------------------
-    # Internal — JWT mint
+    # Internal — SSO upsert + JWT mint
     # ------------------------------------------------------------------
 
-    def _mint_access_token(self, user: User) -> tuple[str, int]:
+    async def _upsert_sso_user(self, claims: VerifiedIDTokenClaims) -> User:
+        """Find-or-create the `users` row bound to `claims.sub`.
+
+        Per ADR-0006 the IdP is the identity authority for SSO users;
+        a subject that re-presents itself should resolve to the same
+        `users._id` so audit trails and refresh-token families stay
+        attached. On repeat logins we mirror IdP-side identity
+        changes (`email` / `display_name`) onto the local row so
+        admin tooling sees a current name without joining IdP.
+        """
+        try:
+            existing = await self._users.get_by_sso_subject(claims.sub)
+        except NotFoundError:
+            existing = None
+
+        if existing is None:
+            return await self._users.create(
+                UserCreate(
+                    email=claims.email,
+                    display_name=claims.name,
+                    source="sso",
+                    sso_subject=claims.sub,
+                    role_ids=[],
+                )
+            )
+
+        patch = UserUpdate()
+        changed = False
+        if existing.email != claims.email:
+            patch.email = claims.email
+            changed = True
+        if existing.display_name != claims.name:
+            patch.display_name = claims.name
+            changed = True
+        if changed:
+            return await self._users.update(existing.id, patch)
+        return existing
+
+    def _mint_access_token(self, user: User) -> str:
         ttl = self._settings.oidc_access_token_ttl_seconds
         now = now_unix()
-        exp = now + ttl
         claims = AccessTokenClaims(
             sub=user.id,
             source=user.source,
@@ -307,16 +338,11 @@ class OIDCLoginService:
             issuer=self._settings.oidc_jwt_issuer,
             audience=self._settings.oidc_jwt_audience,
             issued_at=now,
-            expires_at=exp,
+            expires_at=now + ttl,
             jti=new_jti(),
         )
         token, _ = mint_access_token(claims, signing_key=self._settings.oidc_jwt_signing_key)
-        return token, ttl
-
-
-# ---------------------------------------------------------------------------
-# Async lock helper — guard concurrent state-store mutations
-# ---------------------------------------------------------------------------
+        return token
 
 
 def build_state_store(settings: Settings) -> OIDCStateStore:
@@ -328,15 +354,6 @@ def build_state_store(settings: Settings) -> OIDCStateStore:
     a future ticket will add.
     """
     return OIDCStateStore(ttl_seconds=settings.oidc_state_ttl_seconds)
-
-
-async def shutdown_exchange(wait: bool = True) -> None:
-    """Best-effort door for tests that want to ensure pending tasks drain."""
-    # The state store is purely in-memory and has no pending IO; this
-    # helper exists for symmetry with the lifespan future
-    # `aclose()` calls. Currently a no-op.
-    _ = wait
-    await asyncio.sleep(0)
 
 
 __all__ = [

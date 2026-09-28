@@ -36,8 +36,9 @@ The token is the standard JWS compact form::
 * `payload` carries the access-token claims (see `AccessTokenClaims`).
 * The signature segment is the 32-byte HMAC tag, base64url-no-pad.
 
-`verify_id_token` (in `app.auth.oidc`) consumes the IdP-issued
-`id_token` and re-uses the same decoder path here.
+`OIDCAdapter.verify_id_token` (in `app.auth.oidc`) routes every
+`id_token` it sees through `decode_jwt` here, so the signature and
+shape checks share one code path with the access-token path.
 """
 from __future__ import annotations
 

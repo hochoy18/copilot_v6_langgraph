@@ -737,15 +737,17 @@ class TestVerifyIDToken:
                 token, expected_nonce="nonce-1", id_token_signing_key=IDP_SIGNING_KEY
             )
 
-    def test_rs256_skips_signature_with_no_key(
+    def test_rs256_is_rejected_until_jwks_lands(
         self, adapter: OIDCAdapter
     ) -> None:
-        """RS256 tokens verify claims without the signing key.
+        """RS256-signing IdPs are rejected until T35 wires JWKS.
 
-        Signature verification is deferred to T35 (JWKS). The
-        adapter must NOT crash on RS256-without-key.
+        RS256 verification needs the IdP's JWKS to verify the
+        signature; that lives in T35. Until then, accepting an
+        RS256 token would let forged claims through because the
+        adapter can't check the signature. The adapter therefore
+        fails closed.
         """
-        # Forge an RS256-shaped token — header + payload, fake signature.
         header_b64 = _b64url_encode(
             json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
         )
@@ -755,10 +757,12 @@ class TestVerifyIDToken:
             "exp": int(time.time()) + 3600,
         }).encode())
         token = f"{header_b64}.{payload_b64}.{_b64url_encode(_ZEROS_256)}"
-        claims = adapter.verify_id_token(
-            token, expected_nonce="nonce-1", id_token_signing_key=None
-        )
-        assert claims.sub == "u"
+        with pytest.raises(OIDCIDTokenInvalidError) as exc:
+            adapter.verify_id_token(
+                token, expected_nonce="nonce-1", id_token_signing_key="k" * 32
+            )
+        # `decode_jwt` raises on unsupported alg.
+        assert _details(exc.value)["error"] == "unsupported alg: 'RS256' (only HS256)"
 
     def test_hs256_without_key_raises(self, adapter: OIDCAdapter) -> None:
         """HS256 without a signing key cannot verify — fail closed."""

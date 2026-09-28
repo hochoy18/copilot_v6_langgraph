@@ -82,14 +82,21 @@ _TOKEN_BYTES: int = 32
 DEFAULT_TTL: timedelta = timedelta(days=7)
 
 
-def _hash_token(raw_token: str) -> str:
+def hash_token(raw_token: str) -> str:
     """Hash a raw refresh token for storage / lookup.
 
     SHA-256 hex is what the rest of the codebase expects. The hash
     is treated as opaque throughout the service: never logged, never
-    compared as a string outside Mongo's equality match.
+    compared as a string outside Mongo's equality match. Public so
+    tests can verify the storage representation; production callers
+    stay inside the service.
     """
     return hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+
+
+# Backwards-compat shim — kept so internal callers / older tests
+# don't break. New code should use the public `hash_token` above.
+_hash_token = hash_token
 
 
 def _generate_token() -> str:

@@ -88,13 +88,25 @@ class RefreshTokenReuseError(AppError):
 # OIDC SSO (T08 / #46)
 # ---------------------------------------------------------------------------
 #
-# These mirror the four "compromise-class" signals the OIDC spec and
-# ADR-0009 / ADR-0006 expect to see on a callback that we can't safely
-# complete. Every one of them is a 401 — the callback is gated on a
-# short-lived IdP authorisation and any mismatch means we either don't
-# trust the client (state / nonce) or don't trust the IdP (signature
-# / claims). The 401 envelope keeps the i18n layer unified with the
-# refresh-token path.
+# These mirror the OIDC callback's "couldn't complete safely" family
+# per ADR-0009 / ADR-0006. Status codes are tuned per cause rather
+# than collapsed to a single 401:
+#
+# * `OIDCStateMismatchError` — 401: client-side mismatch (no state, OR
+#   TTL elapsed). Same envelope as the refresh-token family so the
+#   front-end's i18n layer renders one shape.
+# * `OIDCIDTokenInvalidError` — 401: signature / shape problem with
+#   the IdP-issued `id_token`.
+# * `OIDCClaimsMismatchError` — 401: `id_token` decoded cleanly but
+#   one of `iss` / `aud` / `nonce` / `exp` / identity claims didn't
+#   match — config drift or a forged token.
+# * `OIDCTokenExchangeError` — 502: the IdP rejected the code, or the
+#   upstream call failed. Upstream's fault, not the client's.
+# * `OIDCDiscoveryError` — 502: IdP metadata fetch failed.
+# * `UserInactiveError` — 403: IdP can vouch for identity, but our
+#   local admin offboarded the user. Distinct from the auth-failure
+#   401s so the front-end renders "account disabled" not "wrong
+#   password".
 
 
 class OIDCStateMismatchError(AppError):

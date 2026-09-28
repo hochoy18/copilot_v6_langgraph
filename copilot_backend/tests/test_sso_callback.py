@@ -30,7 +30,7 @@ from app.auth.login import (
     build_state_store,
 )
 from app.auth.oidc import OIDCAdapter, derive_code_challenge, generate_code_verifier
-from app.auth.tokens import RefreshTokenService
+from app.auth.tokens import RefreshTokenService, hash_token
 from app.db.init_db import init_database
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.users import UserRepository
@@ -367,8 +367,7 @@ class TestSSOCallbackHappyPath:
         assert refresh is not None
         assert refresh["revoked_at"] is None
         # The refresh token's hash is SHA-256 of the raw token we got.
-        from app.auth.tokens import _hash_token
-        assert refresh["token_hash"] == _hash_token(resp.json()["refresh_token"])
+        assert refresh["token_hash"] == hash_token(resp.json()["refresh_token"])
 
     async def test_repeat_login_returns_same_user_id(
         self,
