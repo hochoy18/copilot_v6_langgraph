@@ -30,3 +30,14 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
         yield ac
+
+
+@pytest.fixture
+def client_app(client: AsyncClient, app: FastAPI) -> FastAPI:
+    """Public alias so tests can call `dependency_overrides` cleanly.
+
+    Reaching into `client._transport.app` would work but it pokes at a
+    private httpx attribute; this fixture surfaces the same FastAPI
+    handle through a stable test seam.
+    """
+    return app

@@ -1,9 +1,13 @@
 """Application settings, loaded from environment via pydantic-settings.
 
-Kept intentionally minimal for the scaffold ticket. New env vars must land
-here so configuration is centralised, not scattered across modules.
-"""
+All configuration for the Copilot backend must land here so values are
+centralised, not scattered across modules. Env vars use the `COPILOT_`
+prefix and are seeded from a local `.env` file when present.
 
+Per-issue T03 (#4): connection strings for MongoDB / Milvus / Langfuse ship
+with sensible localhost / remote URLs so a fresh checkout can boot against
+the dependencies documented in `docs/SPEC.md` without further setup.
+"""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -22,15 +26,58 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # CORS: SPEC defers policy to V1.1 (SPA + FastAPI same-origin in prod),
-    # but the issue acceptance criteria require the middleware be wired.
-    # Default to common local-dev origins; override in deployments.
+    # ---- CORS ------------------------------------------------------------
     cors_allow_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:3000",
             "http://127.0.0.1:3000",
         ],
-        description="Comma-separated origins allowed by CORS.",
+        description=(
+            "Comma-separated origins allowed by CORS. SPEC defers policy to V1.1; "
+            "default covers the local Vite dev server."
+        ),
+    )
+
+    # ---- MongoDB (T03 / T04+) -------------------------------------------
+    # T03 only verifies reachability; deeper SDK wiring lands in T04 (#5)
+    # and T05 (#6). The database name lands with those tickets because
+    # T03 doesn't need it.
+    mongodb_uri: str = Field(
+        default="mongodb://localhost:27017",
+        description="MongoDB connection URI. mongodb://host:port for a single node.",
+    )
+
+    # ---- Milvus (T03 / T31+) --------------------------------------------
+    # T03 only verifies reachability via TCP. The gRPC SDK lands in T31 (#27).
+    milvus_host: str = Field(
+        default="localhost",
+        description="Milvus gRPC host. Local dev uses the bundled instance.",
+    )
+    milvus_port: int = Field(
+        default=19530,
+        description="Milvus gRPC port. Default matches the official image.",
+    )
+
+    # ---- Langfuse (T03 / T35+) ------------------------------------------
+    # T03 verifies reachability against the public health endpoint. SDK
+    # wiring lands in T35 (#35). The URL must NOT include a trailing slash.
+    langfuse_host: str = Field(
+        default="https://langfuse.bananahochoy.online",
+        description=(
+            "Langfuse base URL. Used to derive the public health probe and "
+            "(later) the OTel/SDK endpoints. No trailing slash."
+        ),
+    )
+
+    # ---- Health-check tuning --------------------------------------------
+    health_check_timeout_seconds: float = Field(
+        default=2.0,
+        ge=0.1,
+        le=10.0,
+        description=(
+            "Per-dependency probe timeout. T03 uses TCP / HTTP-level pings; "
+            "the same value applies to all three dependencies."
+        ),
     )
 
 

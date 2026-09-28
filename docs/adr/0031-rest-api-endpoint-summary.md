@@ -50,6 +50,14 @@
 | `/api/v1/admin/users` | GET / POST | 用户列表 / 创建 | ADR-0006 |
 | `/api/v1/admin/users/{id}/roles` | PUT | 分配角色 | ADR-0006 / ADR-0002 |
 
+### 运维与可观测性
+
+| 端点 | 方法 | 用途 | 来源 ADR |
+|---|---|---|---|
+| `/healthz` | GET | 进程与依赖探针(MongoDB / Milvus / Langfuse 健康聚合,公开、不需 JWT,K8s probe 友好) | T03 / ADR-0031 |
+
+> `/healthz` 故意不在 `/api/v1` 前缀下,也不走 Bearer JWT — 部署探针 / 负载均衡需在不携带凭据时拿到响应,见 `app/api/health.py` 的设计说明。新增任何"运维类"端点(如 `/readyz`、`/metrics`)也应在本节追加并放在 `/api/v1` 之外。
+
 ### 系统配置(前端可读)
 
 | 端点 | 方法 | 用途 | 来源 ADR |
