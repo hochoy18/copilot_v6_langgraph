@@ -275,6 +275,58 @@ class ConversationService:
         )
 
     # ------------------------------------------------------------------
+    # Plan execution (T21 / #18)
+    # ------------------------------------------------------------------
+
+    async def get_latest_approved_plan(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+    ) -> Plan:
+        """Return the conversation's latest `approved` / `modified` Plan.
+
+        The Worker (T21 / #18) consumes from this seam: the React Flow
+        drawer shows the latest Plan, and "execute" picks the
+        approved / modified row (modified = post-ADR-0019 edit).
+        Anything else (pending / rejected / executing / succeeded /
+        failed) raises `PlanNotPendingError` (409) so the audit
+        lifecycle never rewinds.
+        """
+        conversation = await self._conversations.get(conversation_id)
+        _assert_owner(conversation, user_id)
+
+        plan = await self._plans.get_latest_for_conversation(conversation_id)
+        if plan.status not in ("approved", "modified"):
+            raise PlanNotPendingError(
+                details={
+                    "plan_id": plan.id,
+                    "current_status": plan.status,
+                    "expected": ["approved", "modified"],
+                },
+            )
+        return plan
+
+    async def get_latest_turn_for_plan(self, plan: Plan) -> Turn:
+        """Return the Turn that triggered `plan`.
+
+        Used by the executor to back-fill the audit log row's
+        `turn_id` FK pointer. The Plan always carries the FK, but
+        the Turn repo is the canonical read seam.
+        """
+        from app.db.errors import NotFoundError
+
+        try:
+            return await self._turns.get(plan.turn_id)
+        except NotFoundError as exc:  # pragma: no cover — defensive
+            raise NotFoundError(
+                message_en=(
+                    f"Plan {plan.id} references missing Turn {plan.turn_id}"
+                ),
+                details={"plan_id": plan.id, "turn_id": plan.turn_id},
+            ) from exc
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 

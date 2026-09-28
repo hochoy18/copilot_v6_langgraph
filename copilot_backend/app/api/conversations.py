@@ -41,7 +41,11 @@ from app.conversations.service import (
     ConversationDetail,
     ConversationService,
 )
-from app.db.dependencies import get_conversation_service, get_planner_service
+from app.db.dependencies import (
+    get_conversation_service,
+    get_plan_executor,
+    get_planner_service,
+)
 from app.db.schemas import (
     Conversation,
     ConversationStatus,
@@ -51,6 +55,7 @@ from app.db.schemas import (
 )
 from app.planner.service import PlannerService, TurnOutcome
 from app.security.auth import get_current_user
+from app.tools.executor import PlanExecutionOutcome, PlanExecutor
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
 
@@ -436,6 +441,72 @@ async def reject_plan(
         user_id=user.id,
     )
     return _plan_to_dict(plan)
+
+
+class PlanExecutionResponse(BaseModel):
+    """Wire shape of `POST /api/v1/conversations/{id}/plan/execute` — T21 / #18.
+
+    Returns the post-execution Plan (status `succeeded` / `failed`)
+    plus the `audit_log_ids` the Frontend can render alongside the
+    per-node lifecycle. The per-node execution detail lives on
+    `plan_executions.node_results` and is fetched by a future
+    conversation-detail endpoint; T21 only ships the high-level
+    envelope.
+    """
+
+    plan: dict[str, Any] = Field(
+        description="The post-execution Plan row."
+    )
+    execution_id: str = Field(
+        description="ObjectId of the `plan_executions` row created for this run."
+    )
+    audit_log_ids: list[str] = Field(
+        description="One `audit_logs` row id per node, in execution order."
+    )
+
+
+@router.post(
+    "/{conversation_id}/plan/execute",
+    response_model=PlanExecutionResponse,
+    summary="Execute the conversation's approved Plan (T21 / #18)",
+)
+async def execute_plan(
+    conversation_id: str,
+    user: User = Depends(get_current_user),  # noqa: B008
+    svc: ConversationService = Depends(get_conversation_service),  # noqa: B008
+    executor: PlanExecutor = Depends(get_plan_executor),  # noqa: B008
+) -> PlanExecutionResponse:
+    """`POST /api/v1/conversations/{id}/plan/execute` — Worker trigger.
+
+    Per ADR-0004 the Plan preview is mandatory and one-shot: the
+    HITL flow is approve → execute. Approval flips the Plan to
+    `approved`; this endpoint drives the Worker (T21) over every
+    node and writes the audit trail. Cross-user access surfaces the
+    same 404 envelope as an absent conversation; a Plan that isn't
+    in `approved` / `modified` raises 409 (the same envelope as
+    `PlanNotPendingError`).
+
+    Failures (HITL escalation, schema violation, upstream error)
+    land here as a 200 with `plan.status = "failed"` — the call
+    succeeded, the Plan didn't. The audit log ids tell the Frontend
+    where to drill in.
+    """
+    plan = await svc.get_latest_approved_plan(
+        conversation_id=conversation_id,
+        user_id=user.id,
+    )
+    turn = await svc.get_latest_turn_for_plan(plan)
+    outcome: PlanExecutionOutcome = await executor.execute_plan(
+        plan=plan,
+        actor_id=user.id,
+        conversation_id=conversation_id,
+        turn_id=turn.id,
+    )
+    return PlanExecutionResponse(
+        plan=_plan_to_dict(outcome.plan),
+        execution_id=outcome.execution_id,
+        audit_log_ids=outcome.audit_log_ids,
+    )
 
 
 __all__ = ["router"]

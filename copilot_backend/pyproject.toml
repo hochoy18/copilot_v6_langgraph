@@ -30,6 +30,11 @@ dependencies = [
     # `gensalt`); a 5.x bump will be a deliberate decision.
     "bcrypt>=4.2.0,<5.0",
     "langchain-openai>=0.2.14,<0.4",
+    # T21 / #18 — JSON Schema validation for Tool parameters (ADR-0020).
+    # The Worker runs every `parameters` payload through the snapshot's
+    # frozen `parameters_schema` before the upstream call so LLM
+    # hallucinations never reach the API.
+    "jsonschema>=4.23.0,<5.0",
 ]
 
 [project.optional-dependencies]
@@ -63,7 +68,7 @@ strict = true
 files = ["app", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["mongomock_motor", "mongomock", "yaml"]
+module = ["mongomock_motor", "mongomock", "yaml", "jsonschema"]
 ignore_missing_imports = true
 
 [tool.ruff]

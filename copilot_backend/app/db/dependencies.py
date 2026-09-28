@@ -43,8 +43,10 @@ from app.repositories.users import UserRepository
 from app.security.crypto import CredentialEncryptor
 from app.settings import Settings, get_settings
 from app.tools.description_generator import ToolDescriptionGenerator
+from app.tools.executor import PlanExecutor
 from app.tools.openapi_parser import OpenAPIParser
 from app.tools.service import ToolService
+from app.tools.worker import ToolWorker
 
 
 def get_database(request: Request) -> AsyncIOMotorDatabase[Any]:
@@ -282,6 +284,50 @@ def get_openapi_parser() -> OpenAPIParser:
     patching the class.
     """
     return OpenAPIParser()
+
+
+# ---------------------------------------------------------------------------
+# Tool Worker / Plan Executor (T21 / #18)
+# ---------------------------------------------------------------------------
+
+
+def get_tool_worker(
+    credential_repo: CredentialRepository = Depends(get_credential_repository),  # noqa: B008
+) -> ToolWorker:
+    """FastAPI dependency: build a `ToolWorker` for this request (T21 / #18).
+
+    The Worker is stateless beyond its collaborator references; a
+    fresh instance per request is fine. Tests override this
+    dependency to inject a stubbed Worker / http client pair.
+    """
+    import httpx
+
+    return ToolWorker(
+        credential_repository=credential_repo,
+        http_client=httpx.AsyncClient(),
+    )
+
+
+def get_plan_executor(
+    plan_repo: PlanRepository = Depends(get_plan_repository),  # noqa: B008
+    plan_execution_repo: PlanExecutionRepository = Depends(get_plan_execution_repository),  # noqa: B008
+    audit_repo: AuditLogRepository = Depends(get_audit_log_repository),  # noqa: B008
+    tool_repo: ToolRepository = Depends(get_tool_repository),  # noqa: B008
+    worker: ToolWorker = Depends(get_tool_worker),  # noqa: B008
+) -> PlanExecutor:
+    """FastAPI dependency: build a `PlanExecutor` for this request (T21 / #18).
+
+    Composes the four repositories the Executor writes to and the
+    shared `ToolWorker`. The Executor itself holds no I/O buffers;
+    a fresh instance per request is fine.
+    """
+    return PlanExecutor(
+        plan_repository=plan_repo,
+        plan_execution_repository=plan_execution_repo,
+        audit_log_repository=audit_repo,
+        tool_repository=tool_repo,
+        worker=worker,
+    )
 
 
 # ---------------------------------------------------------------------------
