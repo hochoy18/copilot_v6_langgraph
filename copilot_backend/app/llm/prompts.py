@@ -6,22 +6,20 @@ used. The ADR also pins the degradation ladder for Langfuse outages:
 
     fresh fetch (within TTL) → cached last-good copy → bootstrap default
 
-Why the public REST API over httpx instead of the Langfuse SDK:
-ADR-0015's dependency notes already route Langfuse traffic through
-httpx (health probe in T03, trace upload planned for T40), and the
-prompt read we need is a single `GET /api/public/v2/prompts/{name}`.
-The v3 SDK bundles the OTel tracing machinery that only becomes
-relevant when T40 wires full-chain traces; pulling it in now would add
-a heavyweight dependency for one endpoint and its sync API would block
-the event loop inside request handlers. When T40 adds the SDK, this
-provider can delegate to it without touching any caller.
+ADR-0033 records the two deviations from ADR-0013's wording that this
+module embodies, with their rationale — do not re-litigate them in
+review without reopening ADR-0033:
 
-The bootstrap copy of `tool-description-generator` embedded below is a
-degradation floor, not the canonical asset (ADR-0013 "本地缓存的最近
-版本 Prompt" taken to its logical end for first-boot): admins are
-expected to create the same-named Prompt on Langfuse and tune it there.
-It asks for a strict-JSON reply; the generator's parser is forgiving
-about fences but not about missing fields.
+* Prompt reads go to the Langfuse public REST API over httpx, not the
+  v3 SDK (the SDK's OTel bundle belongs to T40; its sync API would
+  block the event loop). When T40 lands, `get_prompt` can delegate to
+  the SDK without touching callers.
+* The ladder's floor is a code-embedded *bootstrap* copy, because
+  ADR-0013's "locally cached Prompt" fallback presupposes at least one
+  successful fetch — impossible on a first boot with Langfuse down.
+  The bootstrap text is a usability floor, not the canonical asset:
+  creating the same-named Prompt on Langfuse takes over on the next
+  fetch, and `PromptTemplate.source` records which rung answered.
 
 Placeholders use the Langfuse `{{variable}}` convention; see
 `app.tools.description_generator` for the render step.

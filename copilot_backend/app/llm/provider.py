@@ -19,12 +19,13 @@ object owns an httpx client, so construction belongs to the lifespan /
 `BaseChatModel` instances and override the dependency instead of
 calling through here.
 
-Startup validation note: ADR-0016 phrases the capability check as a
-boot-time gate, but `app.main`'s lifespan deliberately never raises (a
-degraded boot is the contract for /healthz, and LLM-less deployments
-are supported). The check therefore runs at model-construction time —
-the first moment any LLM feature is actually used — and its failure is
-rendered to admins as a degradation warning on the import preview.
+Startup validation note: ADR-0033 (item 3) revises ADR-0016's "fail
+boot" wording to a first-use check — `app.main`'s lifespan never
+raises (degraded boot is the /healthz contract, and LLM-less
+deployments are supported), so the refusal happens when a ChatModel is
+actually constructed and surfaces to admins as a degradation warning.
+The call-site invariant is unchanged: no LLM call can be built while
+opt-out and provider capability disagree.
 """
 from __future__ import annotations
 

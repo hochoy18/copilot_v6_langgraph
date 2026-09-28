@@ -51,10 +51,11 @@ from app.llm.prompts import TOOL_DESCRIPTION_GENERATOR_PROMPT, PromptProvider
 from app.settings import Settings
 from app.tools.openapi_parser import ToolDraft
 
-# Upper bound on LLM rewrites per import preview. Beyond it the extra
-# drafts keep their raw text and the response carries an import-level
-# warning. Sized for typical enterprise specs; the admin can import a
-# slice, review, and re-run for the long tail.
+# Upper bound on LLM rewrites per import preview (parameters recorded
+# in ADR-0033). Beyond it the extra drafts keep their raw text and the
+# response carries an import-level warning — skipped drafts are
+# editable during review; a per-draft regeneration endpoint is tracked
+# as a follow-up of #14 for the long tail.
 MAX_DESCRIPTIONS_PER_IMPORT = 32
 
 # In-flight LLM calls per import. OpenAI-compatible providers throttle
