@@ -56,4 +56,26 @@ class ConversationArchivedError(AppError):
     http_status = status.HTTP_409_CONFLICT
 
 
-__all__ = ["ConversationAccessDeniedError", "ConversationArchivedError"]
+class PlanNotPendingError(AppError):
+    """Raised when approve / reject targets a Plan that's already terminal.
+
+    The HITL preview (T20 / #43, ADR-0004) is a one-shot checkpoint:
+    once a Plan is `approved` / `rejected` / `modified` / `executing`,
+    the business user cannot re-decide. Approving a running Plan would
+    rewind its audit lifecycle; rejecting an executed one would
+    contradict the Worker. 409 carries the current status so the
+    Frontend can show "Plan 已批准, 不可再次批准" without parsing
+    English message text.
+    """
+
+    code = "plan_not_pending"
+    message_zh = "Plan 已不可变更"
+    message_en = "Plan is no longer awaiting approval"
+    http_status = status.HTTP_409_CONFLICT
+
+
+__all__ = [
+    "ConversationAccessDeniedError",
+    "ConversationArchivedError",
+    "PlanNotPendingError",
+]

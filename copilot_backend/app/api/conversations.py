@@ -1,7 +1,7 @@
-"""`/api/v1/conversations` router — T10 / #40, T18 / #16.
+"""`/api/v1/conversations` router — T10 / #40, T18 / #16, T20 / #43.
 
-The thin HTTP seam for conversation CRUD and turn submission. Five
-endpoints per ADR-0031:
+The thin HTTP seam for conversation CRUD, turn submission, and the
+HITL Plan approve / reject endpoints. Seven endpoints per ADR-0031:
 
 * `POST /api/v1/conversations` — create.
 * `GET  /api/v1/conversations` — list (with optional `status` filter).
@@ -10,13 +10,20 @@ endpoints per ADR-0031:
   run the Planner (T18). Synchronous for now: the response carries
   the generated Plan (status `pending`, awaiting the HITL preview —
   ADR-0004); the SSE event stream `plan.generated` etc. is T23 (#20).
+* `POST /api/v1/conversations/{id}/plan/approve` — HITL approval
+  (T20 / #43 / ADR-0004). Flips the conversation's latest Plan to
+  `approved`; the Worker (T21) picks it up from there.
+* `POST /api/v1/conversations/{id}/plan/reject` — HITL rejection
+  (T20 / #43 / ADR-0004). Flips the latest Plan to `rejected`; the
+  Turn stays so the conversation can be re-decided.
 * `POST /api/v1/conversations/{id}/archive` — manual archive
   (transitions `active` / `idle` → `idle`, ADR-0011).
 
 The router is intentionally thin: business logic lives in
-`app.conversations.service.ConversationService` (CRUD) and
-`app.planner.service.PlannerService` (turn → Plan). This file exists
-only to translate Pydantic wire shapes into service calls and back.
+`app.conversations.service.ConversationService` (CRUD + Plan
+decisions) and `app.planner.service.PlannerService` (turn → Plan).
+This file exists only to translate Pydantic wire shapes into service
+calls and back.
 
 Authentication is supplied by `get_current_user` (T09 / #10), which
 returns the canonical `User` row. Ownership is then enforced at the
@@ -374,6 +381,61 @@ async def archive_conversation(
         user_id=user.id,
     )
     return _conversation_to_response(conv)
+
+
+@router.post(
+    "/{conversation_id}/plan/approve",
+    response_model=dict[str, Any],
+    summary="HITL approve the conversation's pending Plan (T20 / #43)",
+)
+async def approve_plan(
+    conversation_id: str,
+    user: User = Depends(get_current_user),  # noqa: B008
+    svc: ConversationService = Depends(get_conversation_service),  # noqa: B008
+) -> dict[str, Any]:
+    """`POST /api/v1/conversations/{id}/plan/approve` — HITL approval.
+
+    Per ADR-0004 the Plan preview is mandatory: this endpoint is the
+    "approve as-is" branch of the Plan-preview buttons (T20 / #43).
+    The Drawer header (T19) renders one approve / reject pair bound
+    to the latest Plan; the Worker (T21) picks up from here.
+
+    The path is conversation-scoped (no `plan_id`) because per
+    ADR-0005 a conversation has at most one "active" Plan at a time
+    — that's the row the React Flow drawer is rendering. Status
+    conflicts (Plan already approved / rejected / executing) raise
+    409 with code `plan_not_pending`; cross-user access surfaces
+    the same 404 envelope as an absent row.
+    """
+    plan = await svc.approve_plan(
+        conversation_id=conversation_id,
+        user_id=user.id,
+    )
+    return _plan_to_dict(plan)
+
+
+@router.post(
+    "/{conversation_id}/plan/reject",
+    response_model=dict[str, Any],
+    summary="HITL reject the conversation's pending Plan (T20 / #43)",
+)
+async def reject_plan(
+    conversation_id: str,
+    user: User = Depends(get_current_user),  # noqa: B008
+    svc: ConversationService = Depends(get_conversation_service),  # noqa: B008
+) -> dict[str, Any]:
+    """`POST /api/v1/conversations/{id}/plan/reject` — HITL rejection.
+
+    Mirrors `approve_plan` — same ownership + status-guard contract.
+    The Turn stays so the user can refine the instruction and
+    resubmit; a rejected Plan is terminal from the Worker's POV but
+    not from the conversation's.
+    """
+    plan = await svc.reject_plan(
+        conversation_id=conversation_id,
+        user_id=user.id,
+    )
+    return _plan_to_dict(plan)
 
 
 __all__ = ["router"]

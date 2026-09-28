@@ -1,5 +1,5 @@
 /**
- * Plan drawer store — T19 / #17 (Zustand per ADR-0029).
+ * Plan drawer store — T19 / #17, T20 / #43 (Zustand per ADR-0029).
  *
  * Client state for the right-side Plan preview drawer: which Plan is
  * on screen, whether it is docked / fullscreen / collapsed, and the
@@ -7,9 +7,11 @@
  * layout rule — "Plan 预览从右侧滑出为抽屉, 可全屏看图也可收起继续
  * 聊" — is exactly the `mode` union below.
  *
- * The SSE-hook ticket (T24 / #21) will add Plan *status* updates to
- * this store's `plan`; T19 hydrates it synchronously from the
- * `POST /turns` response (T18), so the store only owns view state.
+ * T20 / #43 adds the `decidePlan` action: after a successful HITL
+ * approve / reject call, the Plan returned by the backend is folded
+ * back into the store so the header status badge + button set
+ * reflect the new lifecycle without a refetch. The SSE-hook ticket
+ * (T24 / #21) will add further Plan *status* updates to this store.
  */
 import { create } from 'zustand'
 
@@ -30,6 +32,13 @@ interface PlanDrawerState {
   reopen(): void
   toggleFullscreen(): void
   selectNode(nodeId: string | null): void
+  /**
+   * Apply a server-decided Plan (approve / reject) onto the current
+   * `plan` (T20 / #43). The header badge re-renders against the new
+   * status; the approve / reject buttons disappear because the Plan
+   * is no longer `pending`.
+   */
+  decidePlan(plan: Plan): void
 }
 
 export const usePlanDrawerStore = create<PlanDrawerState>((set) => ({
@@ -54,4 +63,5 @@ export const usePlanDrawerStore = create<PlanDrawerState>((set) => ({
       mode: state.mode === 'fullscreen' ? 'docked' : 'fullscreen',
     })),
   selectNode: (nodeId) => set({ selectedNodeId: nodeId }),
+  decidePlan: (plan) => set({ plan }),
 }))

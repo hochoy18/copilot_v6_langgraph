@@ -1,5 +1,5 @@
 /**
- * Plan preview drawer — T19 / #17.
+ * Plan preview drawer — T19 / #17, T20 / #43.
  *
  * Right-side slide-out drawer rendering a Plan as a React Flow
  * node-edge graph (ADR-0029: "Plan 预览从右侧滑出为抽屉, 可全屏看图
@@ -12,8 +12,13 @@
  * The aside stays mounted in every mode so the `transition-transform`
  * actually animates the slide-out; `aria-hidden` keeps the off-screen
  * copy from the a11y tree. Edge layout comes from `plan-graph.ts`
- * (pure + unit-tested); this file is wiring only. HITL approve/reject
- * buttons land with T20 (#43) — until then the drawer is preview-only.
+ * (pure + unit-tested); this file is wiring only.
+ *
+ * T20 / #43 (HITL approve / reject) layers two buttons on the header
+ * when the Plan is `pending`. They hit the T20 backend endpoints
+ * (`POST /conversations/{id}/plan/{approve,reject}`) and fold the
+ * returned Plan back into the store so the status badge updates
+ * without a refetch.
  */
 import '@xyflow/react/dist/style.css'
 
@@ -25,8 +30,8 @@ import {
   type Node,
   type NodeTypes,
 } from '@xyflow/react'
-import { Maximize, Minimize, PanelRightClose } from 'lucide-react'
-import { useMemo } from 'react'
+import { Check, Maximize, Minimize, PanelRightClose, X } from 'lucide-react'
+import { useMemo, useState } from 'react'
 
 import { NodeInfoPanel } from '@/components/plan/NodeInfoPanel'
 import { PlanToolNode } from '@/components/plan/PlanToolNode'
@@ -37,6 +42,11 @@ import {
   buildFlowNodes,
   type PlanNodeData,
 } from '@/lib/plan-graph'
+import {
+  approvePlan,
+  formatPlanDecisionError,
+  rejectPlan,
+} from '@/lib/conversations-api'
 import { usePlanDrawerStore } from '@/stores/plan-drawer'
 import { cn } from '@/lib/utils'
 import type { Plan } from '@/types/plan'
@@ -52,6 +62,7 @@ export function PlanDrawer(): React.ReactElement {
   const collapse = usePlanDrawerStore((s) => s.collapse)
   const toggleFullscreen = usePlanDrawerStore((s) => s.toggleFullscreen)
   const selectNode = usePlanDrawerStore((s) => s.selectNode)
+  const decidePlan = usePlanDrawerStore((s) => s.decidePlan)
 
   const nodes = useMemo(
     () => (plan ? buildFlowNodes(plan) : []),
@@ -80,11 +91,18 @@ export function PlanDrawer(): React.ReactElement {
       <header className="flex shrink-0 items-center gap-2 border-b p-3">
         <h2 className="text-sm font-semibold">Plan 预览</h2>
         {plan && (
-          <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+          <span
+            data-testid="plan-status"
+            data-status={plan.status}
+            className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+          >
             {plan.status}
           </span>
         )}
         <div className="ml-auto flex items-center gap-1">
+          {plan && plan.status === 'pending' && (
+            <PlanDecisionButtons plan={plan} onDecided={decidePlan} />
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -123,6 +141,86 @@ export function PlanDrawer(): React.ReactElement {
         <NodeInfoPanel plan={plan} nodeId={selectedNodeId} />
       )}
     </aside>
+  )
+}
+
+/**
+ * The HITL approve / reject pair (T20 / #43, ADR-0004).
+ *
+ * Rendered only while the Plan is `pending` — once decided, the
+ * buttons disappear (the header still shows the new `approved` /
+ * `rejected` status badge). Each button calls the matching backend
+ * endpoint, then folds the returned Plan back into the store so the
+ * header re-renders against the new status. Errors surface inline
+ * under the button row; the Plan stays `pending` on failure so the
+ * user can retry.
+ */
+function PlanDecisionButtons({
+  plan,
+  onDecided,
+}: {
+  plan: Plan
+  onDecided: (plan: Plan) => void
+}): React.ReactElement {
+  const [submitting, setSubmitting] = useState<'approve' | 'reject' | null>(
+    null,
+  )
+  const [error, setError] = useState<string | null>(null)
+
+  async function decide(action: 'approve' | 'reject'): Promise<void> {
+    if (!plan.conversation_id) return
+    setError(null)
+    setSubmitting(action)
+    try {
+      const next =
+        action === 'approve'
+          ? await approvePlan(plan.conversation_id)
+          : await rejectPlan(plan.conversation_id)
+      onDecided(next)
+    } catch (err) {
+      setError(formatPlanDecisionError(err))
+    } finally {
+      setSubmitting(null)
+    }
+  }
+
+  return (
+    <div
+      data-testid="plan-decision"
+      className="flex items-center gap-1"
+    >
+      <Button
+        type="button"
+        variant="default"
+        size="sm"
+        data-testid="plan-approve"
+        disabled={submitting !== null}
+        onClick={() => void decide('approve')}
+      >
+        <Check size={14} />
+        {submitting === 'approve' ? '批准中…' : '批准'}
+      </Button>
+      <Button
+        type="button"
+        variant="destructive"
+        size="sm"
+        data-testid="plan-reject"
+        disabled={submitting !== null}
+        onClick={() => void decide('reject')}
+      >
+        <X size={14} />
+        {submitting === 'reject' ? '驳回中…' : '驳回'}
+      </Button>
+      {error && (
+        <span
+          role="alert"
+          data-testid="plan-decision-error"
+          className="ml-1 text-xs text-red-600"
+        >
+          {error}
+        </span>
+      )}
+    </div>
   )
 }
 

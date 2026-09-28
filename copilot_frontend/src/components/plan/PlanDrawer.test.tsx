@@ -1,20 +1,26 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act } from 'react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { PlanDrawer } from '@/components/plan/PlanDrawer'
 import { usePlanDrawerStore } from '@/stores/plan-drawer'
 import type { Plan, PlanNode, ToolSnapshot } from '@/types/plan'
 
 /**
- * Drawer UI tests — T19 / #17 acceptance criteria:
+ * Drawer UI tests — T19 / #17 + T20 / #43 acceptance criteria:
  * - [ ] 显示单节点 + 节点信息
  * - [ ] 可收起 / 全屏
  * - [ ] 节点按风险等级区分样式
+ * - [ ] 批准触发 API, 状态 approved  (T20)
+ * - [ ] 驳回触发 API, 状态 rejected  (T20)
+ * - [ ] 按钮在 Plan 渲染后可用    (T20)
  *
  * React Flow mounts in jsdom against the no-op observer stubs from
  * `test-setup.ts`; we assert rendered DOM (node cards, badges, info
- * panel, `data-mode`), never canvas internals.
+ * panel, `data-mode`), never canvas internals. The T20 approve /
+ * reject API is mocked at the module boundary so the drawer can be
+ * exercised without a running backend.
  */
 
 function makeSnapshot(overrides: Partial<ToolSnapshot> = {}): ToolSnapshot {
@@ -169,5 +175,116 @@ describe('PlanDrawer', () => {
     fireEvent.click(screen.getByTestId('plan-node-n2'))
     expect(screen.getByTestId('node-info-panel')).toHaveTextContent('get_order')
     expect(screen.getByTestId('node-info-parameters')).toHaveTextContent('"order_id": 42')
+  })
+})
+
+/**
+ * HITL approve / reject — T20 / #43.
+ *
+ * Mirrors the `mockFetch` pattern from `ChatPage.test.tsx`: queue
+ * canned `Response` objects on `globalThis.fetch` so the drawer's
+ * real `apiFetch` path can hit the approve / reject endpoints
+ * without spinning up a backend. The drawer reads `plan.id` and
+ * `plan.conversation_id` off the seeded Plan, so the path strings
+ * stay stable.
+ */
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+function mockFetch(responses: ReadonlyArray<Response>): ReturnType<typeof vi.fn> {
+  const fn = vi.fn()
+  for (const response of responses) {
+    fn.mockResolvedValueOnce(response)
+  }
+  globalThis.fetch = fn as unknown as typeof fetch
+  return fn
+}
+
+describe('PlanDrawer HITL (T20 / #43)', () => {
+  it('renders the approve / reject buttons only after a pending Plan is loaded (按钮在 Plan 渲染后可用)', () => {
+    // No plan yet — buttons are hidden.
+    render(<PlanDrawer />)
+    expect(screen.queryByTestId('plan-decision')).not.toBeInTheDocument()
+
+    // After `showPlan`, the button row is on screen.
+    act(() => {
+      usePlanDrawerStore.getState().showPlan(makePlan())
+    })
+    expect(screen.getByTestId('plan-decision')).toBeInTheDocument()
+    expect(screen.getByTestId('plan-approve')).toBeInTheDocument()
+    expect(screen.getByTestId('plan-reject')).toBeInTheDocument()
+  })
+
+  it('hides the buttons once the Plan is no longer pending (e.g. approved)', () => {
+    const approved = makePlan({ status: 'approved' })
+    usePlanDrawerStore.getState().showPlan(approved)
+    render(<PlanDrawer />)
+    expect(screen.queryByTestId('plan-decision')).not.toBeInTheDocument()
+    expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'approved')
+  })
+
+  it('approve triggers the API and updates Plan status to approved', async () => {
+    const fetchMock = mockFetch([
+      jsonResponse({ ...makePlan(), status: 'approved' }),
+    ])
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    const user = userEvent.setup()
+    await user.click(screen.getByTestId('plan-approve'))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(path).toBe('/api/v1/conversations/c1/plan/approve')
+    expect(init.method).toBe('POST')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'approved'),
+    )
+    // Buttons gone — the Plan is no longer pending.
+    expect(screen.queryByTestId('plan-decision')).not.toBeInTheDocument()
+  })
+
+  it('reject triggers the API and updates Plan status to rejected', async () => {
+    const fetchMock = mockFetch([
+      jsonResponse({ ...makePlan(), status: 'rejected' }),
+    ])
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    const user = userEvent.setup()
+    await user.click(screen.getByTestId('plan-reject'))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(path).toBe('/api/v1/conversations/c1/plan/reject')
+    expect(init.method).toBe('POST')
+
+    await waitFor(() =>
+      expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'rejected'),
+    )
+  })
+
+  it('surfaces the backend 409 message inline and keeps the Plan pending on conflict', async () => {
+    mockFetch([
+      jsonResponse({ code: 'plan_not_pending', message_zh: 'Plan 已不可变更' }, 409),
+    ])
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    const user = userEvent.setup()
+    await user.click(screen.getByTestId('plan-approve'))
+
+    const error = await screen.findByTestId('plan-decision-error')
+    expect(error).toHaveTextContent('Plan 已不可变更')
+    // The Plan status badge stays `pending` so the user can retry
+    // (the canonical "decide failed, keep going" UX).
+    expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'pending')
+    expect(screen.getByTestId('plan-decision')).toBeInTheDocument()
   })
 })

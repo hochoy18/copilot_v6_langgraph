@@ -28,12 +28,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.conversations.errors import ConversationAccessDeniedError
+from app.conversations.errors import (
+    ConversationAccessDeniedError,
+    PlanNotPendingError,
+)
 from app.db.schemas import (
     Conversation,
     ConversationCreate,
     ConversationStatus,
     Plan,
+    PlanStatus,
     Turn,
 )
 from app.repositories.conversations import ConversationRepository
@@ -216,6 +220,88 @@ class ConversationService:
             return conversation
 
         return await self._conversations.set_status(conversation_id, "idle")
+
+    # ------------------------------------------------------------------
+    # Plan approve / reject (T20 / #43)
+    # ------------------------------------------------------------------
+
+    async def approve_plan(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+    ) -> Plan:
+        """HITL approval: flip the conversation's pending Plan to `approved`.
+
+        Per ADR-0004 the Plan preview is a one-shot checkpoint — the
+        business user approves the Plan "as-is" here; edits (ADR-0019)
+        are a sibling endpoint that lands in T26. Ownership guard
+        mirrors `archive`: a stranger can't tell "this exists but
+        isn't yours" apart from "this doesn't exist". The Plan must
+        be in `pending` — already-approved / rejected / executing
+        rows raise `PlanNotPendingError` (409) so the audit lifecycle
+        never rewinds.
+
+        The endpoint is conversation-scoped (no `plan_id` in the
+        path) because per ADR-0005 a conversation has at most one
+        "active" Plan at a time. The latest Plan is the one the
+        React Flow drawer (T19) is rendering — that's the row the
+        button in the drawer header approves.
+        """
+        return await self._decide_plan(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            target_status="approved",
+        )
+
+    async def reject_plan(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+    ) -> Plan:
+        """HITL rejection: flip the conversation's pending Plan to `rejected`.
+
+        Mirrors `approve_plan` — same ownership + status-guard
+        contract. A rejected Plan keeps the conversation alive
+        (ADR-0011's `archived` transition is independent of Plan
+        lifecycle); the user can refine the instruction and submit
+        a new Turn, which produces a new Plan row.
+        """
+        return await self._decide_plan(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            target_status="rejected",
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _decide_plan(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        target_status: PlanStatus,
+    ) -> Plan:
+        """Shared approval / rejection seam.
+
+        Order: ownership check first (404 envelope on cross-user or
+        absent rows), then Plan lookup, then status guard (409 on
+        non-pending Plans). The repo's `set_status` is the atomic
+        write so audit subscribers see exactly one status event.
+        """
+        conversation = await self._conversations.get(conversation_id)
+        _assert_owner(conversation, user_id)
+
+        plan = await self._plans.get_latest_for_conversation(conversation_id)
+        if plan.status != "pending":
+            raise PlanNotPendingError(
+                details={"plan_id": plan.id, "current_status": plan.status},
+            )
+
+        return await self._plans.set_status(plan.id, target_status)
 
 
 # ---------------------------------------------------------------------------
