@@ -36,6 +36,7 @@ from app.repositories.turns import TurnRepository
 from app.repositories.users import UserRepository
 from app.security.crypto import CredentialEncryptor
 from app.settings import Settings, get_settings
+from app.tools.openapi_parser import OpenAPIParser
 from app.tools.service import ToolService
 
 
@@ -262,3 +263,15 @@ def get_tool_service(
     inject a stubbed service without touching the lifespan.
     """
     return ToolService(tool_repository=tool_repo)
+
+
+def get_openapi_parser() -> OpenAPIParser:
+    """FastAPI dependency: build a fresh `OpenAPIParser` per request (T14 / #12).
+
+    The parser holds no I/O state — every parse call walks the
+    in-memory spec dict — so a fresh instance is the same cost as a
+    singleton and avoids cross-request bleed-through. Tests that
+    want to stub the parser override this dependency rather than
+    patching the class.
+    """
+    return OpenAPIParser()

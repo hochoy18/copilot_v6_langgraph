@@ -1,13 +1,16 @@
-"""`/api/v1/admin/tools` router — T12 / #11.
+"""`/api/v1/admin/tools` router — T12 / #11 + T14 / #12.
 
 The admin-facing HTTP seam for Tool CRUD per ADR-0003 / ADR-0018 /
-ADR-0031. Four endpoints:
+ADR-0031. Endpoints:
 
-* `POST   /api/v1/admin/tools`          — manual registration.
-* `GET    /api/v1/admin/tools`          — list with optional filters.
-* `GET    /api/v1/admin/tools/{id}`     — single Tool detail.
-* `PATCH  /api/v1/admin/tools/{id}`     — partial update (description,
-                                          risk_level, status, …).
+* `POST   /api/v1/admin/tools`               — manual registration.
+* `GET    /api/v1/admin/tools`               — list with optional filters.
+* `GET    /api/v1/admin/tools/{id}`          — single Tool detail.
+* `PATCH  /api/v1/admin/tools/{id}`          — partial update (description,
+                                               risk_level, status, …).
+* `POST   /api/v1/admin/tools/import/openapi` — OpenAPI spec → draft preview
+                                               (T14 / #12; rows are NOT
+                                               persisted — see ADR-0018).
 
 Auth is enforced by `require_admin_user` (T12 / #11), which layers on
 top of `get_current_user` to also verify the caller holds the
@@ -15,8 +18,10 @@ top of `get_current_user` to also verify the caller holds the
 the canonical `User` row attached, never with a raw role lookup.
 
 The router is intentionally thin: every byte of business logic lives
-in `app.tools.service.ToolService`. This file exists only to translate
-Pydantic wire shapes into service calls and back.
+in `app.tools.service.ToolService` (manual CRUD) or
+`app.tools.openapi_parser.OpenAPIParser` (T14 / #12). This file
+exists only to translate Pydantic wire shapes into service calls
+and back.
 
 Why `admin_router` lives here rather than in `app.api.auth`
 -----------------------------------------------------------
@@ -29,12 +34,13 @@ without further edits to `main.py`.
 """
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import asdict
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from app.db.dependencies import get_tool_service
+from app.db.dependencies import get_openapi_parser, get_tool_service
 from app.db.schemas import (
     Tool,
     ToolCreate,
@@ -44,6 +50,7 @@ from app.db.schemas import (
     User,
 )
 from app.security.admin import require_admin_user
+from app.tools.openapi_parser import OpenAPIParser
 from app.tools.service import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, ToolService
 
 router = APIRouter(prefix="/api/v1/admin/tools", tags=["admin"])
@@ -377,6 +384,187 @@ async def patch_tool(
     else:
         tool = await svc.update(tool_id=tool_id, patch=patch)
     return _tool_to_response(tool)
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI import — T14 / #12
+# ---------------------------------------------------------------------------
+#
+# Per ADR-0003 / ADR-0018 this endpoint accepts an OpenAPI 3.x spec
+# and returns a *preview* of the draft Tools it would derive. The
+# admin reviews the preview, optionally edits slugs / risk levels,
+# then a future `import/confirm` endpoint (out of T14's scope) turns
+# the selections into persisted rows. No row is written here.
+
+
+class ImportOpenAPIRequest(BaseModel):
+    """Body of `POST /api/v1/admin/tools/import/openapi`.
+
+    Exactly one of `spec` / `spec_yaml` must be set — Pydantic
+    surfaces that as `422` so the admin UI gets a clear "choose one
+    source" message rather than silently picking one. URL fetching
+    is a future ticket; the field is intentionally absent so the
+    wire doesn't carry an always-400 path.
+
+    The source discriminator is the field the admin fills in; the
+    route hands the right shape to `OpenAPIParser.parse*` and lets
+    the parser own YAML/JSON text decoding.
+    """
+
+    spec: dict[str, Any] | None = Field(
+        default=None,
+        description="Inline OpenAPI document as a JSON object.",
+    )
+    spec_yaml: str | None = Field(
+        default=None,
+        max_length=2 * 1024 * 1024,
+        description=(
+            "Inline OpenAPI document as a YAML string. "
+            "2 MiB cap mirrors common gateway limits."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> ImportOpenAPIRequest:
+        """Reject requests that supply zero or multiple source fields.
+
+        Empty bodies fall through to Pydantic's `422` envelope; multi-
+        source requests would force the route to pick one arbitrarily,
+        which is worse than failing fast. The validator lives on the
+        request model so the route stays declarative.
+        """
+        present = [s for s in (self.spec, self.spec_yaml) if s is not None]
+        if len(present) != 1:
+            raise ValueError(
+                "exactly one of `spec` / `spec_yaml` must be set",
+            )
+        return self
+
+
+class ToolDraftResponse(BaseModel):
+    """Wire shape of a single OpenAPI-derived draft Tool.
+
+    Mirrors the manual-registration `ToolResponse` plus two preview-
+    only fields (`operation_ref`, `warnings`). `operation_ref` is the
+    human-readable pointer the admin UI renders in the preview list
+    ("GET /pets/{id}") — re-derivable, but pinning it on the wire
+    means the UI never has to parse `http_method` + `http_url_template`
+    back into a label.
+
+    `warnings` is the per-draft issue list (missing `operationId`,
+    non-JSON request body, …) so the admin can fix issues before
+    confirming. An empty list means the operation parsed cleanly.
+    """
+
+    operation_ref: str = Field(
+        description="Human-readable pointer for the preview list, e.g. `GET /pets/{id}`.",
+    )
+    name: str = Field(
+        max_length=128,
+        description="LLM-facing slug; derived from `operationId` or synthesised from path.",
+    )
+    description: str = Field(
+        max_length=4096,
+        description="LLM-friendly description. T16 will rewrite this via Langfuse.",
+    )
+    risk_level: ToolRiskLevel
+    status: ToolStatus = Field(
+        description="Always `draft` per ADR-0018 — preview rows are never active.",
+    )
+    parameters_schema: dict[str, Any]
+    http_method: str
+    http_url_template: str
+    http_headers: dict[str, str]
+    http_body_template: dict[str, Any] | None
+    source: str = Field(
+        description=(
+            "Pinned to `openapi` so the persisted row stays "
+            "distinguishable from manual entries."
+        ),
+    )
+    source_ref: str | None = Field(
+        description="Pointer back into the source spec: `method path`.",
+    )
+    credentials_ref: str | None = Field(
+        description="Always `None` at preview time — credential binding happens at confirm-time.",
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Per-operation issues the admin should review before confirming.",
+    )
+
+
+class ImportOpenAPIResponse(BaseModel):
+    """Wire shape of `POST /api/v1/admin/tools/import/openapi`.
+
+    The preview collection lives under `drafts` so a future ticket
+    can add pagination / filter metadata without breaking the parser.
+    `title` / `version` / `server_url` are surfaced verbatim from the
+    spec for the UI's header banner — no re-derivation.
+    """
+
+    drafts: list[ToolDraftResponse] = Field(
+        description="One draft per operation, sorted by (method, path) deterministically.",
+    )
+    title: str | None = Field(
+        default=None,
+        description="From `info.title`. Shown in the preview header.",
+    )
+    version: str | None = Field(
+        default=None,
+        description="From `info.version`. Shown alongside the title.",
+    )
+    server_url: str | None = Field(
+        default=None,
+        description=(
+            "Resolved base URL (first `servers[].url`). "
+            "Used for `http_url_template` derivation."
+        ),
+    )
+    source_format: Literal["json", "yaml"] = Field(
+        description="Format the spec was parsed in. UI uses this for the 'parsed from' badge.",
+    )
+
+
+@router.post(
+    "/import/openapi",
+    response_model=ImportOpenAPIResponse,
+    summary="Preview draft Tools derived from an OpenAPI spec (admin only)",
+)
+async def import_openapi(
+    body: ImportOpenAPIRequest,
+    _admin: User = Depends(require_admin_user),  # noqa: B008
+    parser: OpenAPIParser = Depends(get_openapi_parser),  # noqa: B008
+) -> ImportOpenAPIResponse:
+    """`POST /api/v1/admin/tools/import/openapi` — T14 / #12.
+
+    Accepts an OpenAPI 3.x spec (JSON or YAML, inline) and returns
+    one draft Tool per operation. The preview is **not persisted**;
+    a future confirm endpoint takes the admin's selections and
+    inserts rows via `ToolRepository.create`.
+
+    Per ADR-0018 every draft lands in `status='draft'`. The admin
+    edits `description` / `risk_level` per draft and activates
+    selected ones via `PATCH /api/v1/admin/tools/{id}`.
+
+    The route dispatches on which source field is set so the YAML
+    decoding stays inside `OpenAPIParser.parse_yaml` rather than
+    leaking into the wire-shape translation layer.
+    """
+    if body.spec is not None:
+        result = parser.parse(body.spec)
+    else:
+        # `_exactly_one_source` guarantees `spec_yaml` is set.
+        assert body.spec_yaml is not None  # narrow for mypy
+        result = parser.parse_yaml(body.spec_yaml)
+
+    return ImportOpenAPIResponse(
+        drafts=[ToolDraftResponse(**asdict(d)) for d in result.drafts],
+        title=result.title,
+        version=result.version,
+        server_url=result.server_url,
+        source_format=result.source_format,
+    )
 
 
 __all__ = ["router"]

@@ -62,7 +62,7 @@ strict = true
 files = ["app", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["mongomock_motor", "mongomock"]
+module = ["mongomock_motor", "mongomock", "yaml"]
 ignore_missing_imports = true
 
 [tool.ruff]
