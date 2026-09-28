@@ -71,10 +71,11 @@ export interface ImportOpenAPIResponse {
 /**
  * Body of `POST /api/v1/admin/tools`.
  *
- * Mirrors `app.api.admin_tools.CreateToolRequest` minus the fields
- * the server pins (`source='manual'`, `status='draft'`) and minus
- * `id` / `created_at` / `updated_at`. The frontend assembles this
- * shape from a draft row and posts it during "Activate".
+ * Mirrors `app.api.admin_tools.CreateToolRequest`. The frontend
+ * defaults `source` to `'openapi'` when activating an import draft
+ * so the persisted row keeps its provenance (ADR-0003 §21). Manual
+ * registration forms can pass `'manual'` explicitly or omit it to
+ * inherit the server default.
  */
 export interface CreateToolRequestBody {
   name: string
@@ -85,6 +86,7 @@ export interface CreateToolRequestBody {
   http_url_template: string
   http_headers: Record<string, string>
   http_body_template: Record<string, unknown> | null
+  source?: 'openapi' | 'manual'
   source_ref?: string | null
   credentials_ref?: string | null
 }

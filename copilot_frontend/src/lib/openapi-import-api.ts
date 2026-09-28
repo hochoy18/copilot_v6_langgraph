@@ -125,9 +125,12 @@ export async function setToolStatus(params: SetToolStatusParams): Promise<Tool> 
 /**
  * Shape the "Activate" button needs from a draft to drive the two-
  * step create-then-activate flow. Pulled out so the component stays
- * declarative; the fields match `CreateToolRequestBody` 1:1 and
- * carry the draft's `source_ref` (`method path`) so future re-syncs
- * can trace the row back to its OpenAPI origin.
+ * declarative; the fields match `CreateToolRequestBody` 1:1.
+ *
+ * `source` is pinned to `'openapi'` so the persisted row carries
+ * its ADR-0003 §21 provenance — the Registry must keep a pointer
+ * from the live Tool back to the originating artefact so a future
+ * re-sync can re-derive the row if the upstream API changes.
  */
 export function draftToCreateBody(draft: ToolDraft): CreateToolRequestBody {
   return {
@@ -139,6 +142,7 @@ export function draftToCreateBody(draft: ToolDraft): CreateToolRequestBody {
     http_url_template: draft.http_url_template,
     http_headers: draft.http_headers,
     http_body_template: draft.http_body_template,
+    source: 'openapi',
     source_ref: draft.source_ref,
     credentials_ref: draft.credentials_ref,
   }

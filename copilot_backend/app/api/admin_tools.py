@@ -1,9 +1,12 @@
-"""`/api/v1/admin/tools` router — T12 / #11 + T14 / #12.
+"""`/api/v1/admin/tools` router — T12 / #11 + T14 / #12 + T15 / #13.
 
 The admin-facing HTTP seam for Tool CRUD per ADR-0003 / ADR-0018 /
 ADR-0031. Endpoints:
 
-* `POST   /api/v1/admin/tools`               — manual registration.
+* `POST   /api/v1/admin/tools`               — manual registration, OR
+                                               activate-an-OpenAPI-draft
+                                               (T15 / #13 carries the
+                                               `source` field forward).
 * `GET    /api/v1/admin/tools`               — list with optional filters.
 * `GET    /api/v1/admin/tools/{id}`          — single Tool detail.
 * `PATCH  /api/v1/admin/tools/{id}`          — partial update (description,
@@ -45,6 +48,7 @@ from app.db.schemas import (
     Tool,
     ToolCreate,
     ToolRiskLevel,
+    ToolSource,
     ToolStatus,
     ToolUpdate,
     User,
@@ -106,9 +110,14 @@ class CreateToolRequest(BaseModel):
         default=None,
         description="Optional JSON body template; the Worker renders `parameters` into it.",
     )
-    source: str = Field(
+    source: ToolSource = Field(
         default="manual",
-        description="Originating path per ADR-0003. Manual registrations pin `manual`.",
+        description=(
+            "Originating path per ADR-0003. The default `manual` covers the "
+            "ad-hoc registration flow; T15 / #13's OpenAPI import preview "
+            "forwards `openapi` so the persisted row keeps its provenance "
+            "(per ADR-0003 §21)."
+        ),
     )
     source_ref: str | None = Field(
         default=None,
@@ -247,9 +256,14 @@ async def create_tool(
         http_url_template=body.http_url_template,
         http_headers=body.http_headers,
         http_body_template=body.http_body_template,
-        # `source` is pinned to `manual` for this route per ADR-0003
-        # (the OpenAPI import path is a separate endpoint, T14).
-        source="manual",
+        # `source` defaults to `manual` for the ad-hoc registration
+        # flow (T12). T15 / #13's OpenAPI import preview forwards
+        # `openapi` so the persisted row keeps its provenance per
+        # ADR-0003 §21 ("注册中心保留原始导入产物…与活跃 Tool 的对
+        # 应关系"). The default is preserved so existing manual
+        # callers (T13 ToolsTable's future "create" button, ad-hoc
+        # admin scripts) keep working without rewrites.
+        source=body.source,
         source_ref=body.source_ref,
         credentials_ref=body.credentials_ref,
     )

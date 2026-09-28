@@ -326,6 +326,62 @@ class TestCreateTool:
         assert resp.status_code == 401
         assert resp.json()["code"] == "auth_missing_token"
 
+    async def test_create_with_source_openapi_preserves_provenance(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        user_repo: UserRepository,
+        role_repo: RoleRepository,
+        settings: Settings,
+    ) -> None:
+        """T15 / #13 forwards `source='openapi'` from the import preview.
+
+        Per ADR-0003 §21 the Registry must preserve the originating
+        artefact so admin tooling can re-derive the Tool if upstream
+        changes. The manual default stays intact for ad-hoc callers.
+        """
+        headers = await _admin_bearer(
+            user_repo=user_repo,
+            role_repo=role_repo,
+            settings=settings,
+        )
+        resp = await client.post(
+            "/api/v1/admin/tools",
+            json=_valid_create_body(
+                name="list_pets_from_openapi",
+                source="openapi",
+                source_ref="get /pets",
+            ),
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["source"] == "openapi"
+        assert body["source_ref"] == "get /pets"
+        # Lifecycle is unaffected — still `draft` per ADR-0018.
+        assert body["status"] == "draft"
+
+    async def test_create_with_invalid_source_returns_422(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        user_repo: UserRepository,
+        role_repo: RoleRepository,
+        settings: Settings,
+    ) -> None:
+        """`ToolSource` rejects anything outside `{openapi, manual}`."""
+        headers = await _admin_bearer(
+            user_repo=user_repo,
+            role_repo=role_repo,
+            settings=settings,
+        )
+        resp = await client.post(
+            "/api/v1/admin/tools",
+            json=_valid_create_body(source="scraped"),
+            headers=headers,
+        )
+        assert resp.status_code == 422
+
     async def test_create_non_admin_returns_403(
         self,
         app: FastAPI,

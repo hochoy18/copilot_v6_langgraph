@@ -70,10 +70,13 @@ function AdminOverview(): React.ReactElement {
   return (
     <section className="flex flex-col items-start gap-4">
       <p className="max-w-prose text-muted-foreground">
-        管理员后台入口。Tool Registry 已上线 — 后续将接入 OpenAPI 导入 / 审计日志 / 告警收件(ADR-0029)。
+        管理员后台入口。Tool Registry 与 OpenAPI 导入已上线 — 后续将接入审计日志 / 告警收件(ADR-0029)。
       </p>
       <Button asChild>
         <Link to="/admin/tools">打开 Tool Registry</Link>
+      </Button>
+      <Button asChild variant="outline">
+        <Link to="/admin/tools/import">从 OpenAPI spec 导入 Tool</Link>
       </Button>
     </section>
   )

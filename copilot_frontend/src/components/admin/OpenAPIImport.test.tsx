@@ -252,6 +252,9 @@ describe('OpenAPIImport', () => {
       risk_level: 'read',
       http_method: 'GET',
       http_url_template: 'https://api.example.com/pets',
+      // ADR-0003 §21 — provenance must travel with the activated row.
+      source: 'openapi',
+      source_ref: 'get /pets',
     })
     const [patchUrl, patchInit] = fetchMock.mock.calls[2]
     expect(patchUrl).toBe('/api/v1/admin/tools/tool-created-1')
