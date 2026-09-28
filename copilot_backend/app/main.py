@@ -22,6 +22,8 @@ from app.api.health import router as health_router
 from app.db.mongo import MongoClient
 from app.exceptions import register_exception_handlers
 from app.health import HealthChecker
+from app.security.crypto import CredentialEncryptor
+from app.security.keys import build_credential_encryptor
 from app.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -53,17 +55,21 @@ async def _probe_dependencies(settings: Settings) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Standard FastAPI lifespan: open Mongo, probe deps, log on shutdown.
+    """Standard FastAPI lifespan: open Mongo, build encryptor, probe deps, log on shutdown.
 
-    T04 (#5) opens one `MongoClient` per process here. Closing it on
+    T04 (#5) opens one `MongoClient` per process here. T05 (#6) adds
+    the `CredentialEncryptor` instance on `app.state` so the
+    `CredentialRepository` dependency can reach it. Closing Mongo on
     shutdown is critical — Motor's client owns a connection pool plus a
     background monitoring task; letting them leak until GC leaves the
     process holding sockets open across the lifespan window.
     """
     settings = app.state.settings
     mongo = MongoClient(settings)
+    encryptor: CredentialEncryptor = build_credential_encryptor(settings)
     app.state.mongo = mongo
     app.state.database = mongo.database
+    app.state.credential_encryptor = encryptor
     try:
         await _probe_dependencies(settings)
         yield

@@ -23,7 +23,7 @@ stay JSON-serialisable for tests and API responses.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from bson import ObjectId
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -360,3 +360,296 @@ class ToolGroup(ToolGroupBase):
     tool_ids: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# tools  (T05 / #6)
+# ---------------------------------------------------------------------------
+
+
+# Per ADR-0004 / CONTEXT.md `risk_level` drives the HITL decision: `read`
+# runs automatically, `write` / `destructive` pause for human approval.
+# A new risk tier would extend this Literal — older tiers stay stable.
+ToolRiskLevel = Literal["read", "write", "destructive"]
+
+# Per ADR-0018 the Tool lifecycle is `draft` / `active` / `disabled`.
+# The LLM Planner only ever sees Tools in `active` state; `draft` is
+# admin-review-pending and `disabled` is admin-taken-offline.
+ToolStatus = Literal["draft", "active", "disabled"]
+
+# Per ADR-0003 Tools come in via two paths. The persisted `source_ref`
+# points to the originating artefact (an OpenAPI operation or a manual
+# draft blob) so admin tooling can re-derive the Tool if upstream
+# changes.
+ToolSource = Literal["openapi", "manual"]
+
+
+class ToolBase(BaseModel):
+    """Fields shared between create / read shapes for `tools`.
+
+    `name` is the LLM-facing slug — what the Planner emits in a `tool_call`.
+    `risk_level` and `status` together gate visibility (Planner sees only
+    `active` Tools, regardless of risk). `parameters_schema` is the JSON
+    Schema validated against by the Worker (ADR-0020).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Slug surfaced to the LLM in `tool_call.name`. Indexed unique.",
+    )
+    description: str = Field(
+        min_length=1,
+        max_length=4096,
+        description=(
+            "LLM-friendly description. LLM-generated at create, "
+            "admin-reviewed before activation (ADR-0018)."
+        ),
+    )
+    risk_level: ToolRiskLevel = Field(
+        description="Drives HITL: `read` runs unattended, others pause for approval (ADR-0004).",
+    )
+    status: ToolStatus = Field(
+        default="draft",
+        description=(
+            "Tool lifecycle. `draft` = admin-review-pending, "
+            "`active` = Planner-visible, `disabled` = taken offline (ADR-0018)."
+        ),
+    )
+    parameters_schema: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "JSON Schema for the Tool's arguments. Validated against "
+            "by the Worker before invocation (ADR-0020)."
+        ),
+    )
+    http_method: str = Field(
+        min_length=1,
+        max_length=16,
+        description="HTTP method for the upstream call (ADR-0003). E.g. `GET`, `POST`.",
+    )
+    http_url_template: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="URL template for the upstream call (ADR-0003). Supports `{var}` placeholders.",
+    )
+    http_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Static headers attached to every call.",
+    )
+    http_body_template: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional JSON template for the request body. The Worker "
+            "renders `parameters` into this template before sending."
+        ),
+    )
+    source: ToolSource = Field(
+        description="Originating path per ADR-0003: `openapi` import or `manual` registration.",
+    )
+    source_ref: str | None = Field(
+        default=None,
+        max_length=512,
+        description=(
+            "Opaque pointer to the source document (OpenAPI operationId "
+            "or manual draft id). Lets admin tooling re-derive the Tool."
+        ),
+    )
+
+
+class ToolCreate(ToolBase):
+    """Input shape for creating a Tool.
+
+    `credentials_ref` is a string `ObjectId` reference to `credentials._id`
+    (not embedded — credentials are encrypted at rest and shared across
+    Tools). Setting it to None means the Tool runs unauthenticated (rare;
+    mainly internal health pings).
+    """
+
+    credentials_ref: str | None = Field(
+        default=None,
+        description="ObjectId of `credentials._id`. Indexed; null for unauthenticated Tools.",
+    )
+
+
+class ToolUpdate(BaseModel):
+    """Partial update shape for `tools`.
+
+    Every field is optional so PATCH semantics hold. `risk_level` is
+    intentionally updatable: an admin promoting a Tool from `read` to
+    `write` shouldn't have to delete-and-recreate the row (Plan
+    snapshots preserve the previous `risk_level` for already-issued
+    Plans — see ADR-0027).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = Field(default=None, min_length=1, max_length=4096)
+    risk_level: ToolRiskLevel | None = None
+    status: ToolStatus | None = None
+    parameters_schema: dict[str, Any] | None = None
+    http_method: str | None = Field(default=None, min_length=1, max_length=16)
+    http_url_template: str | None = Field(default=None, min_length=1, max_length=2048)
+    http_headers: dict[str, str] | None = None
+    http_body_template: dict[str, Any] | None = None
+    credentials_ref: str | None = None
+
+
+class ToolInDB(ToolBase):
+    """Persisted shape of a `tools` document.
+
+    `_id` is the canonical Mongo ObjectId (as a string). `created_at` /
+    `updated_at` are stamped by the repository. `credentials_ref` is a
+    foreign-key style pointer to `credentials._id`; the repository
+    keeps it as a string so the persisted doc stays JSON-friendly for
+    tests.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: PyObjectId = Field(alias="_id")
+    credentials_ref: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class Tool(ToolInDB):
+    """Canonical read shape — what API responses return.
+
+    Inherits every persisted field directly. Unlike `User.from_db`
+    there's no secret to redact here: the encryption layer keeps the
+    credential bytes out of the Tool document entirely (they live in
+    `credentials`). What `Tool` carries is just the foreign-key
+    pointer.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
+# credentials  (T05 / #6)
+# ---------------------------------------------------------------------------
+
+
+# Per ADR-0002 the Credential type is whatever the upstream API needs.
+# The four values here cover the common enterprise auth schemes; a
+# new type (e.g. `oauth2_client_credentials`) extends this Literal.
+CredentialAuthType = Literal["api_key", "bearer", "basic", "mtls"]
+
+
+class CredentialBase(BaseModel):
+    """Fields shared between create / read shapes for `credentials`.
+
+    The encrypted payload is opaque to every layer except the Worker
+    that injects it at call time. `auth_type` tells the Worker how to
+    shape the bytes into the right HTTP header / TLS context.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        description=(
+            "Admin-facing label. Indexed unique. Conventional: "
+            "`<system>-<env>`, e.g. `salesforce-prod`."
+        ),
+    )
+    auth_type: Literal["api_key", "bearer", "basic", "mtls"] = Field(
+        description=(
+            "How the Worker should shape the decrypted bytes: "
+            "`api_key` → `X-Api-Key`, `bearer` → `Authorization: Bearer …`, "
+            "`basic` → `Authorization: Basic …`, `mtls` → client cert."
+        ),
+    )
+
+
+class CredentialCreate(CredentialBase):
+    """Input shape for creating a Credential.
+
+    `plaintext_payload` is the unencrypted bytes (or JSON object) the
+    repository seals before persisting. Repositories accept `dict`
+    here for the common `{"key": "...", "secret": "..."}` shape and
+    serialise to JSON internally; tests can pass `bytes` directly for
+    arbitrary binary credentials.
+    """
+
+    plaintext_payload: dict[str, Any] | bytes = Field(
+        description=(
+            "Unencrypted credential material. Dicts are JSON-encoded "
+            "with sorted keys before encryption; bytes pass through "
+            "verbatim. The repository rejects any other type via "
+            "`_serialise_plaintext` before the encryptor sees it — "
+            "never log this field."
+        ),
+    )
+
+
+class CredentialUpdate(BaseModel):
+    """Partial update shape for `credentials`.
+
+    Only `name` is updatable through this model; rotating the credential
+    bytes is a separate `rotate_payload` call (see ADR-0024) that
+    stamps `last_rotated_at`. Letting `update` touch the bytes would
+    make rotation indistinguishable from generic edits in audit logs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    auth_type: CredentialAuthType | None = None
+
+
+class CredentialInDB(CredentialBase):
+    """Persisted shape of a `credentials` document.
+
+    `payload` / `nonce` are `bytes` (BSON `Binary` on the wire) and are
+    NEVER returned by the canonical read shape — they're the at-rest
+    encrypted bytes (ADR-0002). `key_id` records which master-key
+    sealed the row so a future multi-key rotation can re-open older
+    ciphertexts.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: PyObjectId = Field(alias="_id")
+    payload: bytes = Field(description="AES-256-GCM ciphertext. Decrypt via the encryptor.")
+    nonce: bytes = Field(description="12-byte GCM nonce. Distinct per row.")
+    key_id: str = Field(description="Identifier of the master key that sealed this row.")
+    created_at: datetime
+    updated_at: datetime
+    last_rotated_at: datetime | None = Field(
+        default=None,
+        description="Stamp from the most recent `rotate_payload` call (ADR-0024).",
+    )
+
+
+class Credential(CredentialBase):
+    """Canonical read shape — what API responses return.
+
+    Strips `payload` / `nonce` so a future Tool by ID endpoint cannot
+    accidentally surface ciphertext bytes (decryption happens only in
+    the Worker). The repository's `get_in_db` variant returns the
+    persisted row with the bytes intact.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: PyObjectId = Field(alias="_id")
+    created_at: datetime
+    updated_at: datetime
+    last_rotated_at: datetime | None = None
+
+    @classmethod
+    def from_db(cls, row: CredentialInDB) -> Credential:
+        """Strip the encrypted bytes + nonce and return the canonical shape."""
+        return cls(
+            _id=row.id,
+            name=row.name,
+            auth_type=row.auth_type,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            last_rotated_at=row.last_rotated_at,
+        )

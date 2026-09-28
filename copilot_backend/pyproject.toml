@@ -18,6 +18,10 @@ dependencies = [
     "httpx==0.28.1",
     "motor==3.6.0",
     "email-validator>=2.3.0",
+    # T05 (#6) — authenticated encryption for stored Tool credentials.
+    # `cryptography` is the well-maintained PyCA binding; AES-256-GCM is
+    # implemented in constant time inside OpenSSL.
+    "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]

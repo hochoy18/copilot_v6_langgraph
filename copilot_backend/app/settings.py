@@ -99,6 +99,33 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---- Credential encryption (T05 / #6) -------------------------------
+    # The symmetric key used to seal Tool credentials at rest (ADR-0002).
+    # Production should set a base64-encoded 32-byte literal via
+    # `COPILOT_CREDENTIAL_ENCRYPTION_KEY` — `.env.example` ships a
+    # dev-only passphrase that `MasterKey.from_passphrase` derives.
+    credential_encryption_key: str = Field(
+        default="dev-only-do-not-use-in-prod",
+        description=(
+            "Either a base64-encoded 32-byte key (preferred for prod) "
+            "or a human-readable passphrase (dev convenience). The "
+            "encryption layer picks the right factory based on whether "
+            "the value decodes to 32 bytes."
+        ),
+    )
+    credential_encryption_salt: str = Field(
+        default="copilot-dev-salt-001",
+        min_length=16,
+        description=(
+            "PBKDF2 salt for passphrase-derived keys. UTF-8 encoded "
+            "to bytes by `keys.build_credential_encryptor`; must be at "
+            "least 16 bytes after encoding (per NIST SP 800-132). The "
+            "`min_length=16` here guards against single-byte encodings "
+            "falling under the floor. Fixed in dev so restarts decrypt "
+            "existing rows."
+        ),
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

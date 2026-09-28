@@ -20,9 +20,11 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app.db.indexes import (
     CORE_COLLECTIONS,
+    CREDENTIALS,
     REFRESH_TOKENS,
     ROLES,
     TOOL_GROUPS,
+    TOOLS,
     USERS,
 )
 from app.db.init_db import init_database
@@ -38,11 +40,41 @@ class TestInitDatabase:
     """`init_database` is the contract every later ticket relies on."""
 
     @pytest.mark.asyncio
-    async def test_creates_all_four_collections(self, mock_db: object) -> None:
-        """All four core collections land on the database after init."""
+    async def test_creates_all_core_collections(self, mock_db: object) -> None:
+        """All six core collections land on the database after init.
+
+        T05 (#6) extends the four-collection seed (users / roles /
+        refresh_tokens / tool_groups) with `tools` and `credentials`.
+        The acceptance criterion for the ticket is "2 collection 创建",
+        so we pin both here.
+        """
         await init_database(mock_db)  # type: ignore[arg-type]
         names = set(await mock_db.list_collection_names())  # type: ignore[attr-defined]
-        assert {USERS, ROLES, REFRESH_TOKENS, TOOL_GROUPS} <= names
+        assert {USERS, ROLES, REFRESH_TOKENS, TOOL_GROUPS, TOOLS, CREDENTIALS} <= names
+
+    @pytest.mark.asyncio
+    async def test_tool_indexes_match_spec(self, mock_db: object) -> None:
+        """`tools` indexes — unique name, by_status, compound status+risk, FK lookup."""
+        await init_database(mock_db)  # type: ignore[arg-type]
+        info = await mock_db[TOOLS].index_information()  # type: ignore[index]
+        assert set(info.keys()) == {
+            "_id_",
+            "uniq_name",
+            "by_status",
+            "by_status_risk_level",
+            "by_credentials_ref",
+        }
+        assert info["uniq_name"].get("unique") is True
+        assert info["by_status"].get("unique") is None
+        assert info["by_status_risk_level"].get("unique") is None
+
+    @pytest.mark.asyncio
+    async def test_credential_indexes_match_spec(self, mock_db: object) -> None:
+        """`credentials` indexes — unique name, by_key_id for rotation drill-down."""
+        await init_database(mock_db)  # type: ignore[arg-type]
+        info = await mock_db[CREDENTIALS].index_information()  # type: ignore[index]
+        assert set(info.keys()) == {"_id_", "uniq_name", "by_key_id"}
+        assert info["uniq_name"].get("unique") is True
 
     @pytest.mark.asyncio
     async def test_is_idempotent(self, mock_db: object) -> None:

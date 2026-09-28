@@ -29,9 +29,18 @@ USERS = "users"
 ROLES = "roles"
 REFRESH_TOKENS = "refresh_tokens"
 TOOL_GROUPS = "tool_groups"
+TOOLS = "tools"
+CREDENTIALS = "credentials"
 
 
-CORE_COLLECTIONS: tuple[str, ...] = (USERS, ROLES, REFRESH_TOKENS, TOOL_GROUPS)
+CORE_COLLECTIONS: tuple[str, ...] = (
+    USERS,
+    ROLES,
+    REFRESH_TOKENS,
+    TOOL_GROUPS,
+    TOOLS,
+    CREDENTIALS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +109,37 @@ TOOL_GROUP_INDEXES: list[IndexModel] = [
 ]
 
 
+# `tools` (T05 / #6) — per ADR-0018 the runtime filter is
+# `{status: "active"}` over the whole registry; an index on `status`
+# alone lets the Planner load the active set in one shot. `risk_level`
+# is a secondary filter for the admin dashboard and is paired with
+# `status` so compound queries hit one index.
+TOOL_INDEXES: list[IndexModel] = [
+    # `name` is the LLM-facing slug. Unique so two Tools can't claim
+    # the same identifier in a Plan.
+    IndexModel([("name", ASCENDING)], unique=True, name="uniq_name"),
+    # Primary runtime filter: "give me every active Tool".
+    IndexModel([("status", ASCENDING)], name="by_status"),
+    # Admin dashboard + audit drill-down by risk tier.
+    IndexModel(
+        [("status", ASCENDING), ("risk_level", ASCENDING)],
+        name="by_status_risk_level",
+    ),
+    # FK lookup from the credential rotation flow: list Tools that
+    # use a given credential row (ADR-0024).
+    IndexModel([("credentials_ref", ASCENDING)], name="by_credentials_ref"),
+]
+
+# `credentials` (T05 / #6) — the admin labels credentials by `name`
+# (`salesforce-prod`, etc.), so it gets a unique index. A `key_id`
+# index supports the future multi-key rotation flow (find every
+# ciphertext sealed under the deprecated key).
+CREDENTIAL_INDEXES: list[IndexModel] = [
+    IndexModel([("name", ASCENDING)], unique=True, name="uniq_name"),
+    IndexModel([("key_id", ASCENDING)], name="by_key_id"),
+]
+
+
 # ---------------------------------------------------------------------------
 # Aggregator: lookup by collection name → index list.
 # ---------------------------------------------------------------------------
@@ -109,6 +149,8 @@ INDEX_SPECS: dict[str, list[IndexModel]] = {
     ROLES: ROLE_INDEXES,
     REFRESH_TOKENS: REFRESH_TOKEN_INDEXES,
     TOOL_GROUPS: TOOL_GROUP_INDEXES,
+    TOOLS: TOOL_INDEXES,
+    CREDENTIALS: CREDENTIAL_INDEXES,
 }
 
 

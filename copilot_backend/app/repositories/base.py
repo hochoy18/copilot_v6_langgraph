@@ -37,13 +37,18 @@ TUpdate = TypeVar("TUpdate")
 
 
 def utcnow() -> datetime:
-    """Return the current UTC time as a naive datetime.
+    """Return the current UTC time as a naive datetime, millisecond-precision.
 
-    MongoDB stores datetimes as BSON `Date` which is always UTC. We
-    intentionally drop tzinfo here so the values round-trip through
-    Pydantic / Motor without coercion surprises.
+    MongoDB stores datetimes as BSON `Date` which is always UTC and
+    milliseconds — anything finer is truncated on the round-trip. We
+    intentionally drop tzinfo AND sub-millisecond precision so an
+    in-memory timestamp equals what comes out of a follow-up
+    `find_one_and_update`. The two together let tests assert
+    `created_at == updated_at` (same insert) and `updated.created_at ==
+    created.created_at` (unchanged across an update) without flake.
     """
-    return datetime.now(UTC).replace(tzinfo=None)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    return now.replace(microsecond=(now.microsecond // 1000) * 1000)
 
 
 class BaseRepository(Generic[TRead, TCreate, TUpdate]):
