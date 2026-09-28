@@ -159,8 +159,11 @@ class PlannerService:
                     PromptUnavailableError,
                     LLMGenerationError,
                 ) as exc:
+                    # `message_zh` (not `_en`): the warning is a Chinese
+                    # sentence for the chat panel; splicing English text
+                    # into it would read as a half-translated UI string.
                     warnings.append(
-                        f"Planner 生成失败: {exc.message_en}; 本轮未生成 Plan。"
+                        f"Planner 生成失败: {exc.message_zh}; 本轮未生成 Plan。"
                     )
                 else:
                     warnings.extend(intent.warnings)

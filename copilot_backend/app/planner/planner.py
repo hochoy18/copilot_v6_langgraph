@@ -219,11 +219,16 @@ def parse_planner_output(content: str, tools: Sequence[Tool]) -> PlanIntent:
             details={"reason": "no JSON object found"},
         )
 
-    raw_nodes = payload.get("nodes")
-    if raw_nodes is None:
-        # Tolerate the smallest shape of "no plan" — an empty object
-        # is semantically `{"nodes": []}` and shouldn't burn the turn.
-        return PlanIntent(nodes=[], warnings=[])
+    # `nodes` must be present: a well-formed answer that lacks it (a
+    # hallucinated wrapper key, a model that "forgot" the contract) is
+    # indistinguishable from legitimate smalltalk if we tolerate it —
+    # so the contract stays strict and the failure is typed + visible.
+    if "nodes" not in payload:
+        raise LLMGenerationError(
+            message_en="Planner output is not the JSON contract",
+            details={"reason": "'nodes' key missing"},
+        )
+    raw_nodes = payload["nodes"]
     if not isinstance(raw_nodes, list):
         raise LLMGenerationError(
             message_en="Planner output is not the JSON contract",

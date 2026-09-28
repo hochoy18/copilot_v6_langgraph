@@ -250,9 +250,13 @@ class TestParsePlannerOutput:
         assert intent.nodes == []
         assert intent.warnings == []
 
-    def test_missing_nodes_key_treated_as_no_plan(self) -> None:
-        intent = parse_planner_output("{}", [_tool()])
-        assert intent.nodes == []
+    def test_missing_nodes_key_raises(self) -> None:
+        """A well-formed JSON object that breaks the contract must not
+        masquerade as legitimate smalltalk (`{"nodes": []}`)."""
+        with pytest.raises(LLMGenerationError):
+            parse_planner_output("{}", [_tool()])
+        with pytest.raises(LLMGenerationError):
+            parse_planner_output('{"plan": [{"tool": "echo"}]}', [_tool()])
 
     def test_non_json_raises_generation_error(self) -> None:
         with pytest.raises(LLMGenerationError):
