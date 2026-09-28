@@ -1,20 +1,22 @@
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
 
+import { OpenAPIImport } from '@/components/admin/OpenAPIImport'
 import { ToolsTable } from '@/components/admin/ToolsTable'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
 /**
- * Admin shell — T13 / #42 (and future admin tickets).
+ * Admin shell — T13 / #42 + T15 / #13 (and future admin tickets).
  *
  * Routes:
- * - `/admin`         — landing summary (placeholder for now).
- * - `/admin/tools`   — Tool Registry table (T13).
+ * - `/admin`               — landing summary.
+ * - `/admin/tools`         — Tool Registry table (T13).
+ * - `/admin/tools/import`  — OpenAPI import preview (T15).
  *
- * Each future admin surface (OpenAPI import, audit log, alerts) will
- * land as a sibling route, keeping `AdminPage.tsx` as the chrome
- * (top nav, layout) only. Pages stay free to assume their own
- * layout needs without inheriting sibling structure.
+ * Each future admin surface (audit log, alerts) lands as a sibling
+ * route, keeping `AdminPage.tsx` as the chrome (top nav, layout)
+ * only. Pages stay free to assume their own layout needs without
+ * inheriting sibling structure.
  */
 export function AdminPage(): React.ReactElement {
   return (
@@ -27,11 +29,13 @@ export function AdminPage(): React.ReactElement {
         <nav className="ml-auto flex gap-2" aria-label="admin sections">
           <AdminNavLink to="/admin">总览</AdminNavLink>
           <AdminNavLink to="/admin/tools">Tool Registry</AdminNavLink>
+          <AdminNavLink to="/admin/tools/import">OpenAPI 导入</AdminNavLink>
         </nav>
       </header>
       <Routes>
         <Route index element={<AdminOverview />} />
         <Route path="tools" element={<ToolsTable />} />
+        <Route path="tools/import" element={<OpenAPIImport />} />
       </Routes>
     </main>
   )
