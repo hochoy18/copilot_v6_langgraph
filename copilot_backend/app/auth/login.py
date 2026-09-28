@@ -41,7 +41,11 @@ import time
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 
-from app.auth.errors import OIDCStateMismatchError, UserInactiveError
+from app.auth.errors import (
+    OIDCStateMismatchError,
+    RefreshTokenNotFoundError,
+    UserInactiveError,
+)
 from app.auth.oidc import (
     OIDCAdapter,
     VerifiedIDTokenClaims,
@@ -282,6 +286,67 @@ class OIDCLoginService:
             user=user,
             access_token=access_token,
             refresh_token=refresh_raw,
+            token_type="Bearer",
+            expires_in=expires_in,
+        )
+
+    # ------------------------------------------------------------------
+    # Refresh
+    # ------------------------------------------------------------------
+
+    async def refresh(self, raw_refresh_token: str) -> LoginCompleteResult:
+        """Rotate the refresh token + mint a fresh access JWT.
+
+        Mirrors `complete_login`'s wire shape so the front-end can use
+        one response parser for both endpoints (ADR-0009 / ADR-0032).
+        The refresh-token rotation (T07 / #8) is the *only* stateful
+        side effect; this method then re-fetches the user so an admin
+        deactivation that landed between login and refresh bounces
+        the request with `UserInactiveError`, matching the login path.
+
+        Sequence:
+
+        1. `RefreshTokenService.rotate` — atomic claim-or-reuse-detect.
+           Raises `RefreshTokenNotFoundError` / `Expired` / `Revoked` /
+           `ReuseError` for the router to render.
+        2. `UserRepository.get` — read the canonical `User`. If the
+           row disappeared between rotate and fetch, surface as 404.
+        3. `is_active` check — deactivated users don't get a new
+           session, even if they still hold a valid refresh token.
+        4. Mint a fresh access JWT and shape the wire response.
+
+        Raises:
+            RefreshTokenNotFoundError: token absent from the database.
+            RefreshTokenExpiredError: `expires_at` elapsed.
+            RefreshTokenRevokedError: explicit revocation since issue
+                (no concurrency; the "I lost the claim" race raises
+                `RefreshTokenReuseError` instead).
+            RefreshTokenReuseError: replay of a rotated token; the
+                service has already burned the entire family.
+            UserInactiveError: user deactivated since login.
+        """
+        new_refresh_raw, rotated_row = await self._refresh.rotate(raw_refresh_token)
+        try:
+            user = await self._users.get(rotated_row.user_id)
+        except NotFoundError as exc:
+            # The user row vanished mid-rotation (admin hard-delete).
+            # Refresh tokens for a missing user are unusable by
+            # definition — surface the same 404 the refresh-token
+            # family already uses so the front-end has one envelope.
+            raise RefreshTokenNotFoundError(
+                details={"user_id": rotated_row.user_id},
+            ) from exc
+
+        if not user.is_active:
+            raise UserInactiveError(details={"user_id": user.id})
+
+        access_token = self._mint_access_token(user)
+        expires_in = self._settings.oidc_access_token_ttl_seconds
+
+        return LoginCompleteResult(
+            user=user,
+            access_token=access_token,
+            refresh_token=new_refresh_raw,
             token_type="Bearer",
             expires_in=expires_in,
         )
