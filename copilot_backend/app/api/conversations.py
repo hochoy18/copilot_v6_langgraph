@@ -1,18 +1,22 @@
-"""`/api/v1/conversations` router — T10 / #40.
+"""`/api/v1/conversations` router — T10 / #40, T18 / #16.
 
-The thin HTTP seam for conversation CRUD. Four endpoints per
-ADR-0031 + T10's acceptance criteria:
+The thin HTTP seam for conversation CRUD and turn submission. Five
+endpoints per ADR-0031:
 
 * `POST /api/v1/conversations` — create.
 * `GET  /api/v1/conversations` — list (with optional `status` filter).
 * `GET  /api/v1/conversations/{id}` — detail (with turns + plans).
+* `POST /api/v1/conversations/{id}/turns` — submit a user Turn and
+  run the Planner (T18). Synchronous for now: the response carries
+  the generated Plan (status `pending`, awaiting the HITL preview —
+  ADR-0004); the SSE event stream `plan.generated` etc. is T23 (#20).
 * `POST /api/v1/conversations/{id}/archive` — manual archive
   (transitions `active` / `idle` → `idle`, ADR-0011).
 
-The router is intentionally thin: every byte of business logic
-lives in `app.conversations.service.ConversationService`. This file
-exists only to translate Pydantic wire shapes into service calls
-and back.
+The router is intentionally thin: business logic lives in
+`app.conversations.service.ConversationService` (CRUD) and
+`app.planner.service.PlannerService` (turn → Plan). This file exists
+only to translate Pydantic wire shapes into service calls and back.
 
 Authentication is supplied by `get_current_user` (T09 / #10), which
 returns the canonical `User` row. Ownership is then enforced at the
@@ -30,7 +34,7 @@ from app.conversations.service import (
     ConversationDetail,
     ConversationService,
 )
-from app.db.dependencies import get_conversation_service
+from app.db.dependencies import get_conversation_service, get_planner_service
 from app.db.schemas import (
     Conversation,
     ConversationStatus,
@@ -38,6 +42,7 @@ from app.db.schemas import (
     Turn,
     User,
 )
+from app.planner.service import PlannerService, TurnOutcome
 from app.security.auth import get_current_user
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
@@ -118,6 +123,49 @@ class ConversationListResponse(BaseModel):
 
     conversations: list[ConversationResponse] = Field(
         description="Conversations in `last_activity_at` DESC order.",
+    )
+
+
+class CreateTurnRequest(BaseModel):
+    """Body of `POST /api/v1/conversations/{id}/turns` (T18 / #16).
+
+    `content` bounds: one user Turn is a natural-language instruction,
+    so the floor rejects empty messages and the ceiling keeps the
+    Planner prompt (and the `turns` document) bounded. The bound is
+    enforced at the wire, not in the service.
+    """
+
+    content: str = Field(
+        min_length=1,
+        max_length=4000,
+        description="Natural-language instruction from the business user.",
+    )
+
+
+class TurnResponse(BaseModel):
+    """Wire shape of `POST /api/v1/conversations/{id}/turns`.
+
+    `turn` is the persisted user Turn (its `plan_id` is backfilled
+    when a Plan was produced). `plan` is the generated Plan doc in
+    the T17 shape (`nodes` / `edges` / `tool_snapshots`, ADR-0027),
+    status `pending` — the HITL preview (T19/T20) consumes it from
+    here; `None` when the Turn needed no Plan (smalltalk) or the
+    Planner degraded (see `warnings`). Dict-typed like `turns` in the
+    detail response so new Plan fields don't force a client
+    redeploy.
+    """
+
+    turn: dict[str, Any] = Field(description="The created user Turn row.")
+    plan: dict[str, Any] | None = Field(
+        description="The pending Plan, or null when no Tool call was planned."
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-fatal notes explaining a missing/partial Plan "
+            "(Planner degradation, unknown Tools, catalog truncation). "
+            "Empty on the happy path."
+        ),
     )
 
 
@@ -266,6 +314,42 @@ async def get_conversation_detail(
         conversation=_conversation_to_response(detail.conversation),
         turns=[_turn_to_dict(t) for t in detail.turns],
         plans=[_plan_to_dict(p) for p in detail.plans],
+    )
+
+
+@router.post(
+    "/{conversation_id}/turns",
+    response_model=TurnResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Submit a user Turn and run the Planner over it",
+)
+async def submit_turn(
+    conversation_id: str,
+    body: CreateTurnRequest,
+    user: User = Depends(get_current_user),  # noqa: B008
+    svc: PlannerService = Depends(get_planner_service),  # noqa: B008
+) -> TurnResponse:
+    """`POST /api/v1/conversations/{id}/turns` — the chat write path.
+
+    Delegates the whole Turn → Plan flow to `PlannerService`
+    (ownership guard, Turn persistence, LLM Planning, snapshot
+    freezing, Plan persistence). Everything the Planner decides it
+    cannot do — no Tool matched, no LLM configured, unparseable
+    answer — still answers 201 with `plan=None` plus a warning
+    (ADR-0004 permits Plan-less Turns; silent failure is what this
+    shape prevents). State conflicts raise: another user's
+    conversation renders the 404 envelope, an archived one 409
+    (ADR-0011).
+    """
+    outcome: TurnOutcome = await svc.submit_turn(
+        conversation_id=conversation_id,
+        user_id=user.id,
+        content=body.content,
+    )
+    return TurnResponse(
+        turn=_turn_to_dict(outcome.turn),
+        plan=_plan_to_dict(outcome.plan) if outcome.plan is not None else None,
+        warnings=outcome.warnings,
     )
 
 

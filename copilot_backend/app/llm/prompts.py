@@ -22,10 +22,11 @@ review without reopening ADR-0033:
   fetch, and `PromptTemplate.source` records which rung answered.
 
 Placeholders use the Langfuse `{{variable}}` convention; see
-`app.tools.description_generator` for the render step.
+`render_template` below for the render step.
 """
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -39,10 +40,19 @@ from app.settings import Settings
 
 PromptSource = Literal["langfuse", "cache", "bootstrap"]
 
-# The canonical Langfuse Prompt name for T16. Referenced by name only —
+# The canonical Langfuse Prompt names. Referenced by name only —
 # version pinning is deliberately absent (ADR-0013: always the active
 # version).
 TOOL_DESCRIPTION_GENERATOR_PROMPT = "tool-description-generator"
+
+# SPEC §Langfuse Prompt 列表: `planner` is the Planner LLM's Prompt
+# (T18 / #16, T25 multi-node upgrade edits the Langfuse copy only).
+PLANNER_PROMPT = "planner"
+
+# Langfuse-style `{{variable}}` placeholder. `\w+` matches the variable
+# names we render; anything else (e.g. JSON braces in the template)
+# passes through untouched.
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +94,49 @@ HTTP 方法与路径: {{method}} {{path}}
 其中 typical_use_cases 为 2-4 条中文短句。
 """
 
+# Bootstrap fallback for `planner` (T18 / #16). Same contract the
+# Langfuse copy must keep: strict-JSON output, `nodes` array, Tool
+# names drawn from the rendered catalog. T18's single-node scope is
+# enforced by rule 2 — T25 lifts it in Langfuse (plus edges) without
+# a code change; the parser already accepts N nodes.
+_BOOTSTRAP_PLANNER = """\
+你是企业 API Copilot 的 Planner。请把业务人员的自然语言指令翻译成 Tool 调用计划。
+
+可用 Tool 目录(每行一个 Tool):
+{{tools}}
+
+用户指令: {{input}}
+
+规则:
+1. 只能选择目录中出现的 Tool, `tool` 必须与目录中的 name 完全一致; \
+目录中没有合适的 Tool 时输出空节点列表, 不要臆造 Tool。
+2. 当前版本一次最多规划 1 个 Tool 调用(单节点计划)。
+3. `parameters` 是 JSON 对象, 键必须来自所选 Tool 的参数说明; \
+指令未给出的可选参数直接省略, 必填参数无法确定时也输出空节点列表。
+4. `notes` 用一句中文向业务人员解释这个计划要做什么。
+5. 只输出一个 JSON 对象, 不要输出其它任何内容(包括代码围栏之外的文字):
+{"nodes": [{"tool": "<目录中的 name>", "parameters": {...}, "notes": "<一句话说明>"}]}
+不需要调用任何 Tool(闲聊 / 无法匹配)时输出 {"nodes": []}。
+"""
+
 _BOOTSTRAP_PROMPTS: dict[str, str] = {
     TOOL_DESCRIPTION_GENERATOR_PROMPT: _BOOTSTRAP_TOOL_DESCRIPTION_GENERATOR,
+    PLANNER_PROMPT: _BOOTSTRAP_PLANNER,
 }
+
+
+def render_template(text: str, variables: dict[str, str]) -> str:
+    """Substitute Langfuse `{{variable}}` placeholders.
+
+    Unknown placeholders stay literal — an admin can extend the template
+    with new variables before the code learns to supply them, and the
+    LLM sees the marker rather than a silent empty string.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        return variables.get(match.group(1), match.group(0))
+
+    return _PLACEHOLDER_RE.sub(_replace, text)
 
 
 class PromptProvider:
@@ -195,7 +245,9 @@ class PromptProvider:
 
 
 __all__ = [
+    "PLANNER_PROMPT",
     "PromptProvider",
     "PromptTemplate",
     "TOOL_DESCRIPTION_GENERATOR_PROMPT",
+    "render_template",
 ]

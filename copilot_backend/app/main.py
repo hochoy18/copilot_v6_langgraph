@@ -30,6 +30,7 @@ from app.exceptions import register_exception_handlers
 from app.health import HealthChecker
 from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
+from app.planner.planner import ToolPlanner
 from app.security.crypto import CredentialEncryptor
 from app.security.keys import build_credential_encryptor
 from app.settings import Settings, get_settings
@@ -94,9 +95,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # built lazily inside the generator (`build_chat_model(settings)`
     # on first use) — constructing it here would make an unconfigured
     # LLM a boot error, and degraded boot is deliberately allowed.
+    # T18 / #16 — the provider is shared with the Planner (stashed on
+    # app.state for `get_prompt_provider`), so it is a first-class
+    # member of the lifespan rather than an implementation detail of
+    # the description generator.
     prompt_http_client = httpx.AsyncClient()
     prompt_provider = PromptProvider(settings=settings, http_client=prompt_http_client)
+    app.state.prompt_provider = prompt_provider
     app.state.description_generator = ToolDescriptionGenerator(
+        settings=settings,
+        prompt_provider=prompt_provider,
+        chat_model_factory=lambda: build_chat_model(settings),
+    )
+    app.state.tool_planner = ToolPlanner(
         settings=settings,
         prompt_provider=prompt_provider,
         chat_model_factory=lambda: build_chat_model(settings),

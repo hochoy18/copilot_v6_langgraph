@@ -27,6 +27,8 @@ from app.auth.tokens import RefreshTokenService
 from app.conversations.service import ConversationService
 from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
+from app.planner.planner import ToolPlanner
+from app.planner.service import PlannerService
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.credentials import CredentialRepository
@@ -285,6 +287,83 @@ def get_openapi_parser() -> OpenAPIParser:
 # ---------------------------------------------------------------------------
 # LLM / description generation (T16 / #14)
 # ---------------------------------------------------------------------------
+
+
+async def get_prompt_provider(
+    request: Request,
+    settings: Settings = Depends(get_settings),  # noqa: B008  (FastAPI idiom)
+) -> AsyncIterator[PromptProvider]:
+    """FastAPI dependency: the shared `PromptProvider` (T18 / #16, ADR-0013).
+
+    The provider owns the in-process Prompt cache, so it is per-process
+    like the OIDC adapter — the lifespan stashes it on `app.state` and
+    hands its httpx client to shutdown. The fallback branch exists for
+    the test harness (same ASGITransport-skips-startup situation as
+    `get_description_generator`): it builds a throwaway provider and
+    closes its client afterwards. Tests that care about Prompt
+    behaviour override this dependency outright.
+    """
+    existing = getattr(request.app.state, "prompt_provider", None)
+    if isinstance(existing, PromptProvider):
+        yield existing
+        return
+
+    client = httpx.AsyncClient()
+    try:
+        yield PromptProvider(settings=settings, http_client=client)
+    finally:
+        await client.aclose()
+
+
+async def get_tool_planner(
+    request: Request,
+    settings: Settings = Depends(get_settings),  # noqa: B008  (FastAPI idiom)
+    prompt_provider: PromptProvider = Depends(get_prompt_provider),  # noqa: B008
+) -> AsyncIterator[ToolPlanner]:
+    """FastAPI dependency: the shared `ToolPlanner` (T18 / #16).
+
+    Same lifespan-stash / fallback-build shape as
+    `get_description_generator`: the planner caches its lazily built
+    ChatModel, so one instance per process amortises it across
+    requests. The fallback is only reached by tests that skip the
+    lifespan and don't override this dependency — with the default
+    empty LLM settings `ready` is False there, so no ChatModel is
+    ever constructed and nothing leaks. Tests that care about Planner
+    behaviour override this dependency (the canonical seam).
+    """
+    existing = getattr(request.app.state, "tool_planner", None)
+    if isinstance(existing, ToolPlanner):
+        yield existing
+        return
+
+    yield ToolPlanner(
+        settings=settings,
+        prompt_provider=prompt_provider,
+        chat_model_factory=lambda: build_chat_model(settings),
+    )
+
+
+def get_planner_service(
+    conversation_repo: ConversationRepository = Depends(get_conversation_repository),  # noqa: B008
+    turn_repo: TurnRepository = Depends(get_turn_repository),  # noqa: B008
+    plan_repo: PlanRepository = Depends(get_plan_repository),  # noqa: B008
+    tool_repo: ToolRepository = Depends(get_tool_repository),  # noqa: B008
+    planner: ToolPlanner = Depends(get_tool_planner),  # noqa: B008
+) -> PlannerService:
+    """FastAPI dependency: build a `PlannerService` for this request.
+
+    Stateless beyond its collaborator references (the shared
+    `ToolPlanner` does the caching); a fresh instance per request keeps
+    the repository wiring request-scoped like the conversation
+    service's.
+    """
+    return PlannerService(
+        conversation_repository=conversation_repo,
+        turn_repository=turn_repo,
+        plan_repository=plan_repo,
+        tool_repository=tool_repo,
+        planner=planner,
+    )
 
 
 async def get_description_generator(

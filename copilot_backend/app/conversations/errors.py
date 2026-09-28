@@ -18,6 +18,7 @@ from __future__ import annotations
 from fastapi import status
 
 from app.db.errors import NotFoundError
+from app.exceptions import AppError
 
 
 class ConversationAccessDeniedError(NotFoundError):
@@ -37,4 +38,22 @@ class ConversationAccessDeniedError(NotFoundError):
     http_status = status.HTTP_404_NOT_FOUND
 
 
-__all__ = ["ConversationAccessDeniedError"]
+class ConversationArchivedError(AppError):
+    """Raised when a new Turn is submitted into an `archived` conversation.
+
+    ADR-0011 makes archived conversations read-only storage: the user
+    must reactivate (which creates a fresh conversation referencing
+    the old data) before chatting again. 409 rather than 404 because
+    the caller legitimately owns the row — this is a state conflict,
+    not an existence question. `POST /conversations/{id}/turns`
+    (T18 / #16) is the first raiser; the reactivation endpoint
+    lands with T39.
+    """
+
+    code = "conversation_archived"
+    message_zh = "会话已归档, 请重新激活后再发起对话"
+    message_en = "Conversation is archived; reactivate it before sending a new turn"
+    http_status = status.HTTP_409_CONFLICT
+
+
+__all__ = ["ConversationAccessDeniedError", "ConversationArchivedError"]

@@ -5,10 +5,13 @@ and the SSE-driven Turn writer (T23) are the first callers.
 
 Design notes:
 
-* Turns are append-only — every test exercises the create + read
-  paths that T10 (conversation detail) and T23 (SSE pipeline) reach
-  for. There is no `update` path because editing a Turn would
-  re-write history.
+* Turns are append-only *for their content* — there is no message
+  `update` path because editing a Turn would re-write history. The
+  one writable column is the `plan_id` link (T18 / #16): the Plan
+  references the Turn at creation time, so the reverse pointer can
+  only be backfilled once the Plan row exists. `set_plan_id` is the
+  dedicated path, mirroring the `set_status`-style transitions on
+  the sibling repositories.
 * `list_by_conversation` returns turns in `created_at` order so the
   Frontend chat panel can render directly. The compound index keeps
   the read an index scan even for sessions that span hundreds of
@@ -71,6 +74,30 @@ class TurnRepository(BaseRepository[Turn, TurnCreate, TurnCreate]):
         doc["created_at"] = self._now()
         await self._collection.insert_one(doc)
         return await refetch_after_insert(self._collection, doc, Turn)
+
+    # ------------------------------------------------------------------
+    # Link (the one post-insert write — see module docstring)
+    # ------------------------------------------------------------------
+
+    async def set_plan_id(self, turn_id: str, plan_id: str) -> Turn:
+        """Backfill the `plan_id` link after Plan generation (T18 / #16).
+
+        Raises `NotFoundError` if the Turn is missing. Never touches
+        `content` / `role` / timestamps — this is a pointer write, not
+        a history rewrite.
+        """
+        oid = self.to_object_id(turn_id)
+        doc = await self._collection.find_one_and_update(
+            {"_id": oid},
+            {"$set": {"plan_id": plan_id}},
+            return_document=True,
+        )
+        if doc is None:
+            raise NotFoundError(
+                message_en=f"Turn {turn_id} not found",
+                details={"turn_id": turn_id},
+            )
+        return _to_read(doc)
 
     # ------------------------------------------------------------------
     # Read

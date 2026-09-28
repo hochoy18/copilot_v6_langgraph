@@ -38,8 +38,6 @@ refuses endpoints that don't support the no-train path.
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -47,7 +45,12 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from app.llm.errors import LLMConfigurationError, LLMGenerationError
-from app.llm.prompts import TOOL_DESCRIPTION_GENERATOR_PROMPT, PromptProvider
+from app.llm.output import content_to_text, extract_json_object
+from app.llm.prompts import (
+    TOOL_DESCRIPTION_GENERATOR_PROMPT,
+    PromptProvider,
+    render_template,
+)
 from app.settings import Settings
 from app.tools.openapi_parser import ToolDraft
 
@@ -71,14 +74,6 @@ _MAX_DESCRIPTION_LENGTH = 4096
 # descriptions would swamp the prompt; the LLM mainly needs names,
 # types, and locations.
 _MAX_PARAMETERS_SUMMARY = 1200
-
-# Langfuse-style `{{variable}}` placeholder. `\w+` matches the variable
-# names we render; anything else (e.g. JSON braces in the template)
-# passes through untouched.
-_PLACEHOLDER_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
-
-# Fenced code block extractor: ```json … ``` or plain ``` … ```.
-_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 _USE_CASE_HEADER = "\n\n典型用例:\n"
 
@@ -156,7 +151,7 @@ class ToolDescriptionGenerator:
                 details={"tool_name": draft.name, "error_type": type(exc).__name__},
             ) from exc
 
-        content = _content_to_text(response.content)
+        content = content_to_text(response.content)
         description, use_cases = _parse_model_output(content, draft.name)
         composed = _compose_description(description, use_cases)
         return GeneratedDescription(
@@ -248,20 +243,6 @@ class ToolDescriptionGenerator:
 # ---------------------------------------------------------------------------
 
 
-def render_template(text: str, variables: dict[str, str]) -> str:
-    """Substitute Langfuse `{{variable}}` placeholders.
-
-    Unknown placeholders stay literal — an admin can extend the template
-    with new variables before the code learns to supply them, and the
-    LLM sees the marker rather than a silent empty string.
-    """
-
-    def _replace(match: re.Match[str]) -> str:
-        return variables.get(match.group(1), match.group(0))
-
-    return _PLACEHOLDER_RE.sub(_replace, text)
-
-
 def _draft_variables(draft: ToolDraft) -> dict[str, str]:
     """Flatten one draft into the template variable set."""
     _, _, path = draft.operation_ref.partition(" ")
@@ -270,12 +251,12 @@ def _draft_variables(draft: ToolDraft) -> dict[str, str]:
         "method": draft.http_method,
         "path": path or draft.http_url_template,
         "description": draft.description,
-        "parameters": _summarize_parameters(draft.parameters_schema),
+        "parameters": summarize_parameters(draft.parameters_schema),
         "risk_level": draft.risk_level,
     }
 
 
-def _summarize_parameters(schema: dict[str, Any]) -> str:
+def summarize_parameters(schema: dict[str, Any]) -> str:
     """Render `parameters_schema` as a compact one-line-per-parameter digest.
 
     The LLM doesn't need the full JSON Schema (type unions, nested
@@ -308,62 +289,17 @@ def _summarize_parameters(schema: dict[str, Any]) -> str:
     return summary[:_MAX_PARAMETERS_SUMMARY]
 
 
-def _content_to_text(content: Any) -> str:
-    """Normalise a LangChain message content payload to plain text.
-
-    Chat models return either `str` or a list of content blocks
-    (`{"type": "text", "text": …}` for OpenAI-compatible providers).
-    Anything else is stringified defensively — the JSON extractor
-    still gets a chance to find braces inside it.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        chunks: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                chunks.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
-                chunks.append(block["text"])
-        return "".join(chunks)
-    return str(content)
-
-
 def _parse_model_output(content: str, tool_name: str) -> tuple[str, list[str]]:
     """Extract the `{description, typical_use_cases}` contract.
 
-    Tries, in order: the whole payload as JSON, a fenced ```json block,
-    the outermost brace pair. Any of those producing a non-empty
-    `description` string passes; use cases filter down to non-empty
-    strings. Everything else raises `LLMGenerationError` so the batch
-    degrades this draft rather than storing junk.
+    `app.llm.output.extract_json_object` handles the "fenced block /
+    prose-wrapped JSON" mess; here we only police the contract: a
+    non-empty `description` string must survive, and use cases filter
+    down to non-empty strings. Anything else raises
+    `LLMGenerationError` so the batch degrades this draft rather than
+    storing junk.
     """
-    candidate = content.strip()
-    parsed: dict[str, Any] | None = None
-
-    try:
-        maybe = json.loads(candidate)
-        parsed = maybe if isinstance(maybe, dict) else None
-    except ValueError:
-        pass
-
-    if parsed is None:
-        fenced = _FENCED_JSON_RE.search(candidate)
-        if fenced is not None:
-            try:
-                maybe = json.loads(fenced.group(1))
-                parsed = maybe if isinstance(maybe, dict) else None
-            except ValueError:
-                parsed = None
-
-    if parsed is None:
-        start, end = candidate.find("{"), candidate.rfind("}")
-        if 0 <= start < end:
-            try:
-                maybe = json.loads(candidate[start : end + 1])
-                parsed = maybe if isinstance(maybe, dict) else None
-            except ValueError:
-                parsed = None
+    parsed = extract_json_object(content)
 
     if parsed is None:
         raise LLMGenerationError(
@@ -414,5 +350,8 @@ __all__ = [
     "GeneratedDescription",
     "ToolDescriptionGenerator",
     "MAX_DESCRIPTIONS_PER_IMPORT",
+    # Re-exported from `app.llm.prompts` / defined here — both belong
+    # to the Prompt-render contract the planner (T18) shares.
     "render_template",
+    "summarize_parameters",
 ]
