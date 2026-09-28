@@ -1,12 +1,16 @@
 /**
- * Wire types for the OpenAPI import preview — T15 / #13.
+ * Wire types for the OpenAPI import preview — T15 / #13 + T16 / #14.
  *
  * Mirrors `app.api.admin_tools.ImportOpenAPIRequest`,
  * `app.api.admin_tools.ImportOpenAPIResponse`, and
  * `app.api.admin_tools.ToolDraftResponse` from the backend (T14 / #12).
  *
- * Drafts arrive in `status='draft'` per ADR-0018; the admin UI edits
- * per-draft fields (name, risk_level) before activating. The preview
+ * Drafts arrive in `status='draft'` per ADR-0018. T16 / #14 adds LLM
+ * description generation at preview time: `description` carries the
+ * rewrite (with 典型用例 hints), `original_description` keeps the raw
+ * OpenAPI text for side-by-side review, and `description_generated`
+ * distinguishes the two states. The admin UI edits per-draft fields
+ * (name, description, risk_level) before activating. The preview
  * is **not persisted** until the admin hits "Activate" on each row,
  * which routes through `POST /admin/tools` (T12) + `PATCH /admin/tools/{id}`
  * (T12) — the existing CRUD endpoints.
@@ -36,11 +40,19 @@ export type ImportOpenAPIRequestBody =
  * of the fields are the same shape the manual-registration form
  * produces (T12). `warnings` carries per-draft issues so the admin
  * can fix and retry before activating.
+ *
+ * T16 / #14: `description` may be the LLM rewrite — a `true`
+ * `description_generated` pairs it with the raw OpenAPI text in
+ * `original_description` for side-by-side review. Both are inert
+ * (`false` / `null`) when generation was skipped or failed, and the
+ * admin can edit `description` either way before activating.
  */
 export interface ToolDraft {
   operation_ref: string
   name: string
   description: string
+  original_description: string | null
+  description_generated: boolean
   risk_level: ToolRiskLevel
   status: ToolStatus
   parameters_schema: Record<string, unknown>
@@ -59,6 +71,10 @@ export interface ToolDraft {
  *
  * `source_format` is what the parser consumed (`json` vs `yaml`).
  * The UI surfaces it as a badge so the admin knows what they sent.
+ *
+ * `warnings` is the T16 / #14 import-level notice list (LLM not
+ * configured, the per-import generation cap hit). Per-operation
+ * issues stay on each draft's own `warnings`.
  */
 export interface ImportOpenAPIResponse {
   drafts: ToolDraft[]
@@ -66,6 +82,7 @@ export interface ImportOpenAPIResponse {
   version: string | null
   server_url: string | null
   source_format: 'json' | 'yaml'
+  warnings: string[]
 }
 
 /**

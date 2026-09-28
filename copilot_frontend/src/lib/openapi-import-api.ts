@@ -15,8 +15,10 @@
  * 3. `setToolStatus` — PATCH /admin/tools/{id}. Used to promote the
  *    freshly-created row from `draft` to `active` immediately after
  *    the import. The two-step flow (create → activate) matches the
- *    ADR-0018 lifecycle; future tickets (T16 description generator,
- *    audit hook) sit between these two calls.
+ *    ADR-0018 lifecycle. T16 / #14 description generation happens
+ *    server-side at *preview* time (inside `importOpenAPI`), so the
+ *    admin reviews the LLM rewrite before the row is ever persisted;
+ *    the audit hook (T42) still sits between these two calls.
  *
  * `detectSourceFormat` decides which arm of the discriminated union
  * the request body hits. JSON parses first because the OpenAPI JSON

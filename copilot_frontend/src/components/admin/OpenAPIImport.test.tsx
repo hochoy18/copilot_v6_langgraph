@@ -7,13 +7,15 @@ import type { Tool } from '@/types/tool'
 import type { ToolDraft } from '@/types/openapi-import'
 
 /**
- * Tests for the OpenAPI import preview — T15 / #13.
+ * Tests for the OpenAPI import preview — T15 / #13 + T16 / #14.
  *
- * Acceptance criteria from the issue body:
+ * Acceptance criteria from the issue bodies:
  * - [ ] 上传文件解析显示
  * - [ ] 粘贴 URL 解析显示
  * - [ ] 预览列出每个 draft
  * - [ ] 可逐个激活 / 弃用
+ * - [ ] (T16) 管理员可 review:LLM 改写后的描述可编辑、原文可对照、
+ *   导入级 warning 可见
  *
  * `mockFetch` arms `globalThis.fetch` with a sequence of queued
  * responses. The first call in each test is the import preview
@@ -32,6 +34,8 @@ function makeDraft(overrides: Partial<ToolDraft> = {}): ToolDraft {
     operation_ref: 'GET /pets',
     name: 'listPets',
     description: 'List all pets.',
+    original_description: null,
+    description_generated: false,
     risk_level: 'read',
     status: 'draft',
     parameters_schema: { type: 'object', properties: {}, required: [] },
@@ -52,6 +56,7 @@ function makePreviewResponse(drafts: ToolDraft[], overrides: Partial<{
   version: string | null
   server_url: string | null
   source_format: 'json' | 'yaml'
+  warnings: string[]
 }> = {}) {
   return {
     drafts,
@@ -59,6 +64,7 @@ function makePreviewResponse(drafts: ToolDraft[], overrides: Partial<{
     version: '1.0.0',
     server_url: 'https://api.example.com',
     source_format: 'json' as const,
+    warnings: [] as string[],
     ...overrides,
   }
 }
@@ -360,6 +366,85 @@ describe('OpenAPIImport', () => {
     const warnings = within(row).getByTestId('draft-warnings-POST /uploads')
     expect(warnings).toHaveTextContent('missing `operationId`')
     expect(warnings).toHaveTextContent('multipart/form-data')
+  })
+
+  it('shows the LLM rewrite badge and keeps the original text for comparison', async () => {
+    mockFetch([
+      jsonResponse(
+        makePreviewResponse([
+          makeDraft({
+            description: '根据编号查询宠物资料\n\n典型用例:\n- 查一下 7 号宠物的信息',
+            original_description: 'Returns a user by ID. See Swagger section 4.',
+            description_generated: true,
+          }),
+        ]),
+      ),
+    ])
+    const user = userEvent.setup()
+    render(<OpenAPIImport />)
+
+    const file = new File(['{"openapi":"3.0.0"}'], 'openapi.json', { type: 'application/json' })
+    await user.upload(screen.getByTestId('file-input'), file)
+    const row = await screen.findByTestId('draft-row-GET /pets')
+
+    expect(
+      within(row).getByTestId('draft-description-generated-GET /pets'),
+    ).toHaveTextContent('LLM 改写')
+    const textarea = within(row).getByTestId(
+      'draft-description-GET /pets',
+    ) as HTMLTextAreaElement
+    expect(textarea.value).toContain('根据编号查询宠物资料')
+    expect(
+      within(row).getByTestId('draft-original-description-GET /pets'),
+    ).toHaveTextContent('Returns a user by ID. See Swagger section 4.')
+  })
+
+  it('sends the admin-edited description when activating', async () => {
+    const fetchMock = mockFetch([
+      jsonResponse(makePreviewResponse([makeDraft()])),
+      jsonResponse(makeCreatedTool()),
+      jsonResponse(makeCreatedTool({ status: 'active' })),
+    ])
+    const user = userEvent.setup()
+    render(<OpenAPIImport />)
+
+    const file = new File(['{"openapi":"3.0.0"}'], 'openapi.json', { type: 'application/json' })
+    await user.upload(screen.getByTestId('file-input'), file)
+    const row = await screen.findByTestId('draft-row-GET /pets')
+
+    const textarea = within(row).getByTestId(
+      'draft-description-GET /pets',
+    ) as HTMLTextAreaElement
+    await user.clear(textarea)
+    await user.type(textarea, '查询宠物详细信息')
+
+    await user.click(screen.getByTestId('draft-activate-GET /pets'))
+    await waitFor(() => expect(screen.getByTestId('draft-status-active')).toBeInTheDocument())
+
+    const [, createInit] = fetchMock.mock.calls[1]
+    expect(JSON.parse(createInit?.body as string)).toMatchObject({
+      description: '查询宠物详细信息',
+    })
+  })
+
+  it('renders import-level warnings above the preview', async () => {
+    mockFetch([
+      jsonResponse(
+        makePreviewResponse([makeDraft()], {
+          warnings: [
+            'LLM description generation is not configured; drafts keep their raw OpenAPI descriptions.',
+          ],
+        }),
+      ),
+    ])
+    const user = userEvent.setup()
+    render(<OpenAPIImport />)
+
+    const file = new File(['{"openapi":"3.0.0"}'], 'openapi.json', { type: 'application/json' })
+    await user.upload(screen.getByTestId('file-input'), file)
+
+    const banner = await screen.findByTestId('import-warnings')
+    expect(banner).toHaveTextContent('LLM description generation is not configured')
   })
 
   it('resets the preview when the admin hits 重新导入', async () => {

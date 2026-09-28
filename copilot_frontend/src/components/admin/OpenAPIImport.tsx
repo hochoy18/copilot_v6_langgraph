@@ -38,11 +38,21 @@ import type {
  * Per-draft actions:
  * - **Activate** — `createTool` (lands in `draft` per ADR-0018)
  *   followed by `setToolStatus('active')`. The two-step pattern
- *   matches the canonical lifecycle; future tickets (T16 description
- *   generation, audit hook) sit between these two calls.
+ *   matches the canonical lifecycle; the audit hook (T42) sits
+ *   between these two calls. T16 / #14 description generation
+ *   happens server-side *before* this flow sees the draft, so the
+ *   row's textarea opens with the LLM rewrite (badge + original
+ *   text for comparison) and the admin's edits are what persist.
  * - **Discard** — local-state removal. Nothing is sent to the
  *   server, matching the "no implicit persistence" rule from
  *   ADR-0003.
+ *
+ * T16 / #14 review surface: a row whose description was rewritten
+ * by the LLM carries `description_generated` + `original_description`;
+ * the row renders a 改写 badge, an editable textarea, and a collapsed
+ * 原文 block. Import-level notices from the backend (`warnings` on
+ * the response — LLM not configured, generation cap hit) render as a
+ * banner above the list, per the no-silent-capping rule.
  *
  * Server state for the preview itself is plain `useState` rather
  * than TanStack Query: the parsed drafts are scoped to this page
@@ -66,6 +76,9 @@ interface PreviewState {
   sourceFormat: 'json' | 'yaml'
   drafts: ToolDraft[]
   statuses: Record<string, DraftStatus>
+  // T16 / #14 — import-level notices from the backend (LLM not
+  // configured, generation cap hit). Distinct from per-draft warnings.
+  importWarnings: string[]
 }
 
 const INITIAL_STATE: PreviewState = {
@@ -75,6 +88,7 @@ const INITIAL_STATE: PreviewState = {
   sourceFormat: 'json',
   drafts: [],
   statuses: {},
+  importWarnings: [],
 }
 
 const RISK_OPTIONS: ReadonlyArray<{ value: ToolRiskLevel; label: string }> = [
@@ -106,6 +120,9 @@ export function OpenAPIImport(): React.ReactElement {
       statuses: Object.fromEntries(
         response.drafts.map((draft) => [draft.operation_ref, { kind: 'idle' }]),
       ),
+      // `Array.isArray` guard: a pre-T16 backend (or a stale test
+      // fixture) without the `warnings` key must not crash the parse.
+      importWarnings: Array.isArray(response.warnings) ? response.warnings : [],
     })
     setParseError(null)
   }, [])
@@ -435,6 +452,17 @@ function PreviewPanel({
 }: PreviewPanelProps): React.ReactElement {
   return (
     <div className="flex flex-col gap-4" data-testid="preview-panel">
+      {preview.importWarnings.length > 0 ? (
+        <div
+          role="alert"
+          data-testid="import-warnings"
+          className="flex flex-col gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200"
+        >
+          {preview.importWarnings.map((warning, idx) => (
+            <p key={idx}>{warning}</p>
+          ))}
+        </div>
+      ) : null}
       <PreviewHeader preview={preview} />
       <ul className="flex flex-col gap-3">
         {preview.drafts.map((draft) => (
@@ -549,9 +577,50 @@ function DraftRow({
           </select>
         </label>
       </div>
-      <p className="max-w-prose text-sm text-muted-foreground">
-        {draft.description}
-      </p>
+      {/*
+        T16 / #14 review surface. The description arrives as the LLM
+        rewrite (badge + collapsed 原文) when generation succeeded,
+        or the raw OpenAPI text otherwise. It is always editable —
+        ADR-0018 makes admin review mandatory, and the edited value is
+        what `draftToCreateBody` persists on activate.
+      */}
+      <div className="flex flex-col gap-1 text-xs">
+        <span className="flex items-center gap-2 text-muted-foreground">
+          <span>描述(LLM-friendly,激活前请审核)</span>
+          {draft.description_generated ? (
+            <span
+              data-testid={`draft-description-generated-${draft.operation_ref}`}
+              className="rounded bg-accent px-1.5 py-0.5 text-[11px] text-accent-foreground"
+            >
+              LLM 改写
+            </span>
+          ) : null}
+        </span>
+        <textarea
+          value={draft.description}
+          disabled={disabled}
+          onChange={(e) =>
+            onUpdate(draft.operation_ref, { description: e.target.value })
+          }
+          rows={3}
+          data-testid={`draft-description-${draft.operation_ref}`}
+          aria-label={`描述 ${draft.operation_ref}`}
+          className="rounded-md border border-input bg-background px-2 py-1.5 text-sm disabled:opacity-60"
+        />
+        {draft.description_generated && draft.original_description ? (
+          <details
+            data-testid={`draft-original-description-${draft.operation_ref}`}
+            className="text-xs text-muted-foreground"
+          >
+            <summary className="cursor-pointer select-none">
+              查看 LLM 改写前的原始 OpenAPI 描述
+            </summary>
+            <p className="mt-1 max-w-prose whitespace-pre-wrap rounded bg-muted/40 p-2">
+              {draft.original_description}
+            </p>
+          </details>
+        ) : null}
+      </div>
       {draft.warnings.length > 0 ? (
         <div
           data-testid={`draft-warnings-${draft.operation_ref}`}
