@@ -10,12 +10,15 @@
  * T20 / #43 adds the `decidePlan` action: after a successful HITL
  * approve / reject call, the Plan returned by the backend is folded
  * back into the store so the header status badge + button set
- * reflect the new lifecycle without a refetch. The SSE-hook ticket
- * (T24 / #21) will add further Plan *status* updates to this store.
+ * reflect the new lifecycle without a refetch. T24 / #21 keeps that
+ * single-write-point promise for the SSE path too: `plan.generated`
+ * / `plan.modified` events flow through `showPlan` / `decidePlan`,
+ * and `execution.completed` lands via `markExecutionOutcome` — the
+ * stream store deliberately holds no Plan copy.
  */
 import { create } from 'zustand'
 
-import type { Plan } from '@/types/plan'
+import type { Plan, PlanStatus } from '@/types/plan'
 
 export type PlanDrawerMode = 'collapsed' | 'docked' | 'fullscreen'
 
@@ -33,12 +36,25 @@ interface PlanDrawerState {
   toggleFullscreen(): void
   selectNode(nodeId: string | null): void
   /**
-   * Apply a server-decided Plan (approve / reject) onto the current
-   * `plan` (T20 / #43). The header badge re-renders against the new
-   * status; the approve / reject buttons disappear because the Plan
-   * is no longer `pending`.
+   * Apply a server-decided Plan onto the current `plan` (T20 / #43
+   * approve / reject; T24 / #21 reuses it for the SSE
+   * `plan.modified` event — issue #53 pins this store as the Plan's
+   * single write point). The header badge re-renders against the
+   * new status; the approve / reject buttons disappear because the
+   * Plan is no longer `pending`.
    */
   decidePlan(plan: Plan): void
+  /**
+   * Fold an SSE `execution.completed` outcome onto the live Plan
+   * (T24 / #21). The Worker (T21) flips the persisted Plan's status
+   * server-side; the event carries only `plan_id` + outcome, so the
+   * badge updates from the in-store copy. A stale `plan_id` (the
+   * drawer already moved on to a newer Plan) is ignored.
+   */
+  markExecutionOutcome(
+    planId: string,
+    outcome: Extract<PlanStatus, 'succeeded' | 'failed' | 'aborted'>,
+  ): void
 }
 
 export const usePlanDrawerStore = create<PlanDrawerState>((set) => ({
@@ -64,4 +80,11 @@ export const usePlanDrawerStore = create<PlanDrawerState>((set) => ({
     })),
   selectNode: (nodeId) => set({ selectedNodeId: nodeId }),
   decidePlan: (plan) => set({ plan }),
+
+  markExecutionOutcome: (planId, outcome) =>
+    set((state) =>
+      state.plan && state.plan.id === planId
+        ? { plan: { ...state.plan, status: outcome } }
+        : state,
+    ),
 }))

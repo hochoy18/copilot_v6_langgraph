@@ -1,10 +1,12 @@
 import { Network, Wrench } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { PlanDrawer } from '@/components/plan/PlanDrawer'
 import { Button } from '@/components/ui/button'
+import { useConversationStream } from '@/hooks/useConversationStream'
 import { ApiError } from '@/lib/api-client'
 import { createConversation, submitTurn } from '@/lib/conversations-api'
+import { useConversationStreamStore } from '@/stores/conversation-stream'
 import { usePlanDrawerStore } from '@/stores/plan-drawer'
 import { cn } from '@/lib/utils'
 import type { Turn } from '@/types/plan'
@@ -47,6 +49,25 @@ export function ChatPage(): React.ReactElement {
   const drawerMode = usePlanDrawerStore((s) => s.mode)
   const showPlan = usePlanDrawerStore((s) => s.showPlan)
   const reopen = usePlanDrawerStore((s) => s.reopen)
+
+  // Declare the store sync *before* the stream hook so effects run
+  // in that order: the store's `conversationId` + buffers reset
+  // first, then the socket opens. (React runs effects in declaration
+  // order, so textual order here is the actual mount order.)
+  useEffect(() => {
+    const store = useConversationStreamStore.getState()
+    if (conversationId) {
+      store.startConversation(conversationId)
+    } else {
+      store.reset()
+    }
+  }, [conversationId])
+
+  // SSE stream subscription (T24 / #21). Opens when a conversation
+  // id is known; tears down on unmount or conversation switch. The
+  // hook drives `useConversationStreamStore`, which `PlanToolNode`
+  // and `PlanAnswerPane` select from.
+  useConversationStream(conversationId)
 
   // When the drawer is docked, the chat main column must reserve the
   // right gutter the fixed-position drawer occupies; otherwise the

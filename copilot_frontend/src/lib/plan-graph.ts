@@ -24,6 +24,7 @@
 import type { Edge, Node } from '@xyflow/react'
 
 import type { Plan, PlanNode, ToolRiskLevel, ToolSnapshot } from '@/types/plan'
+import type { ToolRuntimeStatus } from '@/types/sse'
 
 /** Custom node type key registered on the React Flow canvas. */
 export const PLAN_TOOL_NODE_TYPE = 'planTool'
@@ -55,6 +56,21 @@ export interface RiskStyle {
   hitl: string
 }
 
+/**
+ * Per-node runtime status pulled off the SSE stream (T24 / #21).
+ * Reused by `PlanToolNode` so the node badge flips "执行中 / 成功 /
+ * 失败" as the Worker reports progress without the consumer
+ * knowing which event triggered the flip.
+ */
+export interface RuntimeStatusStyle {
+  /** Tailwind classes for the small status pill below the title. */
+  pill: string
+  /** Short Chinese label. */
+  label: string
+  /** Optional pulse animation — set on `running`. */
+  pulse: boolean
+}
+
 const RISK_STYLES: Record<ToolRiskLevel, RiskStyle> = {
   // read → auto-executed: calm green, no confirmation friction.
   read: {
@@ -81,6 +97,60 @@ const RISK_STYLES: Record<ToolRiskLevel, RiskStyle> = {
 
 export function riskStyleFor(level: ToolRiskLevel): RiskStyle {
   return RISK_STYLES[level]
+}
+
+// ---------------------------------------------------------------------------
+// Runtime status — T24 / #21.
+//
+// A node has a runtime status (running / succeeded / failed) that
+// the SSE stream flips independently of the frozen risk level.
+// `idle` is the absent case — when no `tool.*` event has fired
+// yet — so the lookup table stays exhaustive without a `null`
+// branch at every call site.
+// ---------------------------------------------------------------------------
+
+const RUNTIME_STATUS_STYLES = {
+  idle: {
+    pill: 'bg-muted text-muted-foreground',
+    label: '等待执行',
+    pulse: false,
+  },
+  running: {
+    pill: 'bg-blue-100 text-blue-800',
+    label: '执行中',
+    pulse: true,
+  },
+  succeeded: {
+    pill: 'bg-emerald-100 text-emerald-800',
+    label: '成功',
+    pulse: false,
+  },
+  failed: {
+    pill: 'bg-red-100 text-red-800',
+    label: '失败',
+    pulse: false,
+  },
+  skipped: {
+    pill: 'bg-zinc-100 text-zinc-700',
+    label: '跳过',
+    pulse: false,
+  },
+  cancelled: {
+    pill: 'bg-zinc-100 text-zinc-700',
+    label: '已取消',
+    pulse: false,
+  },
+} as const satisfies Record<ToolRuntimeStatus, RuntimeStatusStyle>
+
+/**
+ * Look up the runtime-status style. `undefined` = the store has no
+ * entry for the node yet, which renders as `idle`. The `satisfies`
+ * clause keeps this table exhaustive against `ToolRuntimeStatus`.
+ */
+export function runtimeStatusStyleFor(
+  status: ToolRuntimeStatus | undefined,
+): RuntimeStatusStyle {
+  return RUNTIME_STATUS_STYLES[status ?? 'idle']
 }
 
 /**

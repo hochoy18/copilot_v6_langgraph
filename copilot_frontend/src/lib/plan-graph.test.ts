@@ -5,6 +5,7 @@ import {
   buildFlowNodes,
   layoutDepths,
   riskStyleFor,
+  runtimeStatusStyleFor,
 } from '@/lib/plan-graph'
 import type { Plan, PlanNode, ToolSnapshot } from '@/types/plan'
 
@@ -165,5 +166,28 @@ describe('riskStyleFor', () => {
     expect(riskStyleFor('read').hitl).toBe('自动执行')
     expect(riskStyleFor('write').hitl).toBe('需确认')
     expect(riskStyleFor('destructive').hitl).toBe('需确认')
+  })
+})
+
+describe('runtimeStatusStyleFor (T24 / #21)', () => {
+  it('renders absent (never-seen) nodes as idle', () => {
+    const idle = runtimeStatusStyleFor(undefined)
+    expect(idle.label).toBe('等待执行')
+    expect(idle.pulse).toBe(false)
+  })
+
+  it('labels the live execution states with Chinese badge copy', () => {
+    expect(runtimeStatusStyleFor('running').label).toBe('执行中')
+    expect(runtimeStatusStyleFor('succeeded').label).toBe('成功')
+    expect(runtimeStatusStyleFor('failed').label).toBe('失败')
+    expect(runtimeStatusStyleFor('skipped').label).toBe('跳过')
+    expect(runtimeStatusStyleFor('cancelled').label).toBe('已取消')
+  })
+
+  it('pulses only while running — the one state worth animating', () => {
+    expect(runtimeStatusStyleFor('running').pulse).toBe(true)
+    for (const settled of ['succeeded', 'failed', 'skipped', 'cancelled'] as const) {
+      expect(runtimeStatusStyleFor(settled).pulse).toBe(false)
+    }
   })
 })

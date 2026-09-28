@@ -1,5 +1,5 @@
 /**
- * Plan preview drawer — T19 / #17, T20 / #43.
+ * Plan preview drawer — T19 / #17, T20 / #43, T24 / #21.
  *
  * Right-side slide-out drawer rendering a Plan as a React Flow
  * node-edge graph (ADR-0029: "Plan 预览从右侧滑出为抽屉, 可全屏看图
@@ -30,10 +30,11 @@ import {
   type Node,
   type NodeTypes,
 } from '@xyflow/react'
-import { Check, Maximize, Minimize, PanelRightClose, X } from 'lucide-react'
+import { Check, Maximize, Minimize, PanelRightClose, RefreshCw, WifiOff, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
 import { NodeInfoPanel } from '@/components/plan/NodeInfoPanel'
+import { PlanAnswerPane } from '@/components/plan/PlanAnswerPane'
 import { PlanToolNode } from '@/components/plan/PlanToolNode'
 import { Button } from '@/components/ui/button'
 import {
@@ -47,6 +48,10 @@ import {
   formatPlanDecisionError,
   rejectPlan,
 } from '@/lib/conversations-api'
+import {
+  useConversationStreamStore,
+  type StreamConnectionStatus,
+} from '@/stores/conversation-stream'
 import { usePlanDrawerStore } from '@/stores/plan-drawer'
 import { cn } from '@/lib/utils'
 import type { Plan } from '@/types/plan'
@@ -99,6 +104,7 @@ export function PlanDrawer(): React.ReactElement {
             {plan.status}
           </span>
         )}
+        <ConnectionStatusPill />
         <div className="ml-auto flex items-center gap-1">
           {plan && plan.status === 'pending' && (
             <PlanDecisionButtons plan={plan} onDecided={decidePlan} />
@@ -136,6 +142,8 @@ export function PlanDrawer(): React.ReactElement {
           </p>
         )}
       </div>
+
+      <PlanAnswerPane />
 
       {plan && selectedNodeId && (
         <NodeInfoPanel plan={plan} nodeId={selectedNodeId} />
@@ -252,5 +260,61 @@ function PlanCanvas({
     >
       <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
     </ReactFlow>
+  )
+}
+
+/**
+ * Header pill that surfaces the SSE lifecycle — T24 / #21.
+ *
+ * `idle` / `open` / `closed` are deliberately invisible: "open" is
+ * the happy path and a green pill on every screen would be noise.
+ * The visible states are the transient ones (`connecting`,
+ * `reconnecting`) and the terminal failure (`auth-failed`). The
+ * hook keeps the status in `useConversationStreamStore`; this
+ * component is just the visual, driven off one style map so the
+ * pill chrome isn't duplicated per status (same pattern as
+ * `RISK_STYLES` / `RUNTIME_STATUS_STYLES` in `plan-graph.ts`).
+ */
+const STATUS_PILLS: Partial<
+  Record<StreamConnectionStatus, { label: string; className: string; spinner: boolean }>
+> = {
+  connecting: {
+    label: '连接中…',
+    className: 'bg-amber-100 text-amber-800',
+    spinner: true,
+  },
+  reconnecting: {
+    label: '重连中…',
+    className: 'bg-amber-100 text-amber-800',
+    spinner: true,
+  },
+  'auth-failed': {
+    label: '登录已过期',
+    className: 'bg-red-100 text-red-800',
+    spinner: false,
+  },
+}
+
+function ConnectionStatusPill(): React.ReactElement | null {
+  const status = useConversationStreamStore((s) => s.connectionStatus)
+  const pill = STATUS_PILLS[status]
+  if (!pill) return null
+
+  return (
+    <span
+      data-testid="stream-status"
+      data-status={status}
+      className={cn(
+        'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium',
+        pill.className,
+      )}
+    >
+      {pill.spinner ? (
+        <RefreshCw size={12} className="animate-spin" aria-hidden="true" />
+      ) : (
+        <WifiOff size={12} aria-hidden="true" />
+      )}
+      {pill.label}
+    </span>
   )
 }

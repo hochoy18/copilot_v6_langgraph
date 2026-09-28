@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { PlanDrawer } from '@/components/plan/PlanDrawer'
+import { useConversationStreamStore } from '@/stores/conversation-stream'
 import { usePlanDrawerStore } from '@/stores/plan-drawer'
 import type { Plan, PlanNode, ToolSnapshot } from '@/types/plan'
 
@@ -67,6 +68,7 @@ beforeEach(() => {
     mode: 'collapsed',
     selectedNodeId: null,
   })
+  useConversationStreamStore.getState().reset()
 })
 
 afterEach(() => {
@@ -286,5 +288,128 @@ describe('PlanDrawer HITL (T20 / #43)', () => {
     // (the canonical "decide failed, keep going" UX).
     expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'pending')
     expect(screen.getByTestId('plan-decision')).toBeInTheDocument()
+  })
+})
+
+/**
+ * SSE live state — T24 / #21 acceptance criteria:
+ * - [x] 节点实时切状态   (runtime badge flips off the stream store)
+ * - [x] 回答逐字流出     (typewriter pane renders the token buffer)
+ * - [x] 断线自动重连     (the "reconnecting…" pill surfaces)
+ *
+ * The hook itself is tested in `useEventSource.test.tsx`; here we
+ * render the drawer with the store pre-folded the way
+ * `useConversationStream` folds real events, so the *reactive*
+ * path — store change → React Flow node re-render — is what's
+ * pinned.
+ */
+describe('PlanDrawer SSE live state (T24 / #21)', () => {
+  it('hides the runtime badge until a tool event lands for the node', () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+    expect(screen.queryByTestId('plan-node-status-n1')).not.toBeInTheDocument()
+  })
+
+  it('flips the node badge 执行中 → 成功 as the Worker reports progress (节点实时切状态)', async () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    act(() => {
+      useConversationStreamStore.getState().markNodeRunning('n1')
+    })
+    const badge = await screen.findByTestId('plan-node-status-n1')
+    expect(badge).toHaveTextContent('执行中')
+    expect(screen.getByTestId('plan-node-n1')).toHaveAttribute('data-runtime', 'running')
+
+    act(() => {
+      useConversationStreamStore.getState().markNodeFinished('n1', 'succeeded')
+    })
+    expect(screen.getByTestId('plan-node-status-n1')).toHaveTextContent('成功')
+    expect(screen.getByTestId('plan-node-n1')).toHaveAttribute('data-runtime', 'succeeded')
+  })
+
+  it('shows 失败 on tool.failed', () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+    act(() => {
+      useConversationStreamStore.getState().markNodeFailed('n1')
+    })
+    expect(screen.getByTestId('plan-node-status-n1')).toHaveTextContent('失败')
+  })
+
+  it('streams llm tokens into the answer pane (回答逐字流出)', async () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    expect(screen.queryByTestId('plan-answer-pane')).not.toBeInTheDocument()
+
+    act(() => {
+      useConversationStreamStore.getState().appendAnswerToken('u1', 'EMEA 共')
+    })
+    expect(screen.getByTestId('plan-answer-text')).toHaveTextContent('EMEA 共')
+    expect(screen.getByTestId('plan-answer-pane')).toHaveAttribute('data-done', 'false')
+    expect(screen.getByTestId('plan-answer-caret')).toBeInTheDocument()
+
+    act(() => {
+      useConversationStreamStore.getState().appendAnswerToken('u1', '有 42 家客户。')
+    })
+    expect(screen.getByTestId('plan-answer-text')).toHaveTextContent(
+      'EMEA 共有 42 家客户。',
+    )
+
+    act(() => {
+      useConversationStreamStore.getState().finishActiveAnswer()
+    })
+    expect(screen.getByTestId('plan-answer-pane')).toHaveAttribute('data-done', 'true')
+    expect(screen.queryByTestId('plan-answer-caret')).not.toBeInTheDocument()
+  })
+
+  it('renders the reconnecting pill while the hook is backing off (断线自动重连)', () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+    expect(screen.queryByTestId('stream-status')).not.toBeInTheDocument()
+
+    act(() => {
+      useConversationStreamStore.getState().setConnectionStatus('reconnecting')
+    })
+    const pill = screen.getByTestId('stream-status')
+    expect(pill).toHaveAttribute('data-status', 'reconnecting')
+    expect(pill).toHaveTextContent('重连中')
+
+    act(() => {
+      useConversationStreamStore.getState().setConnectionStatus('open')
+    })
+    expect(screen.queryByTestId('stream-status')).not.toBeInTheDocument()
+  })
+
+  it('surfaces the expired-session pill when the refresh chain died', () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    act(() => {
+      useConversationStreamStore.getState().setConnectionStatus('auth-failed')
+    })
+    const pill = screen.getByTestId('stream-status')
+    expect(pill).toHaveTextContent('登录已过期')
+  })
+
+  it('folds execution.completed onto the drawer Plan status badge', () => {
+    // Issue #53's handoff: `usePlanDrawerStore.plan` is the single
+    // Plan write point — `markExecutionOutcome` lands there, not in
+    // the stream store.
+    usePlanDrawerStore.getState().showPlan(makePlan({ status: 'executing' }))
+    render(<PlanDrawer />)
+    expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'executing')
+
+    act(() => {
+      usePlanDrawerStore.getState().markExecutionOutcome('p1', 'succeeded')
+    })
+    expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'succeeded')
+
+    // A stale plan_id (drawer moved on to a newer Plan) is ignored.
+    act(() => {
+      usePlanDrawerStore.getState().markExecutionOutcome('other-plan', 'failed')
+    })
+    expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'succeeded')
   })
 })
