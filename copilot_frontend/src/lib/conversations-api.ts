@@ -71,22 +71,16 @@ export async function rejectPlan(
  * `plan_not_pending` 409 can reuse the translation without
  * re-deriving the error envelope shape.
  *
- * Returns the backend's `message_zh` for the `plan_not_pending`
- * code; falls back to a generic "request failed" sentence otherwise.
+ * Returns the backend's own `message_zh` for any 4xx/5xx (ADR-0031
+ * guarantees it on every error response); falls back to a generic
+ * sentence for transport failures (no body to draw from).
  */
 export function formatPlanDecisionError(err: unknown): string {
-  if (err instanceof ApiError && err.status === 409) {
-    const body = err.body as { code?: unknown; message_zh?: unknown } | null
-    if (
-      body &&
-      body.code === 'plan_not_pending' &&
-      typeof body.message_zh === 'string'
-    ) {
+  if (err instanceof ApiError) {
+    const body = err.body as { message_zh?: unknown } | null
+    if (body && typeof body.message_zh === 'string') {
       return body.message_zh
     }
-    return 'Plan 已不可变更'
-  }
-  if (err instanceof ApiError) {
     return `请求失败 (HTTP ${err.status}), 请稍后重试。`
   }
   if (err instanceof TypeError) {
