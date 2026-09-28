@@ -14,11 +14,14 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.health import router as health_router
+from app.db.mongo import MongoClient
 from app.exceptions import register_exception_handlers
 from app.health import HealthChecker
 from app.settings import Settings, get_settings
@@ -52,13 +55,35 @@ async def _probe_dependencies(settings: Settings) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Standard FastAPI lifespan: probe deps on startup, log on shutdown."""
+    """Standard FastAPI lifespan: open Mongo, probe deps, log on shutdown.
+
+    T04 (#5) opens one `MongoClient` per process here. Closing it on
+    shutdown is critical — Motor's client owns a connection pool plus a
+    background monitoring task; letting them leak until GC leaves the
+    process holding sockets open across the lifespan window.
+    """
     settings = app.state.settings
-    await _probe_dependencies(settings)
+    mongo = MongoClient(settings)
+    app.state.mongo = mongo
+    app.state.database = mongo.database
     try:
+        await _probe_dependencies(settings)
         yield
     finally:
+        await mongo.close()
         logger.info("backend shutting down")
+
+
+def get_database(app: FastAPI) -> AsyncIOMotorDatabase[Any]:
+    """FastAPI dependency: return the per-process Motor database handle.
+
+    Routes / repositories that want to read or write Mongo call this
+    inside `Depends`. The handle is opened in the lifespan so the
+    dependency has nothing to construct itself — it just hands back the
+    same instance every request, sharing Motor's connection pool.
+    """
+    db: AsyncIOMotorDatabase[Any] = app.state.database
+    return db
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

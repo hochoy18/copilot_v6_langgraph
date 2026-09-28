@@ -13,9 +13,12 @@ authors = [{ name = "Zhipo Copilot" }]
 dependencies = [
     "fastapi==0.115.6",
     "uvicorn[standard]==0.32.1",
-    "pydantic==2.10.3",
+    "pydantic[email]==2.10.3",
     "pydantic-settings==2.7.0",
     "httpx==0.28.1",
+    "motor==3.6.0",
+    "mongomock-motor==0.0.34",
+    "email-validator>=2.3.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +45,10 @@ pythonpath = ["."]
 python_version = "3.11"
 strict = true
 files = ["app", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["mongomock_motor", "mongomock"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100

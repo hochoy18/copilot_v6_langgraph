@@ -33,16 +33,50 @@ or `COPILOT_LANGFUSE_HOST` — see `.env.example` for the full list.
 
 ```
 app/
-  main.py            # FastAPI app factory + lifespan + global error handler
-  settings.py        # pydantic-settings (env-driven: CORS, MongoDB, Milvus, Langfuse, ...)
-  exceptions.py      # AppError + unified error response shape
-  health.py          # /healthz probes (Mongo TCP, Milvus TCP, Langfuse HTTP) + HealthChecker
+  main.py              # FastAPI app factory + lifespan (opens Mongo) + global error handler
+  settings.py          # pydantic-settings (env-driven: CORS, MongoDB, Milvus, Langfuse, ...)
+  exceptions.py        # AppError + unified error response shape
+  health.py            # /healthz probes (Mongo TCP, Milvus TCP, Langfuse HTTP) + HealthChecker
   api/
-    health.py        # /healthz route — returns 200/503 with per-dep breakdown
+    health.py          # /healthz route — returns 200/503 with per-dep breakdown
+  db/
+    mongo.py           # MongoClient — one Motor client per process, closed on shutdown
+    schemas.py         # Pydantic models for users / roles / refresh_tokens / tool_groups
+    indexes.py         # Index specs (single source of truth, read by init_db.py)
+    init_db.py         # create collections + indexes, idempotent
+    errors.py          # Repository-level AppError subclasses (NotFound / DuplicateKey / Validation)
+    dependencies.py     # FastAPI Depends providers for each repository
+  repositories/
+    base.py            # Shared helpers (ObjectId coercion, duplicate-key translation)
+    users.py           # UserRepository — CRUD + auth helpers
+    refresh_tokens.py  # RefreshTokenRepository — schema-only here; rotation lands with T07
+    roles.py           # RoleRepository — schema + seed/list/get
+    tool_groups.py     # ToolGroupRepository — schema + seed/list/get
+scripts/
+  init_db.py           # CLI: `python -m scripts.init_db`
 tests/
-  test_health.py     # /healthz contract + probe unit tests (hermetic via httpx.MockTransport)
-  test_errors.py     # unhandled exceptions return unified {code,message_zh,...}
-  test_cors.py       # CORS middleware wiring
+  test_health.py       # /healthz contract + probe unit tests (hermetic via httpx.MockTransport)
+  test_errors.py       # unhandled exceptions return unified {code,message_zh,...}
+  test_cors.py         # CORS middleware wiring
+  test_init_db.py      # Idempotent init + per-collection index contract
+  test_user_repository.py  # UserRepository CRUD, validation, canonical-read shape
+```
+
+## Database bootstrap
+
+After MongoDB is reachable (see "External dependencies" above), create
+the four core collections and their indexes:
+
+```bash
+cd copilot_backend
+uv run python -m scripts.init_db
+```
+
+The script is idempotent — running it on an already-initialised
+database is a no-op. The output is JSON so it's easy to parse in CI:
+
+```json
+{ "initialized": { "users": ["uniq_email", ...], "roles": [...], ... } }
 ```
 
 ## Configuration

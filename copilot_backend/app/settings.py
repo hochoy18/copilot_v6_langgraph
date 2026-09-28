@@ -39,12 +39,31 @@ class Settings(BaseSettings):
     )
 
     # ---- MongoDB (T03 / T04+) -------------------------------------------
-    # T03 only verifies reachability; deeper SDK wiring lands in T04 (#5)
-    # and T05 (#6). The database name lands with those tickets because
-    # T03 doesn't need it.
+    # T03 only verifies reachability. T04 (#5) introduces Motor (the
+    # async SDK) and the `copilot` database the four core collections
+    # land in; later tickets (T05 / T39 / T42) reuse the same client.
     mongodb_uri: str = Field(
         default="mongodb://localhost:27017",
         description="MongoDB connection URI. mongodb://host:port for a single node.",
+    )
+    mongodb_database: str = Field(
+        default="copilot",
+        description=(
+            "Logical database name for the Copilot app. T04 seeds four "
+            "collections (users / roles / refresh_tokens / tool_groups) "
+            "here; later tickets reuse the same DB."
+        ),
+    )
+    mongodb_server_selection_timeout_ms: int = Field(
+        default=2000,
+        ge=100,
+        le=60_000,
+        description=(
+            "How long Motor waits for a server to become available before "
+            "raising `ServerSelectionTimeoutError`. Mirrors "
+            "`health_check_timeout_seconds` for the SDK path so the "
+            "/healthz probe and a live `find_one` agree on the threshold."
+        ),
     )
 
     # ---- Milvus (T03 / T31+) --------------------------------------------
