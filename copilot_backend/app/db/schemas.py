@@ -1,12 +1,18 @@
-"""Pydantic schemas for the four core MongoDB collections.
+"""Pydantic schemas for the MongoDB collections.
 
-These are the wire shapes of `users`, `roles`, `refresh_tokens`, and
-`tool_groups`. The acceptance criteria for T04 (#5) require the schemas
-to be documented; Pydantic gives both documentation and runtime
-validation in one artefact. Each model carries an `InDB` variant that
-mirrors the persisted form (ObjectId-based `_id`, datetimes stored as
-BSON datetimes) and a `Create` / `Update` variant for repository
-inputs that should not carry an `_id`.
+These are the wire shapes of every collection the backend owns:
+
+* `users`, `roles`, `refresh_tokens`, `tool_groups` — T04 (#5).
+* `tools`, `credentials` — T05 (#6).
+* `conversations`, `turns`, `plans`, `plan_executions`, `audit_logs`
+  — T06 (#7).
+
+The acceptance criteria for T04 require the schemas to be documented;
+Pydantic gives both documentation and runtime validation in one
+artefact. Each model carries an `InDB` variant that mirrors the
+persisted form (ObjectId-based `_id`, datetimes stored as BSON
+datetimes) and a `Create` / `Update` variant for repository inputs
+that should not carry an `_id`.
 
 Naming convention:
 
@@ -653,3 +659,620 @@ class Credential(CredentialBase):
             updated_at=row.updated_at,
             last_rotated_at=row.last_rotated_at,
         )
+
+
+# ---------------------------------------------------------------------------
+# conversation-domain enums  (T06 / #7)
+# ---------------------------------------------------------------------------
+
+
+# Per ADR-0011 the conversation lifecycle is `active` / `idle` /
+# `archived`. A new state (e.g. a "pinned" flag) extends this Literal.
+ConversationStatus = Literal["active", "idle", "archived"]
+
+# Per ADR-0005 a Turn is one message inside a conversation. The
+# `assistant` role covers both the LLM's text reply and the SSE-
+# streamed final answer — `tool` is intentionally absent: tool-side
+# events live in `audit_logs`, not the chat transcript.
+TurnRole = Literal["user", "assistant", "system"]
+
+# Per ADR-0004 / ADR-0019 a Plan moves through:
+#   pending    — Planner produced, awaiting HITL review (mandatory)
+#   approved   — business user approved the Plan as-is
+#   modified   — business user edited parameters (ADR-0019) and we
+#                captured the diff for audit
+#   rejected   — business user rejected; Turn stays, no execution
+#   executing  — Worker is running the Plan (DAG)
+#   succeeded  — every node finished without error
+#   failed     — at least one node hit an unrecoverable error
+#   aborted    — business user cancelled mid-execution
+PlanStatus = Literal[
+    "pending",
+    "approved",
+    "modified",
+    "rejected",
+    "executing",
+    "succeeded",
+    "failed",
+    "aborted",
+]
+
+# Per ADR-0004 + ADR-0017 a node's runtime outcome is finer-grained:
+#   pending     — not yet picked up by the Worker
+#   running     — Worker is mid-execution
+#   succeeded   — upstream returned 2xx / success body
+#   failed      — upstream 4xx/5xx, schema violation, or transport error
+#                that won't be auto-retried (write/destructive path)
+#   skipped     — business user chose "skip this node" mid-Plan
+#   cancelled   — execution aborted before this node started
+PlanNodeStatus = Literal[
+    "pending",
+    "running",
+    "succeeded",
+    "failed",
+    "skipped",
+    "cancelled",
+]
+
+# Per ADR-0028 audit log status is about lifecycle + archival:
+#   active    — hot-stored, queryable via MongoDB
+#   archived  — moved to cold storage; row remains as a tombstone
+#               pointing at the cold-storage location
+#   recalled  — temporarily restored from cold storage (T42)
+AuditLogStatus = Literal["active", "archived", "recalled"]
+
+
+# ---------------------------------------------------------------------------
+# conversations  (T06 / #7)
+# ---------------------------------------------------------------------------
+
+
+class ConversationBase(BaseModel):
+    """Fields shared between create / read shapes for `conversations`.
+
+    Per ADR-0005 the conversation is the audit / replay unit of work —
+    not the Turn, not the Plan. Per ADR-0011 lifecycle is one of three
+    states; admins and end users both move the row across them.
+
+    `user_id` identifies the business user who owns the conversation.
+    The role list is resolved at request time from the user's role
+    grants — we deliberately don't embed it here to avoid a
+    write-skew with `users.role_ids` (ADR-0006).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(
+        description=(
+            "ObjectId of `users._id`. "
+            "Compound index with `last_activity_at` for the list view."
+        ),
+    )
+    title: str = Field(
+        default="",
+        max_length=256,
+        description=(
+            "Display name. Empty until the Planner or the user picks a title; "
+            "frontend uses a truncated slice of the first user message by default."
+        ),
+    )
+    status: ConversationStatus = Field(
+        default="active",
+        description="Lifecycle per ADR-0011: `active` / `idle` / `archived`.",
+    )
+
+
+class ConversationCreate(ConversationBase):
+    """Input shape for creating a new conversation.
+
+    `last_activity_at` is set to `created_at` by the repository so
+    any "active in last 15 min" filter (ADR-0011) works the moment
+    the row lands.
+    """
+
+
+class ConversationUpdate(BaseModel):
+    """Partial update shape for `conversations`.
+
+    `title` is the only user-facing field set by PATCH; lifecycle
+    transitions have their own repository methods (`set_status`,
+    `touch_activity`) so audit hooks see them as discrete events.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, max_length=256)
+
+
+class ConversationInDB(ConversationBase):
+    """Persisted shape of a `conversations` document.
+
+    `last_activity_at` is the gate for ADR-0011's idle transition:
+    a scheduled job (T39) flips active conversations to `idle` once
+    this timestamp is older than 15 minutes.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: PyObjectId = Field(alias="_id")
+    last_activity_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+class Conversation(ConversationInDB):
+    """Canonical read shape — what API responses return.
+
+    Inherits every persisted field. Unlike `User` there's no secret
+    to redact: conversation metadata is safe to surface.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
+# turns  (T06 / #7)
+# ---------------------------------------------------------------------------
+
+
+class TurnBase(BaseModel):
+    """Fields shared between create / read shapes for `turns`.
+
+    Per ADR-0005 a Turn is one message inside a conversation. The
+    `user` role carries the user's natural-language instruction; the
+    `assistant` role holds the final LLM answer (or a streaming-
+    aggregated snapshot at read time). `system` is reserved for
+    internal messages the runtime inserts (e.g. "Plan generated").
+
+    `plan_id` is optional because some Turns (smalltalk, chit-chat)
+    don't need a Plan — per ADR-0004 the Planner is allowed to skip
+    Plan generation when no Tool is involved.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str = Field(
+        description="ObjectId of `conversations._id`. Indexed.",
+    )
+    role: TurnRole = Field(
+        description="Who produced the message — `user` / `assistant` / `system`.",
+    )
+    content: str = Field(
+        description="Markdown-rendered message body. May be empty for tool-only turns.",
+    )
+    plan_id: str | None = Field(
+        default=None,
+        description=(
+            "ObjectId of `plans._id` attached to this Turn. Indexed. "
+            "`None` for Turns that bypass the Planner (smalltalk). "
+            "Per ADR-0019 an edited Plan keeps a single `plan_id`; the diff "
+            "lives on the Plan document, not as a separate Turn."
+        ),
+    )
+
+
+class TurnCreate(TurnBase):
+    """Input shape for creating a Turn.
+
+    `extra` is the seam for tool-only metadata (e.g. the SSE
+    completion time, the model name used, etc.) that the chat UI
+    doesn't render but audit / Langfuse traces (T40) do.
+    """
+
+    extra: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Open-ended metadata for forensic / trace use. Not rendered in chat UI.",
+    )
+
+
+class TurnInDB(TurnBase):
+    """Persisted shape of a `turns` document."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: PyObjectId = Field(alias="_id")
+    extra: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class Turn(TurnInDB):
+    """Canonical read shape — what API responses return.
+
+    Inherits every persisted field; nothing redacted.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
+# plans  (T06 / #7)
+# ---------------------------------------------------------------------------
+
+
+class PlanNodeToolSnapshot(BaseModel):
+    """Tool definition snapshot frozen at Plan generation time.
+
+    Per ADR-0027 each Plan embeds the Tool definitions it references so
+    audits / replays see "which Tool was actually invoked" rather than
+    "the Tool's current state". The fields here mirror the persisted
+    `tools` document minus `_id`, `created_at`, `updated_at`,
+    `credentials_ref` (which references an FK, not a snapshot worth
+    embedding). Plan-Tool binding validation (T44) compares the
+    snapshot against the live row and warns on material drift.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="Tool slug at Plan-generation time.")
+    description: str = Field(description="LLM-facing description at freeze time.")
+    risk_level: ToolRiskLevel = Field(
+        description="Risk tier at freeze time. Drives per-node HITL re-confirmation.",
+    )
+    parameters_schema: dict[str, Any] = Field(
+        default_factory=dict,
+        description="JSON Schema for the Tool's arguments (T44 reads this).",
+    )
+    http_method: str = Field(description="HTTP method at freeze time.")
+    http_url_template: str = Field(description="URL template at freeze time.")
+    http_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Static headers at freeze time.",
+    )
+    http_body_template: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional JSON body template at freeze time.",
+    )
+
+
+class PlanNode(BaseModel):
+    """One Tool invocation inside a Plan DAG.
+
+    Edges are encoded as `depends_on: list[str]` (the list of
+    predecessor node ids inside the same Plan). Per ADR-0012 the
+    LangGraph executor resolves this into a layer-by-layer schedule.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(
+        max_length=64,
+        description=(
+            "Stable per-Plan identifier — distinct from Mongo `_id`. "
+            "Edges reference this string. Conventional: `n1`, `n2`, …"
+        ),
+    )
+    tool_snapshot: PlanNodeToolSnapshot = Field(
+        description="Frozen Tool definition (ADR-0027). Worker validates against this.",
+    )
+    parameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Resolved Tool arguments at Plan generation. "
+            "Business user may edit (ADR-0019)."
+        ),
+    )
+    notes: str = Field(
+        default="",
+        max_length=512,
+        description="Free-form semantic note the Planner attaches for the LLM-facing description.",
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="Node ids this node waits on. Empty list = root of the DAG.",
+    )
+
+
+class PlanBase(BaseModel):
+    """Fields shared between create / read shapes for `plans`.
+
+    `nodes` carries the full DAG including the `tool_snapshots`
+    embedded on each node — the acceptance criterion for T06. Per
+    ADR-0019 the `edited_diff` field is populated when the business
+    user edits parameters; it's a `before → after` JSON diff so audit
+    trails can show exactly what the human changed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str = Field(
+        description="ObjectId of `conversations._id`. Indexed.",
+    )
+    turn_id: str = Field(
+        description="ObjectId of `turns._id` that triggered this Plan. Indexed.",
+    )
+    status: PlanStatus = Field(
+        default="pending",
+        description="Lifecycle (see `PlanStatus` enum docstring).",
+    )
+    nodes: list[PlanNode] = Field(
+        description=(
+            "DAG of Tool invocations. Each node carries its own "
+            "`tool_snapshot` per ADR-0027 — the acceptance criterion "
+            "for T06. The list order is not significant; the "
+            "`depends_on` edges carry the topology."
+        ),
+    )
+
+
+class PlanCreate(PlanBase):
+    """Input shape for creating a Plan.
+
+    `edited_diff` lands on Plan only after a human edit (ADR-0019),
+    so the create path defaults it to `None`. The repository enforces
+    at least one node — a Plan with zero nodes has no audit value and
+    confuses the Frontend DAG renderer.
+    """
+
+
+class PlanUpdate(BaseModel):
+    """Partial update shape for `plans`.
+
+    Lifecycle transitions have dedicated repository methods so audit
+    hooks see them as discrete events; this model only covers the
+    user-driven edits described in ADR-0019.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: PlanStatus | None = None
+    edited_diff: dict[str, Any] | None = Field(
+        default=None,
+        description="JSON diff between the original and edited Plan (ADR-0019).",
+    )
+
+
+class PlanInDB(PlanBase):
+    """Persisted shape of a `plans` document."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: PyObjectId = Field(alias="_id")
+    edited_diff: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class Plan(PlanInDB):
+    """Canonical read shape — what API responses return.
+
+    Inherits every persisted field; nothing redacted. The DAG is
+    returned verbatim so the React Flow renderer (T19) can lay it
+    out without re-deriving edges.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
+# plan_executions  (T06 / #7)
+# ---------------------------------------------------------------------------
+
+
+class PlanNodeResult(BaseModel):
+    """Outcome of one node inside a `plan_execution`.
+
+    Captures the per-node lifecycle: which tool, what parameters
+    were sent, what came back, whether it succeeded. The error shape
+    follows the Worker-side envelope so a future SSE consumer can
+    replay the result without re-running.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(description="Stable Plan-node id this result refers to.")
+    status: PlanNodeStatus = Field(
+        description="Per-node status — see `PlanNodeStatus` for the lifecycle.",
+    )
+    started_at: datetime | None = Field(
+        default=None,
+        description="Wall-clock start. Stamped by the Worker on `tool.started`.",
+    )
+    finished_at: datetime | None = Field(
+        default=None,
+        description="Wall-clock finish. Stamped by the Worker on terminal status transition.",
+    )
+    request: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Outgoing HTTP request payload sent to the upstream API. "
+            "Persisted alongside the result (ADR-0028). None until the "
+            "request has been sent."
+        ),
+    )
+    response: dict[str, Any] | None = Field(
+        default=None,
+        description="Upstream API response body (success or error). None until terminal.",
+    )
+    error: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Structured error envelope (code / message / details) on failure. "
+            "None on success."
+        ),
+    )
+    retry_count: int = Field(
+        default=0,
+        ge=0,
+        description="How many times the Worker retried before this terminal state.",
+    )
+
+
+class PlanExecutionBase(BaseModel):
+    """Fields shared between create / read shapes for `plan_executions`.
+
+    One per Plan; one at most per Plan (a re-execution after a
+    business user action creates a new execution row rather than
+    mutating the prior one, so audit trails see each attempt
+    separately).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str = Field(
+        description="ObjectId of `plans._id`. Indexed.",
+    )
+    conversation_id: str = Field(
+        description="ObjectId of `conversations._id`. Denormalised for fast session-level rollups.",
+    )
+    status: Literal["running", "completed", "failed", "aborted"] = Field(
+        default="running",
+        description="Aggregate execution status — rolled up from `node_results`.",
+    )
+    node_results: list[PlanNodeResult] = Field(
+        default_factory=list,
+        description=(
+            "Per-node outcomes keyed by `node_id`. Includes pending nodes "
+            "with status `pending` so the Frontend can render a partial DAG."
+        ),
+    )
+
+
+class PlanExecutionCreate(PlanExecutionBase):
+    """Input shape for creating a PlanExecution.
+
+    The first call carries `node_results=[]` (the Worker appends as
+    each node terminalises). `started_at` defaults to the repository
+    clock; `finished_at` stays `None` until the execution closes.
+    """
+
+
+class PlanExecutionUpdate(BaseModel):
+    """Partial update shape for `plan_executions`.
+
+    The Worker uses `upsert_node_result` for per-node appends and
+    `set_status` for the aggregate terminal. This `update` path
+    covers edge cases (e.g. attaching an admin note) — most fields
+    are intentionally NOT modifiable here to keep audit semantics
+    clear.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["running", "completed", "failed", "aborted"] | None = None
+
+
+class PlanExecutionInDB(PlanExecutionBase):
+    """Persisted shape of a `plan_executions` document."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: PyObjectId = Field(alias="_id")
+    started_at: datetime
+    finished_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlanExecution(PlanExecutionInDB):
+    """Canonical read shape — what API responses return."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
+# audit_logs  (T06 / #7)
+# ---------------------------------------------------------------------------
+
+
+class AuditLogBase(BaseModel):
+    """Fields shared between create / read shapes for `audit_logs`.
+
+    Per ADR-0002 every Tool invocation must be auditable, and per
+    ADR-0028 the row carries its own retention metadata so the
+    hot/cold split (and future recall) can be enforced without a
+    second collection.
+
+    `actor_id` is the user who triggered the call. `tool_snapshot`
+    freezes the Tool definition that was actually invoked (ADR-0027)
+    so the log row answers "what version of the Tool did this run?"
+    without joining `tools` (which may have moved on).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor_id: str = Field(
+        description="ObjectId of `users._id` who triggered the call. Indexed.",
+    )
+    conversation_id: str = Field(
+        description="ObjectId of `conversations._id`. Indexed.",
+    )
+    turn_id: str = Field(
+        description="ObjectId of `turns._id`. Indexed.",
+    )
+    plan_id: str = Field(
+        description="ObjectId of `plans._id`. Indexed.",
+    )
+    plan_execution_id: str = Field(
+        description="ObjectId of `plan_executions._id`. Indexed.",
+    )
+    tool_name: str = Field(
+        description="Slug of the Tool that was invoked. Indexed for filter UIs.",
+    )
+    tool_snapshot: PlanNodeToolSnapshot = Field(
+        description="Frozen Tool definition per ADR-0027 — what the Worker actually saw.",
+    )
+    parameters: dict[str, Any] = Field(
+        description="Resolved Tool arguments. Persisted in full (with PII redaction at the seam).",
+    )
+    response: dict[str, Any] | None = Field(
+        default=None,
+        description="Upstream API response (success or error body). None until terminal.",
+    )
+    status: Literal["running", "succeeded", "failed", "skipped"] = Field(
+        description="Per-call outcome — `running` is brief; admins see terminal only.",
+    )
+    error: dict[str, Any] | None = Field(
+        default=None,
+        description="Structured error envelope on failure. None on success.",
+    )
+    risk_level: ToolRiskLevel = Field(
+        description="Tool's risk tier at call time — drives HITL re-confirm display in audit UI.",
+    )
+    retry_count: int = Field(default=0, ge=0)
+
+
+class AuditLogCreate(AuditLogBase):
+    """Input shape for creating an audit log entry.
+
+    Repository stamps `occurred_at` and `retention` on insert; the
+    caller never supplies them. Retention metadata follows the
+    default 1-year hot + 3-year cold schedule (ADR-0028) and the
+    repair job bumps `cold_archived_at` as the row crosses the
+    boundary.
+    """
+
+
+class AuditLogInDB(AuditLogBase):
+    """Persisted shape of an `audit_logs` document.
+
+    Names the lifecycle column `lifecycle_status` rather than
+    `status` because `status` is already the per-call outcome
+    (succeeded / failed / running / skipped). Renaming on the wire
+    keeps the canonical `AuditLog` shape readable — both sides carry
+    the same field name, so the simpler `InDB → Canonical` mapping
+    is a no-op transform.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: PyObjectId = Field(alias="_id")
+    occurred_at: datetime
+    lifecycle_status: AuditLogStatus = Field(
+        default="active",
+        description="ADR-0028 retention lifecycle — `active` / `archived` / `recalled`.",
+    )
+    cold_storage_ref: str | None = None
+    cold_archived_at: datetime | None = None
+
+
+class AuditLog(AuditLogInDB):
+    """Canonical read shape — what API responses return.
+
+    Inherits every persisted field directly (mirrors
+    `Tool(ToolInDB)`). Lifecycle metadata is surfaced so the admin
+    audit UI can render "this row expires in 364 days" without
+    joining a second collection (ADR-0028).
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+

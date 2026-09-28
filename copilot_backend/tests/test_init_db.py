@@ -19,12 +19,17 @@ import pytest
 from mongomock_motor import AsyncMongoMockClient
 
 from app.db.indexes import (
+    AUDIT_LOGS,
+    CONVERSATIONS,
     CORE_COLLECTIONS,
     CREDENTIALS,
+    PLAN_EXECUTIONS,
+    PLANS,
     REFRESH_TOKENS,
     ROLES,
     TOOL_GROUPS,
     TOOLS,
+    TURNS,
     USERS,
 )
 from app.db.init_db import init_database
@@ -41,16 +46,31 @@ class TestInitDatabase:
 
     @pytest.mark.asyncio
     async def test_creates_all_core_collections(self, mock_db: object) -> None:
-        """All six core collections land on the database after init.
+        """All eleven core collections land on the database after init.
 
-        T05 (#6) extends the four-collection seed (users / roles /
-        refresh_tokens / tool_groups) with `tools` and `credentials`.
-        The acceptance criterion for the ticket is "2 collection 创建",
-        so we pin both here.
+        T04 brought the four (users / roles / refresh_tokens /
+        tool_groups), T05 (#6) added two (tools / credentials),
+        and T06 (#7) completes the conversation domain with five
+        more: conversations / turns / plans / plan_executions /
+        audit_logs. The two T06 acceptance criteria — "5 collection
+        创建" and "Plan 含 tool_snapshots / audit_logs 含完整字段" —
+        are pinned here.
         """
         await init_database(mock_db)  # type: ignore[arg-type]
         names = set(await mock_db.list_collection_names())  # type: ignore[attr-defined]
-        assert {USERS, ROLES, REFRESH_TOKENS, TOOL_GROUPS, TOOLS, CREDENTIALS} <= names
+        assert {
+            USERS,
+            ROLES,
+            REFRESH_TOKENS,
+            TOOL_GROUPS,
+            TOOLS,
+            CREDENTIALS,
+            CONVERSATIONS,
+            TURNS,
+            PLANS,
+            PLAN_EXECUTIONS,
+            AUDIT_LOGS,
+        } <= names
 
     @pytest.mark.asyncio
     async def test_tool_indexes_match_spec(self, mock_db: object) -> None:
@@ -130,6 +150,64 @@ class TestInitDatabase:
             info = await mock_db[collection].index_information()  # type: ignore[index]
             assert index_name in info, f"missing {index_name} on {collection}"
             assert info[index_name].get("unique") is True
+
+    @pytest.mark.asyncio
+    async def test_conversation_indexes_match_spec(self, mock_db: object) -> None:
+        """`conversations` carries the hot-path + status indexes (ADR-0011)."""
+        await init_database(mock_db)  # type: ignore[arg-type]
+        info = await mock_db[CONVERSATIONS].index_information()  # type: ignore[index]
+        assert set(info.keys()) == {
+            "_id_",
+            "by_user_last_activity",
+            "by_status_activity",
+            "by_user_status",
+        }
+        assert info["by_user_last_activity"].get("unique") is None
+        assert info["by_status_activity"].get("unique") is None
+
+    @pytest.mark.asyncio
+    async def test_turn_and_plan_indexes_match_spec(self, mock_db: object) -> None:
+        """`turns` + `plans` carry compound indexes for the chat / DAG reads."""
+        await init_database(mock_db)  # type: ignore[arg-type]
+        turns_info = await mock_db[TURNS].index_information()  # type: ignore[index]
+        assert set(turns_info.keys()) == {
+            "_id_",
+            "by_conversation_created_at",
+            "by_plan_id",
+        }
+
+        plans_info = await mock_db[PLANS].index_information()  # type: ignore[index]
+        assert set(plans_info.keys()) == {
+            "_id_",
+            "by_conversation_created_at",
+            "by_turn_id",
+            "by_status",
+        }
+
+    @pytest.mark.asyncio
+    async def test_plan_execution_and_audit_log_indexes_match_spec(
+        self, mock_db: object
+    ) -> None:
+        """`plan_executions` + `audit_logs` carry the FK + time indexes."""
+        await init_database(mock_db)  # type: ignore[arg-type]
+        exec_info = await mock_db[PLAN_EXECUTIONS].index_information()  # type: ignore[index]
+        assert set(exec_info.keys()) == {
+            "_id_",
+            "by_plan_started_at",
+            "by_conversation_id",
+            "by_status",
+        }
+
+        audit_info = await mock_db[AUDIT_LOGS].index_information()  # type: ignore[index]
+        assert set(audit_info.keys()) == {
+            "_id_",
+            "by_conversation_id",
+            "by_turn_id",
+            "by_plan_id",
+            "by_actor_id",
+            "by_tool_name",
+            "by_occurred_at",
+        }
 
     @pytest.mark.asyncio
     async def test_returns_index_names_per_collection(self, mock_db: object) -> None:

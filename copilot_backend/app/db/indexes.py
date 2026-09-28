@@ -1,15 +1,20 @@
-"""Index specifications for the four core collections.
+"""Index specifications for the MongoDB collections.
 
 Single source of truth for `init_db.py` — collections and indexes are
-created in one pass. Two design rules govern the entries below:
+created in one pass. Three design rules govern the entries below:
 
 1. **Lookups come first.** Every field the repository layer reads by
    has a unique or non-unique index. Without this, the user-lookup
-   queries in T07 (login) and T08 (refresh) scan the full collection.
+   queries in T07 (login), the conversation list in T10 (CRUD), and
+   the audit-log drill-downs in T43 scan the full collection.
 2. **Sparse + unique for "one-of" fields.** `sso_subject` and
    `local_username` are unique only when present (sparse=True). A row
    missing the field shouldn't collide with another row also missing
    it — that would let every SSO user claim the same "blank subject".
+3. **Compound for hot paths.** The conversation list view sorts by
+   `user_id` then `last_activity_at`; turning that into one index
+   keeps T39's "flip to idle" sweep an index scan rather than a
+   collection scan + sort.
 
 `refresh_tokens` carries a TTL index on `expires_at`: the persistence
 layer purges expired rows itself, so the application code never has to
@@ -19,7 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from pymongo import ASCENDING, IndexModel
+from pymongo import ASCENDING, DESCENDING, IndexModel
 
 # ---------------------------------------------------------------------------
 # Collection names — referenced from init_db.py AND repositories.
@@ -31,6 +36,11 @@ REFRESH_TOKENS = "refresh_tokens"
 TOOL_GROUPS = "tool_groups"
 TOOLS = "tools"
 CREDENTIALS = "credentials"
+CONVERSATIONS = "conversations"
+TURNS = "turns"
+PLANS = "plans"
+PLAN_EXECUTIONS = "plan_executions"
+AUDIT_LOGS = "audit_logs"
 
 
 CORE_COLLECTIONS: tuple[str, ...] = (
@@ -40,6 +50,12 @@ CORE_COLLECTIONS: tuple[str, ...] = (
     TOOL_GROUPS,
     TOOLS,
     CREDENTIALS,
+    # T06 (#7) — conversation-domain collections.
+    CONVERSATIONS,
+    TURNS,
+    PLANS,
+    PLAN_EXECUTIONS,
+    AUDIT_LOGS,
 )
 
 
@@ -140,6 +156,98 @@ CREDENTIAL_INDEXES: list[IndexModel] = [
 ]
 
 
+# `conversations` (T06 / #7) — the list view is
+# `find({user_id}).sort({last_activity_at: -1})`; turning the hot
+# path into one compound index keeps the Frontend "recent
+# conversations" load off the full scan. `by_status` powers T39's
+# sweep ("find every active conversation whose last activity is
+# older than 15 min"). `by_user_status` covers the Frontend's
+# active / idle / archived filter.
+CONVERSATION_INDEXES: list[IndexModel] = [
+    # Hot read: "my active conversations, newest first".
+    IndexModel(
+        [("user_id", ASCENDING), ("last_activity_at", DESCENDING)],
+        name="by_user_last_activity",
+    ),
+    # T39 idle sweep: every active conversation sorted by activity.
+    IndexModel(
+        [("status", ASCENDING), ("last_activity_at", ASCENDING)],
+        name="by_status_activity",
+    ),
+    # Frontend filter for a single conversation's status filter.
+    IndexModel(
+        [("user_id", ASCENDING), ("status", ASCENDING)],
+        name="by_user_status",
+    ),
+]
+
+
+# `turns` (T06 / #7) — the chat history is a per-conversation fetch
+# in `created_at` order. `created_at` alone is fine for queries
+# scoped to one conversation (Mongo sorts in-memory cheap at this
+# scale), but the compound lets the archive flow
+# (`conversation_id`, status) cleanly without re-scanning.
+TURN_INDEXES: list[IndexModel] = [
+    # Primary read: a conversation's turns in order.
+    IndexModel(
+        [("conversation_id", ASCENDING), ("created_at", ASCENDING)],
+        name="by_conversation_created_at",
+    ),
+    # Lookup by Plan (cross-turn analysis, audit joins).
+    IndexModel([("plan_id", ASCENDING)], name="by_plan_id"),
+]
+
+
+# `plans` (T06 / #7) — the chat UI fetches the latest plan for a
+# conversation (`conversation_id`, `created_at` DESC). The audit
+# drill-down (T42) looks up by `turn_id`. The lifecycle filter
+# (`status: pending|approved|...`) drives the HITL pending queue.
+PLAN_INDEXES: list[IndexModel] = [
+    # Latest-plan-per-conversation lookup.
+    IndexModel(
+        [("conversation_id", ASCENDING), ("created_at", DESCENDING)],
+        name="by_conversation_created_at",
+    ),
+    # Per-Turn lookup.
+    IndexModel([("turn_id", ASCENDING)], name="by_turn_id"),
+    # HITL pending queue + lifecycle dashboards.
+    IndexModel([("status", ASCENDING)], name="by_status"),
+]
+
+
+# `plan_executions` (T06 / #7) — one row per Plan invocation; the
+# read pattern is "give me the run for this Plan, newest first" —
+# plans can re-execute (admin retry, agent-initiated re-run), so we
+# sort by `started_at` DESC. `status` powers the "running now"
+# dashboard.
+PLAN_EXECUTION_INDEXES: list[IndexModel] = [
+    # Per-Plan lookup of every execution attempt (audit / replay).
+    IndexModel(
+        [("plan_id", ASCENDING), ("started_at", DESCENDING)],
+        name="by_plan_started_at",
+    ),
+    # Session-level rollup: executions per conversation.
+    IndexModel([("conversation_id", ASCENDING)], name="by_conversation_id"),
+    # "What's currently running" query.
+    IndexModel([("status", ASCENDING)], name="by_status"),
+]
+
+
+# `audit_logs` (T06 / #7) — the read patterns are diverse
+# (per-conversation, per-turn, per-plan, per-actor, per-tool, time
+# range). For T06 we cover the four FK lookups + a time index
+# (per-tenant "list my audit rows this month" scans); retention
+# sweeps and recall land with T42 and add their own indexes here.
+AUDIT_LOG_INDEXES: list[IndexModel] = [
+    IndexModel([("conversation_id", ASCENDING)], name="by_conversation_id"),
+    IndexModel([("turn_id", ASCENDING)], name="by_turn_id"),
+    IndexModel([("plan_id", ASCENDING)], name="by_plan_id"),
+    IndexModel([("actor_id", ASCENDING)], name="by_actor_id"),
+    IndexModel([("tool_name", ASCENDING)], name="by_tool_name"),
+    IndexModel([("occurred_at", DESCENDING)], name="by_occurred_at"),
+]
+
+
 # ---------------------------------------------------------------------------
 # Aggregator: lookup by collection name → index list.
 # ---------------------------------------------------------------------------
@@ -151,13 +259,18 @@ INDEX_SPECS: dict[str, list[IndexModel]] = {
     TOOL_GROUPS: TOOL_GROUP_INDEXES,
     TOOLS: TOOL_INDEXES,
     CREDENTIALS: CREDENTIAL_INDEXES,
+    CONVERSATIONS: CONVERSATION_INDEXES,
+    TURNS: TURN_INDEXES,
+    PLANS: PLAN_INDEXES,
+    PLAN_EXECUTIONS: PLAN_EXECUTION_INDEXES,
+    AUDIT_LOGS: AUDIT_LOG_INDEXES,
 }
 
 
 def all_indexes() -> Iterable[tuple[str, list[IndexModel]]]:
     """Iterate `(collection_name, index_list)` pairs in stable order.
 
-    Yields the four CORE_COLLECTIONS in their declared order so init
+    Yields the CORE_COLLECTIONS in their declared order so init
     output is deterministic and easy to diff.
     """
     for name in CORE_COLLECTIONS:

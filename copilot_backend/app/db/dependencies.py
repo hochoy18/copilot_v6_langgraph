@@ -18,11 +18,16 @@ from typing import Any
 from fastapi import Depends, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from app.repositories.audit_logs import AuditLogRepository
+from app.repositories.conversations import ConversationRepository
 from app.repositories.credentials import CredentialRepository
+from app.repositories.plan_executions import PlanExecutionRepository
+from app.repositories.plans import PlanRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.roles import RoleRepository
 from app.repositories.tool_groups import ToolGroupRepository
 from app.repositories.tools import ToolRepository
+from app.repositories.turns import TurnRepository
 from app.repositories.users import UserRepository
 from app.security.crypto import CredentialEncryptor
 
@@ -85,3 +90,38 @@ def get_credential_repository(
 ) -> CredentialRepository:
     """FastAPI dependency: build a `CredentialRepository` for this request."""
     return CredentialRepository(db, encryptor)
+
+
+def get_conversation_repository(
+    db: AsyncIOMotorDatabase[Any] = Depends(get_database),  # noqa: B008  (FastAPI idiom)
+) -> ConversationRepository:
+    """FastAPI dependency: build a `ConversationRepository` for this request."""
+    return ConversationRepository(db)
+
+
+def get_turn_repository(
+    db: AsyncIOMotorDatabase[Any] = Depends(get_database),  # noqa: B008  (FastAPI idiom)
+) -> TurnRepository:
+    """FastAPI dependency: build a `TurnRepository` for this request."""
+    return TurnRepository(db)
+
+
+def get_plan_repository(
+    db: AsyncIOMotorDatabase[Any] = Depends(get_database),  # noqa: B008  (FastAPI idiom)
+) -> PlanRepository:
+    """FastAPI dependency: build a `PlanRepository` for this request."""
+    return PlanRepository(db)
+
+
+def get_plan_execution_repository(
+    db: AsyncIOMotorDatabase[Any] = Depends(get_database),  # noqa: B008  (FastAPI idiom)
+) -> PlanExecutionRepository:
+    """FastAPI dependency: build a `PlanExecutionRepository` for this request."""
+    return PlanExecutionRepository(db)
+
+
+def get_audit_log_repository(
+    db: AsyncIOMotorDatabase[Any] = Depends(get_database),  # noqa: B008  (FastAPI idiom)
+) -> AuditLogRepository:
+    """FastAPI dependency: build an `AuditLogRepository` for this request."""
+    return AuditLogRepository(db)
