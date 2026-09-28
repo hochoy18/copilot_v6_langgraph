@@ -287,17 +287,6 @@ def get_openapi_parser() -> OpenAPIParser:
 # ---------------------------------------------------------------------------
 
 
-def get_prompt_provider(request: Request) -> PromptProvider:
-    """FastAPI dependency: return the process-wide `PromptProvider`.
-
-    The provider owns the in-process Prompt cache (ADR-0013) so it is
-    constructed once in the lifespan — per-request instances would
-    discard the cache and re-fetch Langfuse on every import.
-    """
-    provider: PromptProvider = request.app.state.prompt_provider
-    return provider
-
-
 async def get_description_generator(
     request: Request,
     settings: Settings = Depends(get_settings),  # noqa: B008  (FastAPI idiom)

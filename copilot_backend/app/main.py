@@ -96,7 +96,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # LLM a boot error, and degraded boot is deliberately allowed.
     prompt_http_client = httpx.AsyncClient()
     prompt_provider = PromptProvider(settings=settings, http_client=prompt_http_client)
-    app.state.prompt_provider = prompt_provider
     app.state.description_generator = ToolDescriptionGenerator(
         settings=settings,
         prompt_provider=prompt_provider,

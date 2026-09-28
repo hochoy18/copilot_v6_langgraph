@@ -274,6 +274,21 @@ async def test_enrich_degrades_per_draft_when_generation_fails() -> None:
         assert "LLM" in d.warnings[0]
 
 
+async def test_enrich_warns_when_generated_text_lacks_use_cases() -> None:
+    """AC #2 guard: an empty 典型用例 list must not pass silently."""
+    generator, _model = _generator(
+        response_text='{"description": "只有描述没有用例", "typical_use_cases": []}'
+    )
+    drafts = [_draft()]
+
+    await generator.enrich_drafts(drafts)
+
+    assert drafts[0].description_generated is True
+    assert drafts[0].description == "只有描述没有用例"
+    assert len(drafts[0].warnings) == 1
+    assert "用例" in drafts[0].warnings[0]
+
+
 async def test_enrich_caps_generation_and_warns_about_skipped_drafts() -> None:
     """Beyond the cap the extra drafts stay raw — and say so, loudly."""
     generator, model = _generator()

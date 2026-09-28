@@ -89,14 +89,13 @@ class GeneratedDescription:
     `description` is the final composed text (rewrite + 典型用例 lines,
     already clamped to the schema cap) — this is what lands on
     `draft.description`. `typical_use_cases` mirrors the structured
-    model output so callers (the preview UI) can render the hints
-    without re-parsing. `prompt_source` records which rung of the
-    ADR-0013 ladder supplied the template.
+    model output so callers can tell whether the hints actually made
+    it into the text (an empty list triggers a review warning) without
+    re-parsing.
     """
 
     description: str
     typical_use_cases: list[str]
-    prompt_source: str
 
 
 class ToolDescriptionGenerator:
@@ -162,7 +161,6 @@ class ToolDescriptionGenerator:
         return GeneratedDescription(
             description=composed,
             typical_use_cases=use_cases,
-            prompt_source=template.source,
         )
 
     # ------------------------------------------------------------------
@@ -223,6 +221,12 @@ class ToolDescriptionGenerator:
                 draft.original_description = draft.description
                 draft.description = generated.description
                 draft.description_generated = True
+                if not generated.typical_use_cases:
+                    # AC #2 guard: a rewrite without 典型用例 is still
+                    # reviewable, but the admin must be told to add one.
+                    draft.warnings.append(
+                        "LLM 生成结果未包含典型用例，请 review 时补充。"
+                    )
 
         await asyncio.gather(*(_one(draft) for draft in within))
         return import_warnings
