@@ -42,6 +42,7 @@
 |---|---|---|---|
 | `/api/v1/admin/auth/login` | POST | 管理员本地账号登录 | ADR-0006 |
 | `/api/v1/admin/tools` | GET | Tool 列表(可过滤、可搜索) | ADR-0003 / ADR-0018 |
+| `/api/v1/admin/tools` | POST | 手动注册 Tool(默认 `draft`) | ADR-0003 / ADR-0018 |
 | `/api/v1/admin/tools/{id}` | GET / PATCH | 拉取 / 修改 Tool(描述、风险等级、状态) | ADR-0003 / ADR-0018 |
 | `/api/v1/admin/tools/import/openapi` | POST | 上传 / 粘贴 OpenAPI spec,返回预览(每个 operation 派生 draft Tool) | ADR-0003 / ADR-0018 |
 | `/api/v1/admin/tools/import/confirm` | POST | 确认 preview 中的若干 operation 激活 | ADR-0018 |

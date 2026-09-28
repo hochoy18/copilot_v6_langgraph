@@ -36,6 +36,7 @@ from app.repositories.turns import TurnRepository
 from app.repositories.users import UserRepository
 from app.security.crypto import CredentialEncryptor
 from app.settings import Settings, get_settings
+from app.tools.service import ToolService
 
 
 def get_database(request: Request) -> AsyncIOMotorDatabase[Any]:
@@ -244,3 +245,20 @@ def get_conversation_service(
         turn_repository=turn_repo,
         plan_repository=plan_repo,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool service (T12 / #11)
+# ---------------------------------------------------------------------------
+
+
+def get_tool_service(
+    tool_repo: ToolRepository = Depends(get_tool_repository),  # noqa: B008
+) -> ToolService:
+    """FastAPI dependency: build a `ToolService` for this request.
+
+    The service is stateless beyond the repository reference; a fresh
+    instance per request is fine. Tests override this dependency to
+    inject a stubbed service without touching the lifespan.
+    """
+    return ToolService(tool_repository=tool_repo)

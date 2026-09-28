@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError as PyMongoDuplicateKeyError
 
-from app.db.errors import NotFoundError
+from app.db.errors import InvalidIdError, NotFoundError
 from app.db.indexes import ROLES
 from app.db.schemas import Role, RoleCreate, RoleInDB, RoleUpdate
 from app.repositories.base import BaseRepository
@@ -62,4 +63,31 @@ class RoleRepository(BaseRepository[Role, RoleCreate, RoleUpdate]):
 
     async def list_all(self) -> list[Role]:
         cursor = self._collection.find({}).sort("name", 1)
+        return [self._doc_to_read(doc) async for doc in cursor]
+
+    async def list_by_ids(self, role_ids: list[str]) -> list[Role]:
+        """Look up a batch of Roles by `_id`, returning whatever resolved.
+
+        Admin authorisation (`app.security.admin.require_admin_user`)
+        needs to ask "does this user hold the `admin` role?" without
+        paying N round-trips. `list_by_ids` runs a single `$in` query
+        against the indexed `_id` field and skips ids that fail the
+        ObjectId coercion — a corrupt id is treated as "no such role"
+        rather than raising, so the auth path stays simple.
+
+        Order is not preserved — callers that care about ordering
+        should sort the result themselves. Empty / all-invalid input
+        returns an empty list.
+        """
+        if not role_ids:
+            return []
+        object_ids: list[ObjectId] = []
+        for raw in role_ids:
+            try:
+                object_ids.append(self.to_object_id(raw))
+            except InvalidIdError:
+                continue
+        if not object_ids:
+            return []
+        cursor = self._collection.find({"_id": {"$in": object_ids}}).sort("name", 1)
         return [self._doc_to_read(doc) async for doc in cursor]

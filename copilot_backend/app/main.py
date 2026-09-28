@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.admin_tools import router as admin_tools_router
 from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
@@ -135,6 +136,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from app.api.auth import admin_router
 
     app.include_router(admin_router)
+    # T12 / #11 — admin Tool CRUD (`POST /tools`, `GET /tools`,
+    # `GET /tools/{id}`, `PATCH /tools/{id}`). Lives after `admin_router`
+    # so the OpenAPI tag order reads auth → admin-tools; load order
+    # has no runtime effect.
+    app.include_router(admin_tools_router)
 
     # Unified error contract (ADR-0031).
     register_exception_handlers(app)
