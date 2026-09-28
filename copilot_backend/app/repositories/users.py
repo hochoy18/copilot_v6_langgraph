@@ -59,21 +59,13 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
 
     @staticmethod
     def _doc_to_in_db(doc: dict[str, Any]) -> UserInDB:
-        """Parse a Mongo document into the persisted-shape Pydantic model.
+        """Parse a Mongo document into the persisted-shape Pydantic model."""
+        return UserInDB.model_validate(BaseRepository._coerce_id(doc))
 
-        Centralising the parsing means every read path produces the
-        same validation; a future schema migration only needs to
-        change here.
-        """
-        # Mongo stores `_id` as ObjectId; coerce to str for the Pydantic
-        # model (which expects a string in the canonical read shape).
-        if "_id" in doc and not isinstance(doc["_id"], str):
-            doc = {**doc, "_id": str(doc["_id"])}
-        return UserInDB.model_validate(doc)
-
-    def _doc_to_read(self, doc: dict[str, Any]) -> User:
+    @staticmethod
+    def _doc_to_read(doc: dict[str, Any]) -> User:
         """Convert a Mongo document to the canonical read shape (no `password_hash`)."""
-        return User.from_db(self._doc_to_in_db(doc))
+        return User.from_db(UserRepository._doc_to_in_db(doc))
 
     # ------------------------------------------------------------------
     # Create

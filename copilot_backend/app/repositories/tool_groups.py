@@ -28,9 +28,7 @@ class ToolGroupRepository(BaseRepository[ToolGroup, ToolGroupCreate, ToolGroupUp
 
     @staticmethod
     def _doc_to_read(doc: dict[str, Any]) -> ToolGroup:
-        if "_id" in doc and not isinstance(doc["_id"], str):
-            doc = {**doc, "_id": str(doc["_id"])}
-        return ToolGroup.model_validate(doc)
+        return ToolGroup.model_validate(BaseRepository._coerce_id(doc))
 
     async def get_by_name(self, name: str) -> ToolGroup:
         doc = await self._collection.find_one({"name": name})

@@ -2,15 +2,20 @@
 
 Centralises the small set of helpers that any repository needs:
 
-* ObjectId ↔ str conversion for primary keys.
-* Mapping a MongoDB document into the canonical read shape (which
-  usually involves stripping internal-only fields like `password_hash`).
-* The "now" clock — pinned to UTC `datetime.now(UTC)` so tests can
-  patch it.
+* `to_object_id` — string → `bson.ObjectId`, with `InvalidIdError` on
+  malformed input (the seam operators use).
+* `_coerce_id` — Mongo doc with `_id: ObjectId` → dict copy with
+  `_id: str`. Subclass parse helpers call this and then `model_validate`
+  on the right Pydantic model.
+* `_translate_duplicate` — `pymongo.errors.DuplicateKeyError` →
+  `app.db.errors.DuplicateKeyError` with the offending index name
+  surfaced under `details.index`.
+* `_now` — UTC clock, overridable by subclasses for deterministic
+  tests.
 
 Why a base class: the per-collection repositories share too much logic
 for composition but too little for an `ABC`; a concrete class with
-overridable hooks (`_to_read_model`, `_now`) hits the sweet spot.
+overridable static helpers hits it.
 """
 from __future__ import annotations
 
@@ -21,7 +26,7 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError as PyMongoDuplicateKeyError
 
-from app.db.errors import DuplicateKeyError, InvalidIdError, NotFoundError
+from app.db.errors import DuplicateKeyError, InvalidIdError
 
 # Generic type for the canonical read shape (e.g. `User`). The base
 # class doesn't know which collection it serves; subclasses parameterise
@@ -71,17 +76,16 @@ class BaseRepository(Generic[TRead, TCreate, TUpdate]):
             ) from exc
 
     @staticmethod
-    def _to_read(doc: dict[str, Any] | None) -> dict[str, Any]:
-        """Default `_id` → `id` rename for callers that bypass Pydantic.
+    def _coerce_id(doc: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy of `doc` with `_id` coerced to str (idempotent).
 
-        Subclasses override this when the read shape needs more
-        transformations (e.g. dropping `password_hash`).
+        Mongo stores `_id` as `bson.ObjectId`; the canonical read shape
+        carries `id` as a string. Centralising the coercion here means
+        every read path produces the same parsed shape and a future
+        migration (e.g. uuid ids) only needs to change one place.
         """
-        if doc is None:
-            raise NotFoundError(message_en="Document not found")
-        doc = dict(doc)
-        if "_id" in doc and "id" not in doc:
-            doc["id"] = str(doc.pop("_id"))
+        if "_id" in doc and not isinstance(doc["_id"], str):
+            doc = {**doc, "_id": str(doc["_id"])}
         return doc
 
     @staticmethod

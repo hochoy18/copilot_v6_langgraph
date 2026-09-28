@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError as PyMongoDuplicateKeyError
 
 from app.db.errors import NotFoundError
 from app.db.indexes import ROLES
@@ -27,9 +28,7 @@ class RoleRepository(BaseRepository[Role, RoleCreate, RoleUpdate]):
 
     @staticmethod
     def _doc_to_read(doc: dict[str, Any]) -> Role:
-        if "_id" in doc and not isinstance(doc["_id"], str):
-            doc = {**doc, "_id": str(doc["_id"])}
-        return Role.model_validate(doc)
+        return Role.model_validate(BaseRepository._coerce_id(doc))
 
     async def get_by_name(self, name: str) -> Role:
         """Look up by role slug. Raises `NotFoundError` if missing."""
@@ -48,17 +47,13 @@ class RoleRepository(BaseRepository[Role, RoleCreate, RoleUpdate]):
                 message_en=f"Role {name!r} not found",
                 details={"name": name},
             )
-        if "_id" in doc and not isinstance(doc["_id"], str):
-            doc = {**doc, "_id": str(doc["_id"])}
-        return RoleInDB.model_validate(doc)
+        return RoleInDB.model_validate(BaseRepository._coerce_id(doc))
 
     async def create(self, data: RoleCreate) -> Role:
         now = self._now()
         doc = data.model_dump()
         doc["created_at"] = now
         doc["updated_at"] = now
-        from pymongo.errors import DuplicateKeyError as PyMongoDuplicateKeyError
-
         try:
             await self._collection.insert_one(doc)
         except PyMongoDuplicateKeyError as exc:

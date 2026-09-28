@@ -43,9 +43,7 @@ class RefreshTokenRepository(BaseRepository[RefreshTokenInDB, RefreshTokenCreate
 
     @staticmethod
     def _doc_to_in_db(doc: dict[str, Any]) -> RefreshTokenInDB:
-        if "_id" in doc and not isinstance(doc["_id"], str):
-            doc = {**doc, "_id": str(doc["_id"])}
-        return RefreshTokenInDB.model_validate(doc)
+        return RefreshTokenInDB.model_validate(BaseRepository._coerce_id(doc))
 
     # ------------------------------------------------------------------
     # Create
