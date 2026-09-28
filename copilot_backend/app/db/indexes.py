@@ -18,7 +18,9 @@ created in one pass. Three design rules govern the entries below:
 
 `refresh_tokens` carries a TTL index on `expires_at`: the persistence
 layer purges expired rows itself, so the application code never has to
-sweep a dead-token pile. T07 wires the rotation flow.
+sweep a dead-token pile. T07 (#8) wires the rotation flow and adds a
+non-unique `family_id` index so a reuse-detection event revokes every
+token in the compromised chain with one query.
 """
 from __future__ import annotations
 
@@ -109,6 +111,9 @@ REFRESH_TOKEN_INDEXES: list[IndexModel] = [
         [("user_id", ASCENDING), ("revoked_at", ASCENDING)],
         name="by_user_revoked",
     ),
+    # Per-family lookup: T07 (#8) reuse detection sweeps the rotation
+    # chain in one query when a revoked token is presented again.
+    IndexModel([("family_id", ASCENDING)], name="by_family_id"),
     # TTL: Mongo purges rows whose `expires_at` is in the past. The
     # 0-second `expireAfterSeconds` is the documented form for "use the
     # date field as the absolute expiry".

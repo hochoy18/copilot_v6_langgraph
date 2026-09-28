@@ -39,6 +39,9 @@ app/
   health.py            # /healthz probes (Mongo TCP, Milvus TCP, Langfuse HTTP) + HealthChecker
   api/
     health.py          # /healthz route — returns 200/503 with per-dep breakdown
+  auth/                # T07 (#8) — refresh-token rotation service + auth errors
+    tokens.py          # RefreshTokenService — issue / verify / rotate / revoke, reuse detection
+    errors.py          # RefreshTokenNotFoundError / Revoked / Expired / ReuseDetected
   db/
     mongo.py           # MongoClient — one Motor client per process, closed on shutdown
     schemas.py         # Pydantic models for users / roles / refresh_tokens / tool_groups
@@ -49,7 +52,7 @@ app/
   repositories/
     base.py            # Shared helpers (ObjectId coercion, duplicate-key translation)
     users.py           # UserRepository — CRUD + auth helpers
-    refresh_tokens.py  # RefreshTokenRepository — schema-only here; rotation lands with T07
+    refresh_tokens.py  # RefreshTokenRepository — CRUD + family revocation; rotation lands with T07
     roles.py           # RoleRepository — schema + seed/list/get
     tool_groups.py     # ToolGroupRepository — schema + seed/list/get
 scripts/
@@ -59,7 +62,8 @@ tests/
   test_errors.py       # unhandled exceptions return unified {code,message_zh,...}
   test_cors.py         # CORS middleware wiring
   test_init_db.py      # Idempotent init + per-collection index contract
-  test_user_repository.py  # UserRepository CRUD, validation, canonical-read shape
+  test_user_repository.py   # UserRepository CRUD, validation, canonical-read shape
+  test_refresh_token_rotation.py  # T07 (#8) — rotation / reuse detection / family revocation
 ```
 
 ## Database bootstrap

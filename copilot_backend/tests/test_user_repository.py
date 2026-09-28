@@ -336,7 +336,12 @@ class TestRefreshTokenShape:
 
     @pytest.mark.asyncio
     async def test_refresh_token_persists_required_fields(self) -> None:
-        """The persisted refresh_token document carries the three required fields."""
+        """The persisted refresh_token document carries the required fields.
+
+        T07 (#8) adds `family_id` to the schema; the four required
+        fields persisted today are `token_hash`, `user_id`,
+        `family_id`, `expires_at`.
+        """
         from app.db.schemas import RefreshTokenCreate
         from app.repositories.refresh_tokens import RefreshTokenRepository
 
@@ -352,13 +357,15 @@ class TestRefreshTokenShape:
             RefreshTokenCreate(
                 token_hash="a" * 64,
                 user_id=user.id,
+                family_id="0c0a4f48-dead-beef-cafe-000000000001",
                 expires_at=expires,
             )
         )
 
-        # All three required fields are on the persisted row.
+        # All four required fields are on the persisted row.
         assert token.token_hash == "a" * 64
         assert token.user_id == user.id
+        assert token.family_id == "0c0a4f48-dead-beef-cafe-000000000001"
         assert token.revoked_at is None  # fresh tokens are unrevoked
 
         # And on the raw Mongo doc too.
@@ -366,6 +373,7 @@ class TestRefreshTokenShape:
         assert raw is not None
         assert raw["token_hash"] == "a" * 64
         assert raw["user_id"] == user.id
+        assert raw["family_id"] == "0c0a4f48-dead-beef-cafe-000000000001"
         assert "revoked_at" in raw
 
     @pytest.mark.asyncio
@@ -384,6 +392,7 @@ class TestRefreshTokenShape:
             RefreshTokenCreate(
                 token_hash="b" * 64,
                 user_id=user.id,
+                family_id="0c0a4f48-dead-beef-cafe-000000000002",
                 expires_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=7),
             )
         )

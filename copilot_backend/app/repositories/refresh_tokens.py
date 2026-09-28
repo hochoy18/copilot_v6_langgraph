@@ -6,19 +6,18 @@ The schema is fixed by ADR-0009 (short JWT + refresh-token rotation):
   token only exists in the user's cookie / local storage; the DB
   never sees it.
 * `user_id` — pointer to `users._id`. Indexed.
+* `family_id` — rotation-chain identifier (T07 / #8). Indexed.
 * `expires_at` — absolute expiry (7 days after issuance per ADR-0009).
   Carries a TTL index so expired rows are purged by Mongo itself.
 * `revoked_at` — `None` while active; stamped on rotation / logout /
   admin force-logout. A non-null `revoked_at` makes the token
   unusable even before `expires_at`.
 
-T04 (#5) introduces the repository. The rotation flow (issue a new
-token, revoke the old one in the same operation) lands with T07.
-
-Why this repository is shipped in T04 even though no caller exercises
-it yet: the `init_db` step defines the indexes that T07 will rely on.
-Pinning the schema here means the index list and the read/write shape
-stay in lockstep.
+T04 (#5) introduces the repository. T07 (#8) layers the rotation
+flow on top: `revoke_family` powers reuse detection (one revoked
+token presented again → revoke every token in the chain) and the
+`create` call now accepts `family_id` so a brand-new login gets a
+fresh chain.
 """
 from __future__ import annotations
 
@@ -27,7 +26,7 @@ from typing import Any, ClassVar
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo.errors import PyMongoError
 
-from app.db.errors import NotFoundError
+from app.db.errors import NotFoundError, ValidationError
 from app.db.indexes import REFRESH_TOKENS
 from app.db.schemas import RefreshTokenCreate, RefreshTokenInDB
 from app.repositories.base import BaseRepository
@@ -122,6 +121,36 @@ class RefreshTokenRepository(BaseRepository[RefreshTokenInDB, RefreshTokenCreate
             {"$set": {"revoked_at": self._now()}},
         )
         return result.modified_count
+
+    async def revoke_family(self, family_id: str) -> int:
+        """Revoke every active token in a rotation chain.
+
+        T07 (#8) reuse detection: when a token that has already been
+        rotated (i.e. `revoked_at IS NOT NULL`) is presented again,
+        treat it as a compromise and revoke every token sharing its
+        `family_id`. Returns the number of rows flipped from active
+        to revoked so callers can log "n tokens revoked".
+        """
+        if not family_id:
+            raise ValidationError(
+                message_en="family_id must be a non-empty string",
+                details={"family_id": family_id},
+            )
+        result = await self._collection.update_many(
+            {"family_id": family_id, "revoked_at": None},
+            {"$set": {"revoked_at": self._now()}},
+        )
+        return result.modified_count
+
+    async def list_family(self, family_id: str) -> list[RefreshTokenInDB]:
+        """Return every token in a family, oldest first.
+
+        Used by tests / admin tooling to render the rotation chain. Not
+        a hot path; the indexed lookup is cheap but unbounded on a
+        compromised family.
+        """
+        cursor = self._collection.find({"family_id": family_id}).sort("created_at", 1)
+        return [self._doc_to_in_db(doc) async for doc in cursor]
 
     # ------------------------------------------------------------------
     # Rotation

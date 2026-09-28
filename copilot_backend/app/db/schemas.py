@@ -6,6 +6,9 @@ These are the wire shapes of every collection the backend owns:
 * `tools`, `credentials` — T05 (#6).
 * `conversations`, `turns`, `plans`, `plan_executions`, `audit_logs`
   — T06 (#7).
+* `refresh_tokens.family_id` — T07 (#8); the rotation flow attaches a
+  fresh `family_id` on every login and inherits it on rotate so reuse
+  of a revoked token can revoke the entire chain.
 
 The acceptance criteria for T04 require the schemas to be documented;
 Pydantic gives both documentation and runtime validation in one
@@ -254,6 +257,13 @@ class RefreshTokenBase(BaseModel):
     is stored. Callers compare incoming tokens against `token_hash` (a
     SHA-256 over the raw token) to verify. Per ADR-0009 the raw token
     is short-lived (7 days) and is rotated on every refresh.
+
+    `family_id` (T07 / #8) groups every token issued against one login
+    into a chain. Rotation reuses the same `family_id`; reuse of an
+    already-revoked token within a family triggers a whole-family
+    revoke (OAuth 2.0 Security BCP, "Refresh Token Protection").
+    Independent logins get distinct `family_id`s so a stolen token on
+    one device does not log the user out everywhere.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -265,6 +275,15 @@ class RefreshTokenBase(BaseModel):
     )
     user_id: str = Field(
         description="ObjectId of `users._id`. Indexed.",
+    )
+    family_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description=(
+            "Rotation-chain identifier. A login issues a fresh UUID; "
+            "rotations inherit it. Indexed non-unique so family-wide "
+            "revocations stay one query."
+        ),
     )
     expires_at: datetime = Field(
         description="Token expiry. A TTL index purges rows past this instant."
