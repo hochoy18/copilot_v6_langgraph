@@ -104,6 +104,12 @@ class ToolDraft:
     source_ref: str | None
     credentials_ref: None  # imported Tools never bind a credential at preview time
     warnings: list[str] = field(default_factory=list)
+    # T16 / #14 — LLM description generation (ADR-0018). The generator
+    # overwrites `description` with the LLM-friendly rewrite and parks
+    # the raw OpenAPI text here so the preview UI can show the admin
+    # what the model changed. `None` / `False` means "still raw".
+    original_description: str | None = None
+    description_generated: bool = False
 
 
 @dataclass(slots=True)

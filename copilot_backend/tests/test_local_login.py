@@ -41,8 +41,8 @@ from app.auth.login import (
     OIDCStateStore,
     build_state_store,
 )
-from app.auth.passwords import hash_password, verify_password
 from app.auth.oidc import OIDCAdapter
+from app.auth.passwords import hash_password, verify_password
 from app.auth.tokens import RefreshTokenService
 from app.db.init_db import init_database
 from app.db.schemas import UserCreate

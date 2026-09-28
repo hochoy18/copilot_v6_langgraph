@@ -194,7 +194,6 @@ async def _admin_bearer(
 # Re-export RoleCreate for the helper above.
 from app.db.schemas import RoleCreate  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Sample OpenAPI specs
 # ---------------------------------------------------------------------------

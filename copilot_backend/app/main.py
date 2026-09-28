@@ -15,6 +15,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -27,9 +28,12 @@ from app.auth.oidc import OIDCAdapter
 from app.db.mongo import MongoClient
 from app.exceptions import register_exception_handlers
 from app.health import HealthChecker
+from app.llm.prompts import PromptProvider
+from app.llm.provider import build_chat_model
 from app.security.crypto import CredentialEncryptor
 from app.security.keys import build_credential_encryptor
 from app.settings import Settings, get_settings
+from app.tools.description_generator import ToolDescriptionGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +87,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state_store = build_state_store(settings)
     app.state.oidc_adapter = oidc_adapter
     app.state.oidc_state_store = state_store
+    # T16 / #14 — Prompt provider + description generator on app.state.
+    # The provider owns the in-process Prompt cache (ADR-0013), so it
+    # is per-process like the OIDC adapter; its httpx client is closed
+    # on shutdown for the same socket-leak reason. The chat model is
+    # built lazily inside the generator (`build_chat_model(settings)`
+    # on first use) — constructing it here would make an unconfigured
+    # LLM a boot error, and degraded boot is deliberately allowed.
+    prompt_http_client = httpx.AsyncClient()
+    prompt_provider = PromptProvider(settings=settings, http_client=prompt_http_client)
+    app.state.prompt_provider = prompt_provider
+    app.state.description_generator = ToolDescriptionGenerator(
+        settings=settings,
+        prompt_provider=prompt_provider,
+        chat_model_factory=lambda: build_chat_model(settings),
+    )
     try:
         await _probe_dependencies(settings)
         yield
     finally:
         await oidc_adapter.aclose()
+        await prompt_http_client.aclose()
         await mongo.close()
         logger.info("backend shutting down")
 

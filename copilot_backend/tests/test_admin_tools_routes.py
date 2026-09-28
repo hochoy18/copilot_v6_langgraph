@@ -419,7 +419,8 @@ async def _seed_tool_via_api(
     body = _valid_create_body(name=name, description=description, risk_level=risk_level)
     resp = await client.post("/api/v1/admin/tools", json=body, headers=headers)
     assert resp.status_code == 201, resp.text
-    return resp.json()
+    data: dict[str, Any] = resp.json()
+    return data
 
 
 class TestListTools:

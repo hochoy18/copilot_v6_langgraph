@@ -14,6 +14,10 @@ ADR-0031. Endpoints:
 * `POST   /api/v1/admin/tools/import/openapi` — OpenAPI spec → draft preview
                                                (T14 / #12; rows are NOT
                                                persisted — see ADR-0018).
+                                               T16 / #14 rewrites each
+                                               draft's description with
+                                               the LLM before the admin
+                                               reviews it.
 
 Auth is enforced by `require_admin_user` (T12 / #11), which layers on
 top of `get_current_user` to also verify the caller holds the
@@ -21,10 +25,11 @@ top of `get_current_user` to also verify the caller holds the
 the canonical `User` row attached, never with a raw role lookup.
 
 The router is intentionally thin: every byte of business logic lives
-in `app.tools.service.ToolService` (manual CRUD) or
-`app.tools.openapi_parser.OpenAPIParser` (T14 / #12). This file
-exists only to translate Pydantic wire shapes into service calls
-and back.
+in `app.tools.service.ToolService` (manual CRUD),
+`app.tools.openapi_parser.OpenAPIParser` (T14 / #12), or
+`app.tools.description_generator.ToolDescriptionGenerator` (T16 / #14).
+This file exists only to translate Pydantic wire shapes into service
+calls and back.
 
 Why `admin_router` lives here rather than in `app.api.auth`
 -----------------------------------------------------------
@@ -43,7 +48,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field, model_validator
 
-from app.db.dependencies import get_openapi_parser, get_tool_service
+from app.db.dependencies import get_description_generator, get_openapi_parser, get_tool_service
 from app.db.schemas import (
     Tool,
     ToolCreate,
@@ -54,6 +59,7 @@ from app.db.schemas import (
     User,
 )
 from app.security.admin import require_admin_user
+from app.tools.description_generator import ToolDescriptionGenerator
 from app.tools.openapi_parser import OpenAPIParser
 from app.tools.service import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, ToolService
 
@@ -479,7 +485,23 @@ class ToolDraftResponse(BaseModel):
     )
     description: str = Field(
         max_length=4096,
-        description="LLM-friendly description. T16 will rewrite this via Langfuse.",
+        description=(
+            "LLM-friendly description. T16 / #14: auto-rewritten via the "
+            "Langfuse `tool-description-generator` Prompt on import preview "
+            "(ADR-0018); raw OpenAPI text when generation is skipped or fails."
+        ),
+    )
+    original_description: str | None = Field(
+        default=None,
+        description=(
+            "Raw OpenAPI summary/description the LLM rewrite replaced. "
+            "`None` when `description` is still the raw text — the admin "
+            "UI shows it side by side for review."
+        ),
+    )
+    description_generated: bool = Field(
+        default=False,
+        description="True when `description` is the LLM-generated draft awaiting review.",
     )
     risk_level: ToolRiskLevel
     status: ToolStatus = Field(
@@ -538,6 +560,14 @@ class ImportOpenAPIResponse(BaseModel):
     source_format: Literal["json", "yaml"] = Field(
         description="Format the spec was parsed in. UI uses this for the 'parsed from' badge.",
     )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Import-level notices (T16 / #14): LLM not configured, the "
+            "per-import generation cap being hit, etc. Per-operation "
+            "issues stay on each draft's own `warnings` list."
+        ),
+    )
 
 
 @router.post(
@@ -549,17 +579,27 @@ async def import_openapi(
     body: ImportOpenAPIRequest,
     _admin: User = Depends(require_admin_user),  # noqa: B008
     parser: OpenAPIParser = Depends(get_openapi_parser),  # noqa: B008
+    generator: ToolDescriptionGenerator = Depends(get_description_generator),  # noqa: B008
 ) -> ImportOpenAPIResponse:
-    """`POST /api/v1/admin/tools/import/openapi` — T14 / #12.
+    """`POST /api/v1/admin/tools/import/openapi` — T14 / #12 + T16 / #14.
 
     Accepts an OpenAPI 3.x spec (JSON or YAML, inline) and returns
     one draft Tool per operation. The preview is **not persisted**;
     a future confirm endpoint takes the admin's selections and
     inserts rows via `ToolRepository.create`.
 
-    Per ADR-0018 every draft lands in `status='draft'`. The admin
-    edits `description` / `risk_level` per draft and activates
-    selected ones via `PATCH /api/v1/admin/tools/{id}`.
+    Per ADR-0018 every draft lands in `status='draft'`, and per the
+    same ADR the description is rewritten by the LLM
+    (`ToolDescriptionGenerator.enrich_drafts`) before the admin sees
+    it: the rewrite goes into `description`, the raw OpenAPI text into
+    `original_description`. Generation never blocks the import — an
+    unconfigured or failing LLM degrades to raw text plus a warning
+    (ADR-0003's no-silent-drop rule), which is why there is no
+    dedicated error envelope on this path.
+
+    The admin reviews `description` / `risk_level` per draft and
+    activates selected ones via `POST /api/v1/admin/tools` +
+    `PATCH /api/v1/admin/tools/{id}`.
 
     The route dispatches on which source field is set so the YAML
     decoding stays inside `OpenAPIParser.parse_yaml` rather than
@@ -572,12 +612,15 @@ async def import_openapi(
         assert body.spec_yaml is not None  # narrow for mypy
         result = parser.parse_yaml(body.spec_yaml)
 
+    generation_warnings = await generator.enrich_drafts(result.drafts)
+
     return ImportOpenAPIResponse(
         drafts=[ToolDraftResponse(**asdict(d)) for d in result.drafts],
         title=result.title,
         version=result.version,
         server_url=result.server_url,
         source_format=result.source_format,
+        warnings=generation_warnings,
     )
 
 

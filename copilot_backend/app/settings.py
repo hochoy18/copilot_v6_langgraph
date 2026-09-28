@@ -88,6 +88,101 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---- LLM Provider (T16 / #14, ADR-0014 / ADR-0016) -------------------
+    # The LangChain ChatModel seam. Every LLM call in the backend is
+    # made against an OpenAI-compatible endpoint built from these three
+    # values (ADR-0014 — default provider is OpenAI-compatible, pointing
+    # at OpenAI / DeepSeek / 豆包 / self-hosted vLLM alike).
+    #
+    # `llm_base_url` / `llm_api_key` default to empty: an deployment
+    # without an LLM is fully supported — the description generator
+    # (T16) degrades to raw OpenAPI text with an admin-visible warning
+    # rather than failing the request. `build_chat_model` raises
+    # `LLMConfigurationError` when an unconfigured backend is asked to
+    # call a model.
+    llm_base_url: str = Field(
+        default="",
+        description=(
+            "OpenAI-compatible endpoint base URL, e.g. "
+            "`https://api.openai.com/v1` or a vLLM/DeepSeek gateway. "
+            "Empty means the LLM provider is not configured."
+        ),
+    )
+    llm_api_key: str = Field(
+        default="",
+        description=(
+            "Bearer key for `llm_base_url`. Empty means not configured. "
+            "Confidential — set via env in prod, never committed."
+        ),
+    )
+    llm_model: str = Field(
+        default="gpt-4o-mini",
+        min_length=1,
+        max_length=128,
+        description=(
+            "Model name passed to the provider. MVP: every LLM call "
+            "shares this one configuration (ADR-0014 §multi-model)."
+        ),
+    )
+    llm_request_timeout_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=300.0,
+        description="Per-call timeout handed to the ChatModel.",
+    )
+    # ADR-0016: enterprise deployments default to the no-train path.
+    # `llm_provider_supports_no_train` is the operator's declaration
+    # that the chosen endpoint honours it (zero-retention agreement,
+    # private deployment, 脱敏模式). If the two disagree the provider
+    # factory refuses to build — silently training on enterprise API
+    # metadata is the failure mode this guards against.
+    llm_data_usage_opt_out: bool = Field(
+        default=True,
+        description=(
+            "ADR-0016 opt-out flag. `true` (enterprise default) requires "
+            "`llm_provider_supports_no_train=true` for any LLM call to proceed."
+        ),
+    )
+    llm_provider_supports_no_train: bool = Field(
+        default=True,
+        description=(
+            "Operator declaration that the endpoint at `llm_base_url` "
+            "supports the no-train path. Set to `false` to opt back into "
+            "training-enabled endpoints (requires `llm_data_usage_opt_out=false`)."
+        ),
+    )
+
+    # ---- Langfuse prompts (T16 / #14, ADR-0013) --------------------------
+    # Prompt templates are fetched from the Langfuse public API at
+    # runtime (ADR-0013). The key pair below authenticates those reads;
+    # when unset the provider falls back to the cached last-good copy and
+    # then to the code-embedded bootstrap template (degradation ladder
+    # documented in `app.llm.prompts`).
+    langfuse_public_key: str = Field(
+        default="",
+        description="Langfuse public key (`pk-lf-…`). Empty = fetch off; cache/bootstrap only.",
+    )
+    langfuse_secret_key: str = Field(
+        default="",
+        description="Langfuse secret key (`sk-lf-…`). Confidential.",
+    )
+    langfuse_prompt_cache_ttl_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=86_400,
+        description=(
+            "How long a freshly-fetched prompt stays fresh. Past the TTL "
+            "the next fetch re-reads Langfuse; on failure the stale copy "
+            "is still served (ADR-0013 degradation)."
+        ),
+    )
+    langfuse_prompt_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.1,
+        le=60.0,
+        description="Per-request timeout for prompt fetches.",
+    )
+
     # ---- Health-check tuning --------------------------------------------
     health_check_timeout_seconds: float = Field(
         default=2.0,

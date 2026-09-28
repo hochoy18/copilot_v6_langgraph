@@ -13,8 +13,10 @@ would create import cycles.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 from fastapi import Depends, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -23,6 +25,8 @@ from app.auth.login import OIDCLoginService, OIDCStateStore
 from app.auth.oidc import OIDCAdapter
 from app.auth.tokens import RefreshTokenService
 from app.conversations.service import ConversationService
+from app.llm.prompts import PromptProvider
+from app.llm.provider import build_chat_model
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.credentials import CredentialRepository
@@ -36,6 +40,7 @@ from app.repositories.turns import TurnRepository
 from app.repositories.users import UserRepository
 from app.security.crypto import CredentialEncryptor
 from app.settings import Settings, get_settings
+from app.tools.description_generator import ToolDescriptionGenerator
 from app.tools.openapi_parser import OpenAPIParser
 from app.tools.service import ToolService
 
@@ -275,3 +280,50 @@ def get_openapi_parser() -> OpenAPIParser:
     patching the class.
     """
     return OpenAPIParser()
+
+
+# ---------------------------------------------------------------------------
+# LLM / description generation (T16 / #14)
+# ---------------------------------------------------------------------------
+
+
+def get_prompt_provider(request: Request) -> PromptProvider:
+    """FastAPI dependency: return the process-wide `PromptProvider`.
+
+    The provider owns the in-process Prompt cache (ADR-0013) so it is
+    constructed once in the lifespan — per-request instances would
+    discard the cache and re-fetch Langfuse on every import.
+    """
+    provider: PromptProvider = request.app.state.prompt_provider
+    return provider
+
+
+async def get_description_generator(
+    request: Request,
+    settings: Settings = Depends(get_settings),  # noqa: B008  (FastAPI idiom)
+) -> AsyncIterator[ToolDescriptionGenerator]:
+    """FastAPI dependency: the shared `ToolDescriptionGenerator` (T16 / #14).
+
+    Production reads the instance the lifespan stashed on `app.state`.
+    The fallback branch exists for the test harness: fixtures that
+    build `create_app()` without entering the lifespan (ASGITransport
+    skips startup) still hit this dependency through the real router.
+    It builds a throwaway generator — and closes its httpx client
+    afterwards, so the fallback can't leak sockets — with the same
+    settings the route sees. Tests that care about generation behaviour
+    override this dependency outright (the canonical seam).
+    """
+    existing = getattr(request.app.state, "description_generator", None)
+    if isinstance(existing, ToolDescriptionGenerator):
+        yield existing
+        return
+
+    client = httpx.AsyncClient()
+    try:
+        yield ToolDescriptionGenerator(
+            settings=settings,
+            prompt_provider=PromptProvider(settings=settings, http_client=client),
+            chat_model_factory=lambda: build_chat_model(settings),
+        )
+    finally:
+        await client.aclose()
