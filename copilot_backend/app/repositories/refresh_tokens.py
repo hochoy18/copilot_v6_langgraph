@@ -156,6 +156,49 @@ class RefreshTokenRepository(BaseRepository[RefreshTokenInDB, RefreshTokenCreate
     # Rotation
     # ------------------------------------------------------------------
 
+    async def claim_for_rotation(self, token_hash: str) -> bool:
+        """Atomically mark a token as revoked iff it is currently active.
+
+        Returns `True` when the call flipped the row from active to
+        revoked — meaning the caller "won" the right to insert the
+        successor token. Returns `False` when the row was already
+        revoked (or expired+TTL-purged): the caller must treat this as
+        reuse / compromise and follow up with `revoke_family`.
+
+        Why a single conditional `update_one` instead of a fetch +
+        check + non-conditional update: between the snapshot read and
+        the unconditional write, a concurrent refresh request can
+        rotate the same token. The filter `{token_hash, revoked_at:
+        None}` makes the "claim" step mutually exclusive at the
+        Mongo-driver level — only one of N concurrent callers matches
+        the predicate; the rest get `matched_count == 0` and treat
+        the situation as reuse.
+        """
+        now = self._now()
+        result = await self._collection.update_one(
+            {"token_hash": token_hash, "revoked_at": None},
+            {"$set": {"revoked_at": now}},
+        )
+        return result.matched_count == 1
+
+    async def set_replaced_by(self, old_id: str, new_id: str) -> None:
+        """Best-effort chain audit update: stamp the new token's id on the old row.
+
+        `replaced_by` is reconstruction metadata for audit / chain
+        traversal only — losing a write does NOT invalidate the new
+        token. We tolerate pymongo driver failures here so a transient
+        broker hiccup doesn't take down the rotation flow. Programming
+        errors (bad id string, etc.) still surface as exceptions
+        because they signal a real bug.
+        """
+        try:
+            await self._collection.update_one(
+                {"_id": self.to_object_id(old_id)},
+                {"$set": {"replaced_by": new_id}},
+            )
+        except PyMongoError:  # noqa: BLE001 — chain metadata is not auth-critical
+            pass
+
     async def rotate(
         self,
         old_hash: str,
@@ -166,6 +209,12 @@ class RefreshTokenRepository(BaseRepository[RefreshTokenInDB, RefreshTokenCreate
         Two writes, but they happen sequentially. The repository keeps
         the API simple; a future transaction-wrapped variant can
         replace this without touching callers.
+
+        ⚠️ This method is racy under concurrent `/auth/refresh` calls
+        presenting the same raw token. The service layer should use
+        `claim_for_rotation` for the rotate hot path; this convenience
+        method remains for callers that don't need atomic claim
+        semantics (e.g. maintenance scripts).
         """
         old = await self.revoke(old_hash)
         new = await self.create(new_token)

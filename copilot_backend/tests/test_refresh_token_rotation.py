@@ -459,3 +459,96 @@ class TestRefreshTokenListFamily:
     async def test_list_family_unknown_returns_empty(self, svc: RefreshTokenService) -> None:
         rows = await svc.list_family("nonexistent-family")
         assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Concurrency — the rotate TOCTOU race (Code-review fix)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshTokenRotateConcurrency:
+    """Two concurrent `rotate` calls presenting the same raw token.
+
+    Pre-fix the service read `revoked_at is None`, then issued a
+    successor; two coroutines could both pass the snapshot check and
+    insert two active tokens in one family. The atomic claim
+    (`claim_for_rotation`) makes the rotate step mutually exclusive:
+    exactly one caller wins, the rest see `RefreshTokenReuseError`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_rotates_produce_at_most_one_new_token(
+        self, svc: RefreshTokenService
+    ) -> None:
+        """Two simultaneous `rotate(raw)` calls produce at most one successor.
+
+        The atomic claim guarantees mutual exclusion: the loser of
+        the race sees `RefreshTokenReuseError` (never a silent
+        second insertion). What we *don't* guarantee is that the
+        winner's successor stays alive — by design the loser also
+        burns the family, so the family ends with 0 active tokens.
+        That's the OAuth BCP's "burn on compromise" rule applied to
+        rotation races; users re-authenticate once more instead of
+        risking a slipped-through attacker. The companion test
+        (`test_concurrent_rotates_burn_family_on_loser`) confirms
+        that aspect of the design.
+        """
+        import asyncio
+
+        raw, row = await svc.issue(USER_ID)
+        family = row.family_id
+
+        results = await asyncio.gather(
+            svc.rotate(raw),
+            svc.rotate(raw),
+            return_exceptions=True,
+        )
+
+        # Exactly one success, exactly one ReuseError.
+        successes = [r for r in results if isinstance(r, tuple)]
+        reuses = [
+            r for r in results if isinstance(r, RefreshTokenReuseError)
+        ]
+        assert len(successes) == 1, results
+        assert len(reuses) == 1, results
+
+        # Family invariant: AT MOST one new row was inserted by the
+        # winner. If the winner also got burned by the loser's
+        # family-burn, the active count is 0 — that still satisfies
+        # "no second active token slipped through."
+        rows = await svc.list_family(family)
+        active_count = sum(1 for r in rows if r.revoked_at is None)
+        assert active_count <= 1, (
+            f"rotation race inserted 2+ active tokens in family {family!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_rotates_burn_family_on_loser(
+        self, svc: RefreshTokenService
+    ) -> None:
+        """The loser of a rotation race also burns the family.
+
+        The service's `_handle_reuse` calls `revoke_family` so the
+        OAuth 2.0 Security BCP's "compromise detected → burn the
+        chain" rule fires on the loser too. Even though the legitimate
+        user just won the claim, concurrent-replay is treated as an
+        attack signal by design.
+        """
+        import asyncio
+
+        raw, row = await svc.issue(USER_ID)
+        family = row.family_id
+
+        # Drain both coroutines; we only care about the post-state.
+        await asyncio.gather(
+            svc.rotate(raw),
+            svc.rotate(raw),
+            return_exceptions=True,
+        )
+
+        # All rows in the family are now revoked (the winner's
+        # successor was burned by the loser's revoke_family call).
+        rows = await svc.list_family(family)
+        assert rows, "the family should still hold the rotation history"
+        assert all(r.revoked_at is not None for r in rows)
+

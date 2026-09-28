@@ -27,8 +27,12 @@ Rotation flow
    * revoked       → `RefreshTokenReuseError` and revoke every other
                      token in `family_id`.
    * expired       → `RefreshTokenExpiredError` (401).
-   * active        → revoke the old row, issue a new row with the
-                     SAME `family_id`, return it.
+   * active        → claim the old row atomically (`{token_hash,
+                     revoked_at: None}` filter), insert the successor
+                     in the same family, return it. If the claim
+                     loses to a concurrent rotation (matched_count
+                     == 0), the loser treats this as reuse and burns
+                     the family.
 
 Why per-family reuse detection: a leaked refresh token may be
 replayed after the legitimate user rotated it. The OAuth 2.0 Security
@@ -37,6 +41,18 @@ signal. Revoking the entire chain — but NOT every token the user owns
 — forces the attacker and any session that the legitimate user
 opened to re-authenticate, without logging them out on unrelated
 devices.
+
+Concurrency note
+----------------
+
+The rotate path is *not* safe with read-then-write. Two concurrent
+`/auth/refresh` calls presenting the same raw token would both pass a
+snapshot check and both insert a successor, breaking the family
+invariant "at most one active token per chain". `rotate` instead
+delegates to `RefreshTokenRepository.claim_for_rotation`, which is
+a single conditional `update_one` — Mongo's per-document atomicity
+makes the claim step mutually exclusive across callers, and any
+loser cleanly falls into the reuse-detected branch.
 """
 from __future__ import annotations
 
@@ -107,6 +123,62 @@ class RefreshTokenService:
         self._repo = repo
 
     # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hash_public(token_hash: str) -> str:
+        """Clip a token hash for safe inclusion in error payloads.
+
+        8 hex chars (32 bits) is more than enough entropy for log
+        triage and keeps the schema's `details` envelope small.
+        Centralised here so audit / router code doesn't have to know
+        the truncation length.
+        """
+        return token_hash[:8]
+
+    async def _fetch_row(self, token_hash: str) -> RefreshTokenInDB:
+        """Resolve `token_hash` to a row, raising the auth-specific 404.
+
+        Translates `NotFoundError` from the repository into
+        `RefreshTokenNotFoundError` so the global error handler can
+        render the right envelope.
+        """
+        try:
+            return await self._repo.get_by_hash(token_hash)
+        except NotFoundError as exc:
+            raise RefreshTokenNotFoundError(
+                details={"token_hash_prefix": self._hash_public(token_hash)},
+            ) from exc
+
+    @staticmethod
+    def _assert_active(row: RefreshTokenInDB) -> None:
+        """Raise the right error if `row` is no longer usable.
+
+        Order matters: a *revoked-then-expired* row raises
+        `RefreshTokenRevokedError` — the cause trumps the
+        consequence. We mirror this in the test suite.
+        """
+        if row.revoked_at is not None:
+            raise RefreshTokenRevokedError(
+                details={
+                    "user_id": row.user_id,
+                    "revoked_at": row.revoked_at.isoformat(),
+                },
+            )
+        # Strict `<` so a token expiring exactly at "now" is rejected.
+        # `<=` would let a millisecond window succeed and the TTL
+        # purge run minutes later — the gap is enough for a flaky
+        # race. We choose the conservative side.
+        if row.expires_at < utcnow():
+            raise RefreshTokenExpiredError(
+                details={
+                    "user_id": row.user_id,
+                    "expires_at": row.expires_at.isoformat(),
+                },
+            )
+
+    # ------------------------------------------------------------------
     # Issue
     # ------------------------------------------------------------------
 
@@ -158,32 +230,8 @@ class RefreshTokenService:
         `revoked_at`; use `rotate` for that (it performs the
         reuse-detection dance atomically with revocation).
         """
-        token_hash = _hash_token(raw_token)
-        try:
-            row = await self._repo.get_by_hash(token_hash)
-        except NotFoundError as exc:
-            raise RefreshTokenNotFoundError(
-                details={"token_hash_prefix": token_hash[:8]},
-            ) from exc
-
-        if row.revoked_at is not None:
-            raise RefreshTokenRevokedError(
-                details={
-                    "user_id": row.user_id,
-                    "revoked_at": row.revoked_at.isoformat(),
-                },
-            )
-        # Strict `<` so a token expiring exactly at "now" is rejected.
-        # `<=` would let a millisecond window succeed and the TTL
-        # purge run minutes later — the gap is enough for a flaky
-        # race. We choose the conservative side.
-        if row.expires_at < utcnow():
-            raise RefreshTokenExpiredError(
-                details={
-                    "user_id": row.user_id,
-                    "expires_at": row.expires_at.isoformat(),
-                },
-            )
+        row = await self._fetch_row(_hash_token(raw_token))
+        self._assert_active(row)
         return row
 
     # ------------------------------------------------------------------
@@ -199,38 +247,25 @@ class RefreshTokenService:
         """Rotate a refresh token.
 
         Returns `(new_raw_token, new_row)`. The old row's
-        `revoked_at` is stamped and its `replaced_by` points at the
-        new row's id.
+        `revoked_at` is stamped by the atomic claim. The new row is
+        only inserted if THIS caller won the claim; concurrent
+        rotations of the same raw token are detected as reuse and
+        land in the `RefreshTokenReuseError` path.
 
         Raises:
             RefreshTokenNotFoundError: token hash not present.
             RefreshTokenExpiredError: `expires_at` elapsed.
-            RefreshTokenReuseError: token was already revoked; the
-                entire family has now been revoked.
+            RefreshTokenRevokedError: token was revoked before this
+                call (no concurrency; the "I lost the claim" case
+                raises `RefreshTokenReuseError` instead).
+            RefreshTokenReuseError: claim lost OR token already
+                revoked; the entire family has now been revoked.
         """
         token_hash = _hash_token(raw_token)
-        # Step 1 — fetch the row to learn its family and state. We
-        # deliberately don't reuse `verify()` here because we need the
-        # row in BOTH active and revoked states (revoked triggers
-        # reuse detection, not a generic 401).
-        try:
-            row = await self._repo.get_by_hash(token_hash)
-        except NotFoundError as exc:
-            raise RefreshTokenNotFoundError(
-                details={"token_hash_prefix": token_hash[:8]},
-            ) from exc
-
-        if row.revoked_at is not None:
-            # Reuse detected. Burn the family and raise. We log the
-            # count so an admin/audit can replay the event later.
-            revoked_count = await self._repo.revoke_family(row.family_id)
-            raise RefreshTokenReuseError(
-                details={
-                    "user_id": row.user_id,
-                    "family_id": row.family_id,
-                    "revoked_additional_count": revoked_count,
-                },
-            )
+        # Step 1 — snapshot read. We use the snapshot for the family
+        # id and a fail-fast on expired tokens. *Revoked* tokens are
+        # NOT failed-fast here — see step 2.
+        row = await self._fetch_row(token_hash)
         if row.expires_at < utcnow():
             raise RefreshTokenExpiredError(
                 details={
@@ -239,29 +274,66 @@ class RefreshTokenService:
                 },
             )
 
-        # Step 2 — happy path: mint the successor and atomically
-        # chain it. The repository's `rotate` accepts a fully-formed
-        # `RefreshTokenCreate` and inserts it as part of the rotation
-        # — we delegate in one call so the hash and id stay coherent.
-        # We don't wrap this in a Mongo transaction because the
-        # `replaced_by` field is informational — if the update fails,
-        # the new token is still valid (audit just loses the parent
-        # link). The repository already implements this best-effort
-        # semantics.
+        # Step 2 — atomic claim. The conditional `update_one` in
+        # `claim_for_rotation` is the mutual-exclusion gate that
+        # closes the read-then-write race. Two ways it can fail:
+        #
+        #   (a) the row was already revoked before this call — the
+        #       snapshot read happened to win the `revoked_at is
+        #       None` window of an already-completed rotation or an
+        #       explicit `revoke(...)`. Pure reuse.
+        #   (b) a concurrent caller won the claim between our
+        #       snapshot and our write. Concurrent reuse.
+        #
+        # Both are compromise signals: the OAuth 2.0 Security BCP
+        # says burn the family. We treat them identically because
+        # the cause is indistinguishable from the caller's view.
+        claimed = await self._repo.claim_for_rotation(token_hash)
+        if not claimed:
+            await self._handle_reuse(row)
+            # `_handle_reuse` always raises; defensive only.
+            raise RuntimeError("unreachable")
+
+        # Step 3 — claim won: now safe to mint and insert the
+        # successor. If the insert itself fails the old row stays
+        # revoked; the user must re-authenticate. That's the right
+        # failure mode — auth-bound writes should never silently
+        # leak a slot for a successor that didn't land.
         new_raw = _generate_token()
-        old, new_row = await self._repo.rotate(
-            old_hash=token_hash,
-            new_token=RefreshTokenCreate(
+        new_row = await self._repo.create(
+            RefreshTokenCreate(
                 token_hash=_hash_token(new_raw),
                 user_id=row.user_id,
                 family_id=row.family_id,
                 expires_at=utcnow() + ttl,
-            ),
+            )
         )
-        # `old` is returned for symmetry / audit hooks; the caller
-        # never sees it directly.
-        _ = old
+        # Best-effort chain-audit stamp on the OLD row. Losing this
+        # write doesn't invalidate the rotation — `replaced_by` is a
+        # reconstruction aid (ADR-0009 audit chain), not a gate.
+        await self._repo.set_replaced_by(old_id=row.id, new_id=new_row.id)
         return new_raw, new_row
+
+    async def _handle_reuse(self, row: RefreshTokenInDB) -> None:
+        """Reuse-detection side effect + raise.
+
+        Shared between the "row already revoked" path and the "claim
+        lost to a concurrent rotate" path. Burns the family so the
+        legitimate user gets bounced to re-auth, then raises
+        `RefreshTokenReuseError` for the router.
+        """
+        # Even if the row state was clean at snapshot time, a
+        # concurrent claim means the row is now revoked; we don't
+        # care to fetch it again. Just burn everything else in the
+        # family and propagate.
+        revoked_count = await self._repo.revoke_family(row.family_id)
+        raise RefreshTokenReuseError(
+            details={
+                "user_id": row.user_id,
+                "family_id": row.family_id,
+                "revoked_additional_count": revoked_count,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Revoke
@@ -279,7 +351,7 @@ class RefreshTokenService:
             return await self._repo.revoke(token_hash)
         except NotFoundError as exc:
             raise RefreshTokenNotFoundError(
-                details={"token_hash_prefix": token_hash[:8]},
+                details={"token_hash_prefix": self._hash_public(token_hash)},
             ) from exc
 
     async def revoke_family(self, family_id: str) -> int:
