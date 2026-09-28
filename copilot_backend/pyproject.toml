@@ -17,16 +17,20 @@ dependencies = [
     "pydantic-settings==2.7.0",
     "httpx==0.28.1",
     "motor==3.6.0",
-    "mongomock-motor==0.0.34",
     "email-validator>=2.3.0",
 ]
 
 [project.optional-dependencies]
+# Dev-only extras. mongomock-motor / mongomock drive the hermetic test
+# suite (no live MongoDB needed in CI); pytest / mypy / ruff cover the
+# usual trio.
 dev = [
     "pytest==8.3.4",
     "pytest-asyncio==0.25.0",
     "mypy==1.13.0",
     "ruff==0.8.4",
+    "mongomock-motor==0.0.34",
+    "mongomock==4.3.0",
 ]
 
 [build-system]

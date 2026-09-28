@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import PyMongoError
 
 from app.db.errors import NotFoundError
 from app.db.indexes import REFRESH_TOKENS
@@ -142,12 +143,14 @@ class RefreshTokenRepository(BaseRepository[RefreshTokenInDB, RefreshTokenCreate
         old = await self.revoke(old_hash)
         new = await self.create(new_token)
         # Record the rotation chain (best-effort: failure here does
-        # not invalidate the new token).
+        # not invalidate the new token). Only Mongo driver failures are
+        # tolerated; programming errors (e.g. typos in field names)
+        # must surface so they get fixed.
         try:
             await self._collection.update_one(
                 {"_id": self.to_object_id(old.id)},
                 {"$set": {"replaced_by": new.id}},
             )
-        except Exception:  # noqa: BLE001 — chain metadata is not auth-critical
+        except PyMongoError:  # noqa: BLE001 — chain metadata is not auth-critical
             pass
         return old, new

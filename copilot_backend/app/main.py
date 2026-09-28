@@ -14,11 +14,9 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.health import router as health_router
 from app.db.mongo import MongoClient
@@ -72,18 +70,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await mongo.close()
         logger.info("backend shutting down")
-
-
-def get_database(app: FastAPI) -> AsyncIOMotorDatabase[Any]:
-    """FastAPI dependency: return the per-process Motor database handle.
-
-    Routes / repositories that want to read or write Mongo call this
-    inside `Depends`. The handle is opened in the lifespan so the
-    dependency has nothing to construct itself — it just hands back the
-    same instance every request, sharing Motor's connection pool.
-    """
-    db: AsyncIOMotorDatabase[Any] = app.state.database
-    return db
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

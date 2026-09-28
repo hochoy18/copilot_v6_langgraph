@@ -21,7 +21,7 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorCollection, AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError as PyMongoDuplicateKeyError
 
-from app.db.errors import DuplicateKeyError, NotFoundError
+from app.db.errors import DuplicateKeyError, InvalidIdError, NotFoundError
 
 # Generic type for the canonical read shape (e.g. `User`). The base
 # class doesn't know which collection it serves; subclasses parameterise
@@ -55,18 +55,17 @@ class BaseRepository(Generic[TRead, TCreate, TUpdate]):
 
     @staticmethod
     def to_object_id(value: str) -> ObjectId:
-        """Coerce a string id into a `bson.ObjectId`, raising `NotFoundError` on garbage.
+        """Coerce a string id into a `bson.ObjectId`, raising `InvalidIdError` on garbage.
 
         Catching `bson.errors.InvalidId` here keeps the public surface
         uniform: callers ask "give me the user with this id" and either
-        get the user back or a `NotFoundError` (HTTP 404), never a raw
-        driver exception.
+        get the user back or a 404 envelope — never a raw driver
+        exception.
         """
         try:
             return ObjectId(value)
         except Exception as exc:  # noqa: BLE001 — bson raises generic Exception
-            raise NotFoundError(
-                code="invalid_id",
+            raise InvalidIdError(
                 message_en=f"Invalid id: {value!r}",
                 details={"id": value, "error": str(exc)},
             ) from exc

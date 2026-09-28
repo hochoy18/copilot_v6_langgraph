@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from pymongo import ASCENDING, DESCENDING, IndexModel
+from pymongo import ASCENDING, IndexModel
 
 # ---------------------------------------------------------------------------
 # Collection names — referenced from init_db.py AND repositories.
@@ -120,8 +120,3 @@ def all_indexes() -> Iterable[tuple[str, list[IndexModel]]]:
     """
     for name in CORE_COLLECTIONS:
         yield name, INDEX_SPECS[name]
-
-
-# Mark DESCENDING as used to keep the import (used in test-side
-# comprehension queries elsewhere in this package).
-_ = DESCENDING

@@ -14,7 +14,7 @@ import pytest
 from bson import ObjectId
 from mongomock_motor import AsyncMongoMockClient
 
-from app.db.errors import DuplicateKeyError, NotFoundError, ValidationError
+from app.db.errors import DuplicateKeyError, InvalidIdError, NotFoundError, ValidationError
 from app.db.init_db import init_database
 from app.db.schemas import UserCreate, UserUpdate
 from app.repositories.users import UserRepository
@@ -169,10 +169,11 @@ class TestUserRead:
             await repo.get(str(ObjectId()))
 
     @pytest.mark.asyncio
-    async def test_get_with_invalid_id_raises_not_found(self, repo: UserRepository) -> None:
-        """Garbage ids surface as 404, not 500."""
-        with pytest.raises(NotFoundError):
+    async def test_get_with_invalid_id_raises_invalid_id(self, repo: UserRepository) -> None:
+        """Garbage ids surface as `InvalidIdError` (code=`invalid_id`), not a 500."""
+        with pytest.raises(InvalidIdError) as exc:
             await repo.get("not-an-objectid")
+        assert exc.value.code == "invalid_id"
 
     @pytest.mark.asyncio
     async def test_get_by_email_returns_user(self, repo: UserRepository) -> None:

@@ -13,6 +13,8 @@ explicit rather than spot-checked.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from mongomock_motor import AsyncMongoMockClient
 
@@ -115,21 +117,48 @@ class TestInitDatabase:
 
 
 class TestCLIShim:
-    """The CLI entrypoint is a thin wrapper, but it must not crash.
+    """End-to-end coverage of the `python -m scripts.init_db` entrypoint.
 
-    We invoke the function directly rather than spawning a subprocess
-    so a transient CLI failure produces a readable trace instead of
-    just a non-zero exit code.
+    Earlier this class only re-invoked `init_database` (the library
+    function) — a name-and-shape lie. The CLI shim adds two layers on
+    top: a settings lookup and a JSON dump to stdout. We exercise both
+    by stubbing `init_database` and capturing `sys.stdout` so the test
+    is hermetic but covers the CLI's I/O contract: exit code, JSON
+    shape, idempotency.
     """
 
-    @pytest.mark.asyncio
-    async def test_cli_run_is_idempotent_against_mock_db(self, mock_db: object) -> None:
-        """Two consecutive CLI invocations against the same DB both succeed."""
+    def test_cli_emits_initialized_json_and_exits_zero(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`python -m scripts.init_db` exits 0 and prints a JSON summary."""
+        from scripts import init_db as cli_module
 
-        # The CLI's _run() reads from get_settings(); instead of swapping
-        # the env, we exercise `init_database` directly against the
-        # mongomock handle. The CLI is two lines on top of that, so the
-        # contract is fully exercised.
-        first = await init_database(mock_db)  # type: ignore[arg-type]
-        second = await init_database(mock_db)  # type: ignore[arg-type]
-        assert set(first.keys()) == set(second.keys()) == set(CORE_COLLECTIONS)
+        async def _fake_init(database: object) -> dict[str, list[str]]:  # noqa: ARG001
+            return {name: [f"idx_{name}"] for name in CORE_COLLECTIONS}
+
+        # Stub the MongoClient construction so the CLI never touches a
+        # real connection. The CLI calls `MongoClient(settings)` and
+        # then `client.database`; both need to return something safe.
+        class _FakeClient:
+            def __init__(self, _settings: object) -> None:
+                self.database = object()
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(cli_module, "init_database", _fake_init)
+        monkeypatch.setattr(cli_module, "MongoClient", _FakeClient)
+        # Avoid touching the real env / .env file in this process.
+        monkeypatch.setattr(cli_module, "get_settings", lambda: object())
+
+        exit_code = cli_module.main()
+
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        # The CLI writes a JSON object with an `initialized` key listing
+        # every core collection's index names.
+        parsed = json.loads(out)
+        assert "initialized" in parsed
+        assert set(parsed["initialized"].keys()) == set(CORE_COLLECTIONS)
+        for name in CORE_COLLECTIONS:
+            assert parsed["initialized"][name] == [f"idx_{name}"]
