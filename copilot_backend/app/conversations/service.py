@@ -278,6 +278,30 @@ class ConversationService:
     # Plan execution (T21 / #18)
     # ------------------------------------------------------------------
 
+    async def get_owned_conversation(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+    ) -> Conversation:
+        """Fetch a single conversation with ownership check — T23 / #20.
+
+        Returns the canonical `Conversation` row when `user_id` owns
+        `conversation_id`. Cross-user access raises
+        `ConversationAccessDeniedError` (same `not_found` envelope
+        as an absent row, per ADR-0002).
+
+        Used by the SSE stream endpoint: opening a stream only
+        needs the ownership check, not the full turn / plan
+        fan-out that `get_detail` performs. Keeping this method
+        on the service (rather than reaching for the private
+        `_conversations` repo handle from the route layer) preserves
+        the seam that all other conversation endpoints use.
+        """
+        conversation = await self._conversations.get(conversation_id)
+        _assert_owner(conversation, user_id)
+        return conversation
+
     async def get_latest_approved_plan(
         self,
         *,

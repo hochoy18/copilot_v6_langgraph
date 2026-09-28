@@ -29,6 +29,7 @@ from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
 from app.planner.planner import ToolPlanner
 from app.planner.service import PlannerService
+from app.realtime.bus import SseEventBus
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.credentials import CredentialRepository
@@ -441,3 +442,40 @@ async def get_description_generator(
         )
     finally:
         await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Realtime / SSE (T23 / #20)
+# ---------------------------------------------------------------------------
+
+
+def get_sse_bus(request: Request) -> SseEventBus:
+    """FastAPI dependency: return the process-wide `SseEventBus`.
+
+    T23 stashes the bus on `app.state.sse_bus` during the lifespan
+    so every request — and every test — shares one channel registry.
+    The bus is in-memory and process-local (ADR-0010 — persistence
+    is a future ticket).
+
+    The fallback path (no bus on `app.state`) raises an `AppError`
+    matching the rest of the codebase's envelope contract (ADR-0031)
+    rather than a raw `HTTPException` — that would bypass the
+    global error handler and surface a non-conforming JSON shape to
+    the Frontend.
+    """
+    from app.exceptions import AppError
+
+    existing = getattr(request.app.state, "sse_bus", None)
+    if isinstance(existing, SseEventBus):
+        return existing
+    # The lifespan-built bus is the production seam. Tests that
+    # need to reset state override this dependency rather than
+    # relying on the fallback. Reaching this branch is a process-
+    # level misconfiguration — there's no recoverable per-request
+    # action the caller can take.
+    raise AppError(  # pragma: no cover — defensive
+        code="sse_bus_not_initialised",
+        message_zh="SSE 事件总线未初始化",
+        message_en="SSE event bus not initialised; missing lifespan?",
+        details={},
+    )

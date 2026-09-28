@@ -31,6 +31,8 @@ from app.health import HealthChecker
 from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
 from app.planner.planner import ToolPlanner
+from app.realtime.bus import SseEventBus
+from app.realtime.stream import router as sse_router
 from app.security.crypto import CredentialEncryptor
 from app.security.keys import build_credential_encryptor
 from app.settings import Settings, get_settings
@@ -112,6 +114,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         prompt_provider=prompt_provider,
         chat_model_factory=lambda: build_chat_model(settings),
     )
+    # T23 / #20 — process-wide SSE event bus. In-memory only; ADR-0010
+    # permits this for the MVP. Stash on `app.state` so the SSE route's
+    # dependency finds the same instance every request.
+    app.state.sse_bus = SseEventBus()
     try:
         await _probe_dependencies(settings)
         yield
@@ -159,6 +165,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Lives after `auth_router` so the OpenAPI tag order reads
     # auth → conversations; the load order has no runtime effect.
     app.include_router(conversations_router)
+    # T23 / #20 — SSE stream endpoint (`GET /conversations/{id}/stream`).
+    # Lives after `conversations_router` so the OpenAPI tag order reads
+    # auth → conversations; load order has no runtime effect.
+    app.include_router(sse_router)
     # T09 / #10 — `/admin/me` lives alongside the rest of the
     # auth-owned endpoints; `admin_router` (declared in `app.api.auth`)
     # owns the `admin` OpenAPI tag and groups the future admin-only
