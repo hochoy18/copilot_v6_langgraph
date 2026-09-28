@@ -49,7 +49,11 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
+
+if TYPE_CHECKING:
+    from app.db.schemas import User
+    from app.settings import Settings
 
 # The only algorithm we mint + verify. Listing it as a Final keeps the
 # verifier's `alg` allow-list explicit; unknown algorithms are
@@ -222,11 +226,42 @@ def new_jti() -> str:
     return uuid.uuid4().hex
 
 
+def mint_access_token_for_user(
+    user: User, *, settings: Settings
+) -> tuple[str, int]:
+    """Mint the short-lived access JWT for `user` and return `(token, expires_in)`.
+
+    Shared by the SSO (`OIDCLoginService`) and local (`LocalLoginService`)
+    login paths so both mint identical wire shapes — `iss` / `aud` /
+    `sub` / `source` / `role_ids` come from the canonical `User` row,
+    and `iat` / `exp` come from the settings-driven TTL (ADR-0009).
+
+    Lives here rather than in either login module to keep both modules
+    from importing each other: the JWT is the shared piece, the login
+    flows are not.
+    """
+    ttl = settings.oidc_access_token_ttl_seconds
+    now = now_unix()
+    claims = AccessTokenClaims(
+        sub=user.id,
+        source=user.source,
+        role_ids=list(user.role_ids),
+        issuer=settings.oidc_jwt_issuer,
+        audience=settings.oidc_jwt_audience,
+        issued_at=now,
+        expires_at=now + ttl,
+        jti=new_jti(),
+    )
+    token, _ = mint_access_token(claims, signing_key=settings.oidc_jwt_signing_key)
+    return token, ttl
+
+
 __all__ = [
     "AccessTokenClaims",
     "SUPPORTED_ALG",
     "mint_access_token",
     "decode_jwt",
+    "mint_access_token_for_user",
     "now_unix",
     "new_jti",
 ]

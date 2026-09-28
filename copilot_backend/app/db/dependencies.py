@@ -18,6 +18,7 @@ from typing import Any
 from fastapi import Depends, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from app.auth.local import LocalLoginService
 from app.auth.login import OIDCLoginService, OIDCStateStore
 from app.auth.oidc import OIDCAdapter
 from app.auth.tokens import RefreshTokenService
@@ -191,6 +192,30 @@ def get_oidc_login_service(
         settings=settings,
         oidc_adapter=adapter,
         state_store=state_store,
+        user_repository=user_repo,
+        refresh_service=refresh_service,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Local admin login (T09 / #10)
+# ---------------------------------------------------------------------------
+
+
+def get_local_login_service(
+    settings: Settings = Depends(get_settings),  # noqa: B008
+    user_repo: UserRepository = Depends(get_user_repository),  # noqa: B008
+    refresh_service: RefreshTokenService = Depends(get_refresh_token_service),  # noqa: B008
+) -> LocalLoginService:
+    """FastAPI dependency: build a `LocalLoginService` for this request.
+
+    The service holds no network state; a fresh instance per request
+    is the same cost as a singleton. Tests override this dependency
+    to swap in a fixture-built instance (e.g. a stubbed password
+    helper) without touching the lifespan.
+    """
+    return LocalLoginService(
+        settings=settings,
         user_repository=user_repo,
         refresh_service=refresh_service,
     )

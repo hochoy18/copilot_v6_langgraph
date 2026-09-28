@@ -201,6 +201,43 @@ class UserInactiveError(AppError):
     http_status = status.HTTP_403_FORBIDDEN
 
 
+# ---------------------------------------------------------------------------
+# Local admin login (T09 / #10)
+# ---------------------------------------------------------------------------
+
+
+class InvalidLocalCredentialsError(AppError):
+    """Raised when an admin local-login attempt fails the credential check.
+
+    Two causes share this envelope so the front-end cannot enumerate
+    usernames: the user does not exist, or the password does not match.
+    Either way the wire response is `401 invalid_local_credentials` —
+    matching the OAuth 2.0 Security BCP recommendation to be
+    indistinguishable from a missing user.
+    """
+
+    code = "invalid_local_credentials"
+    message_zh = "用户名或密码错误"
+    message_en = "Invalid username or password"
+    http_status = status.HTTP_401_UNAUTHORIZED
+
+
+class AdminEndpointRequiresLocalUserError(AppError):
+    """A non-local user reached an admin-only endpoint (T09 / #10).
+
+    The `/admin` shell and the `/admin/me` route are reserved for the
+    local admin path per ADR-0006; an SSO caller authenticates
+    correctly but the endpoint isn't theirs. Distinct from
+    `UserInactiveError`: that signals a credentials problem, this one
+    signals "your account type doesn't fit this endpoint".
+    """
+
+    code = "admin_endpoint_requires_local_user"
+    message_zh = "该接口仅供本地管理员使用"
+    message_en = "This endpoint is reserved for local admin users"
+    http_status = status.HTTP_403_FORBIDDEN
+
+
 __all__ = [
     "RefreshTokenNotFoundError",
     "RefreshTokenRevokedError",
@@ -212,4 +249,6 @@ __all__ = [
     "OIDCTokenExchangeError",
     "OIDCDiscoveryError",
     "UserInactiveError",
+    "InvalidLocalCredentialsError",
+    "AdminEndpointRequiresLocalUserError",
 ]

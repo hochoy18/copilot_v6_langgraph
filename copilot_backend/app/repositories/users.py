@@ -193,6 +193,23 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
             )
         return self._doc_to_read(doc)
 
+    async def get_by_local_username_in_db(self, local_username: str) -> UserInDB:
+        """Lookup by local admin username, returning the persisted shape.
+
+        The local-login path (T09 #10) needs `password_hash` for
+        bcrypt verification. Returning the persisted row lets the
+        service strip the hash with `User.from_db(...)` only after the
+        password is confirmed — no other code path ever sees the
+        hash.
+        """
+        doc = await self._collection.find_one({"local_username": local_username})
+        if doc is None:
+            raise NotFoundError(
+                message_en=f"Local user {local_username!r} not found",
+                details={"local_username": local_username},
+            )
+        return self._doc_to_in_db(doc)
+
     async def list_users(
         self,
         *,

@@ -122,6 +122,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Routers
     app.include_router(health_router)
     app.include_router(auth_router)
+    # T09 / #10 — `/admin/me` lives alongside the rest of the
+    # auth-owned endpoints; `admin_router` (declared in `app.api.auth`)
+    # owns the `admin` OpenAPI tag and groups the future admin-only
+    # routes under one prefix.
+    from app.api.auth import admin_router
+
+    app.include_router(admin_router)
 
     # Unified error contract (ADR-0031).
     register_exception_handlers(app)

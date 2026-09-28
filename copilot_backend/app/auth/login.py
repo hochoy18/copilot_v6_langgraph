@@ -58,7 +58,7 @@ from app.auth.tokens import RefreshTokenService
 from app.db.errors import NotFoundError
 from app.db.schemas import User, UserCreate, UserUpdate
 from app.repositories.users import UserRepository
-from app.security.jwt import AccessTokenClaims, mint_access_token, new_jti, now_unix
+from app.security.jwt import mint_access_token_for_user
 from app.settings import Settings
 
 
@@ -394,19 +394,7 @@ class OIDCLoginService:
         return existing
 
     def _mint_access_token(self, user: User) -> str:
-        ttl = self._settings.oidc_access_token_ttl_seconds
-        now = now_unix()
-        claims = AccessTokenClaims(
-            sub=user.id,
-            source=user.source,
-            role_ids=list(user.role_ids),
-            issuer=self._settings.oidc_jwt_issuer,
-            audience=self._settings.oidc_jwt_audience,
-            issued_at=now,
-            expires_at=now + ttl,
-            jti=new_jti(),
-        )
-        token, _ = mint_access_token(claims, signing_key=self._settings.oidc_jwt_signing_key)
+        token, _ttl = mint_access_token_for_user(user, settings=self._settings)
         return token
 
 
