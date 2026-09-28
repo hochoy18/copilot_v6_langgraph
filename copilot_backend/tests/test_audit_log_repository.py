@@ -20,7 +20,7 @@ from mongomock_motor import AsyncMongoMockClient
 
 from app.db.errors import InvalidIdError, NotFoundError
 from app.db.init_db import init_database
-from app.db.schemas import AuditLogCreate, PlanNodeToolSnapshot
+from app.db.schemas import AuditLogCreate, ToolSnapshot
 from app.repositories.audit_logs import AuditLogRepository
 
 
@@ -32,7 +32,7 @@ async def repo() -> AuditLogRepository:
     return AuditLogRepository(db)
 
 
-def _snapshot(**overrides: object) -> PlanNodeToolSnapshot:
+def _snapshot(**overrides: object) -> ToolSnapshot:
     base: dict[str, object] = {
         "name": "list_customers",
         "description": "List customers by region.",
@@ -47,7 +47,7 @@ def _snapshot(**overrides: object) -> PlanNodeToolSnapshot:
         "http_body_template": None,
     }
     base.update(overrides)
-    return PlanNodeToolSnapshot(**base)  # type: ignore[arg-type]
+    return ToolSnapshot(**base)  # type: ignore[arg-type]
 
 
 def _audit_input(**overrides: object) -> AuditLogCreate:

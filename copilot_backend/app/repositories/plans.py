@@ -1,16 +1,19 @@
 """`PlanRepository` — CRUD for the `plans` collection.
 
-T06 (#7) ships the schema. The Planner (T18/T25), the Plan-edit
-endpoint (T26 / ADR-0019), and the Frontend React Flow renderer
-(T19) reach for this seam.
+T06 (#7) shipped the schema; T17 (#15) restructured it to the
+`nodes` / `edges` / `tool_snapshots` trio. The Planner (T18/T25),
+the Plan-edit endpoint (T26 / ADR-0019), and the Frontend React Flow
+renderer (T19) reach for this seam.
 
 Design notes:
 
-* `nodes` carries the embedded `tool_snapshot`s per ADR-0027 — the
-  acceptance criterion for T06. The repository never splits the
-  snapshot off into a separate collection; replays read both the
-  node's intended `parameters` and the snapshot's frozen schema in
-  one fetch.
+* The document shape is the T17 (#15) trio — `nodes` / `edges` /
+  `tool_snapshots` (ADR-0027). Snapshots live on the Plan, never in
+  a side collection; the Worker replays a run by reading the node's
+  intended `parameters` and the referenced snapshot's frozen schema
+  from the same fetch. `PlanBase`'s model validator enforces the
+  structural invariants (tool binding, DAG-ness) on every read and
+  write — the repository only adds the "at least one node" rule.
 * `set_status` is the dedicated path for the Plan lifecycle. The
   Worker (`plan_executions`) reaches for it as Plans move from
   `approved` → `executing` → `succeeded`/`failed`; audit log
@@ -19,7 +22,8 @@ Design notes:
 * `record_edit` writes the diff between the original and the
   business-user-edited Plan (ADR-0019). Keeping the diff on the
   Plan itself means audit replays don't need a side-channel
-  collection.
+  collection. The merged doc is re-validated before the write so a
+  bad edit can never land.
 
 The doc-parsing and post-insert refetch helpers come from
 `app.repositories._common` — see that module for the rationale.
@@ -29,11 +33,19 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pydantic import ValidationError as PydanticValidationError
 
 from app.db.errors import NotFoundError, ValidationError
 from app.db.indexes import PLANS
-from app.db.schemas import Plan, PlanCreate, PlanStatus, PlanUpdate
-from app.repositories._common import doc_to_read, refetch_after_insert
+from app.db.schemas import (
+    Plan,
+    PlanCreate,
+    PlanInDB,
+    PlanNode,
+    PlanStatus,
+    PlanUpdate,
+)
+from app.repositories._common import doc_to_in_db, doc_to_read, refetch_after_insert
 from app.repositories.base import BaseRepository
 
 
@@ -185,28 +197,68 @@ class PlanRepository(BaseRepository[Plan, PlanCreate, PlanUpdate]):
     async def record_edit(
         self,
         plan_id: str,
-        edited_nodes: list[dict[str, Any]],
+        edited_nodes: list[PlanNode],
         diff: dict[str, Any],
     ) -> Plan:
         """Apply a business-user edit (ADR-0019).
 
-        Writes the edited `nodes` array and the `edited_diff` JSON
-        in one atomic update, then flips `status` to `modified`.
+        ADR-0019: "可改参数,不可增删节点". The submitted node set must
+        match the persisted one exactly — same `node_id`s, same `tool`
+        per node — only `parameters` / `notes` may change. `edges` and
+        `tool_snapshots` are never touched here, so the topology and
+        the frozen definitions (ADR-0027) are immutable by
+        construction. The merged post-edit doc is additionally
+        validated against `PlanInDB` before the write as a catch-all
+        for docs that drifted from the contract.
+
         The diff format is `{"by_node_id": {"param": {"before": …,
         "after": …}}}` — see ADR-0019 for the contract.
         """
         oid = self.to_object_id(plan_id)
-        now = self._now()
+        current = await self._collection.find_one({"_id": oid})
+        if current is None:
+            raise NotFoundError(
+                message_en=f"Plan {plan_id} not found",
+                details={"plan_id": plan_id},
+            )
+        frozen = {node["node_id"]: node["tool"] for node in current["nodes"]}
+        submitted = {node.node_id: node.tool for node in edited_nodes}
+        if submitted.keys() != frozen.keys():
+            raise ValidationError(
+                message_en="Plan edits cannot add or remove nodes (ADR-0019)",
+                details={
+                    "added": sorted(set(submitted) - set(frozen)),
+                    "removed": sorted(set(frozen) - set(submitted)),
+                },
+            )
+        repointed = {
+            node.node_id: {"before": frozen[node.node_id], "after": node.tool}
+            for node in edited_nodes
+            if frozen[node.node_id] != node.tool
+        }
+        if repointed:
+            raise ValidationError(
+                message_en="Plan edits cannot change which Tool a node invokes (ADR-0027)",
+                details={"repointed": repointed},
+            )
+        update_doc: dict[str, Any] = {
+            "nodes": [node.model_dump() for node in edited_nodes],
+            "edited_diff": diff,
+            "status": "modified",
+            "updated_at": self._now(),
+        }
+        try:
+            doc_to_in_db({**current, **update_doc}, PlanInDB)
+        except PydanticValidationError as exc:
+            raise ValidationError(
+                message_en="Edited Plan failed structural validation",
+                details={
+                    "errors": [err["msg"] for err in exc.errors(include_url=False)]
+                },
+            ) from exc
         result = await self._collection.find_one_and_update(
             {"_id": oid},
-            {
-                "$set": {
-                    "nodes": edited_nodes,
-                    "edited_diff": diff,
-                    "status": "modified",
-                    "updated_at": now,
-                }
-            },
+            {"$set": update_doc},
             return_document=True,
         )
         if result is None:

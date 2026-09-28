@@ -6,6 +6,8 @@ These are the wire shapes of every collection the backend owns:
 * `tools`, `credentials` — T05 (#6).
 * `conversations`, `turns`, `plans`, `plan_executions`, `audit_logs`
   — T06 (#7).
+* `plans` restructured to the `nodes` / `edges` / `tool_snapshots`
+  trio — T17 (#15), per SPEC §Data model and ADR-0027.
 * `refresh_tokens.family_id` — T07 (#8); the rotation flow attaches a
   fresh `family_id` on every login and inherits it on rotate so reuse
   of a revoked token can revoke the entire chain.
@@ -35,7 +37,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from bson import ObjectId
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 # A short alias so every `Field(default_factory=ObjectId, alias="_id")`
 # reads the same. Centralising the alias keeps `model_dump(by_alias=True)`
@@ -909,25 +911,75 @@ class Turn(TurnInDB):
 
 
 # ---------------------------------------------------------------------------
-# plans  (T06 / #7)
+# plans  (T06 / #7; restructured to nodes / edges / tool_snapshots by
+# T17 / #15)
+#
+# Documented Plan shape (SPEC §Data model, ADR-0027):
+#
+#   {
+#     "conversation_id": "<users conversation oid>",
+#     "turn_id":         "<turns oid that triggered this Plan>",
+#     "status":          "pending | approved | modified | ... (PlanStatus)",
+#     "nodes": [
+#       {"node_id": "n1", "tool": "list_customers",
+#        "parameters": {"region": "emea"}, "notes": "..."},
+#       ...
+#     ],
+#     "edges": [{"source": "n1", "target": "n2"}, ...],   # ADR-0012 DAG
+#     "tool_snapshots": [                                   # ADR-0027 freeze
+#       {"tool_id": "<tools oid>", "name": "list_customers",
+#        "description": "...", "risk_level": "read",
+#        "parameters_schema": {...}, "http_method": "GET",
+#        "http_url_template": "...", "http_headers": {...},
+#        "http_body_template": null},
+#       ...
+#     ],
+#     "edited_diff": null,   # set by ADR-0019 edits: {"by_node_id": {...}}
+#     "created_at": ..., "updated_at": ...
+#   }
+#
+# Structural invariants (enforced by `PlanBase._validate_structure`):
+# unique node_ids / snapshot names, every node.tool bound to a frozen
+# snapshot, edges reference existing nodes without self-loops or
+# duplicates, and the graph is acyclic.
 # ---------------------------------------------------------------------------
 
 
-class PlanNodeToolSnapshot(BaseModel):
-    """Tool definition snapshot frozen at Plan generation time.
+class ToolSnapshot(BaseModel):
+    """Frozen Tool definition embedded in a Plan (or one audit row).
 
-    Per ADR-0027 each Plan embeds the Tool definitions it references so
-    audits / replays see "which Tool was actually invoked" rather than
-    "the Tool's current state". The fields here mirror the persisted
+    Per ADR-0027 a Plan carries snapshots of every Tool it references
+    so audits / replays see "which Tool was actually invoked" rather
+    than "the Tool's current state". The fields mirror the persisted
     `tools` document minus `_id`, `created_at`, `updated_at`,
-    `credentials_ref` (which references an FK, not a snapshot worth
-    embedding). Plan-Tool binding validation (T44) compares the
-    snapshot against the live row and warns on material drift.
+    `status`, `source`, `source_ref`, and `credentials_ref` (source
+    metadata is admin provenance, not execution input; credentials
+    are an FK pointer resolved at call time, ADR-0002). `tool_id`
+    keeps the pointer to the live row so
+    Plan-Tool binding validation (T44) can compare snapshot-vs-latest
+    and warn on material drift.
+
+    The Worker's execution contract (ADR-0027 §3) reads this model
+    directly: `parameters_schema` validates arguments (ADR-0020),
+    `risk_level` drives HITL (ADR-0004), and the `http_*` fields are
+    the request template.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(description="Tool slug at Plan-generation time.")
+    tool_id: str | None = Field(
+        default=None,
+        description=(
+            "ObjectId of `tools._id` at freeze time. Optional so "
+            "hand-built / older snapshots still parse; T44's drift "
+            "check needs it whenever the Planner generates a Plan."
+        ),
+    )
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Tool slug at Plan-generation time. Mirrors `ToolBase.name` bounds.",
+    )
     description: str = Field(description="LLM-facing description at freeze time.")
     risk_level: ToolRiskLevel = Field(
         description="Risk tier at freeze time. Drives per-node HITL re-confirmation.",
@@ -948,12 +1000,38 @@ class PlanNodeToolSnapshot(BaseModel):
     )
 
 
+class PlanEdge(BaseModel):
+    """One data-dependency edge inside a Plan DAG (CONTEXT.md 术语 "Plan").
+
+    `source -> target` means "target runs after source succeeds"
+    (ADR-0012). The edge carries the ordering guarantee only — no
+    payload rides it: where a downstream `parameters` value depends
+    on an upstream result, the Worker binds it at execution time
+    (T21 / T25). React Flow (T19) consumes this pair directly as
+    `{ source, target }`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(
+        max_length=64,
+        description="`node_id` of the predecessor node.",
+    )
+    target: str = Field(
+        max_length=64,
+        description="`node_id` of the successor node.",
+    )
+
+
 class PlanNode(BaseModel):
     """One Tool invocation inside a Plan DAG.
 
-    Edges are encoded as `depends_on: list[str]` (the list of
-    predecessor node ids inside the same Plan). Per ADR-0012 the
-    LangGraph executor resolves this into a layer-by-layer schedule.
+    T17 (#15) split the T06 shape: a node is pure invocation —
+    which Tool (`tool`, referencing `plan.tool_snapshots[].name`),
+    with what `parameters`, and the Planner's `notes`. The frozen
+    definition lives on the Plan (`tool_snapshots`, ADR-0027) and
+    the topology lives in `plan.edges` — no per-node duplication of
+    either.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -962,17 +1040,25 @@ class PlanNode(BaseModel):
         max_length=64,
         description=(
             "Stable per-Plan identifier — distinct from Mongo `_id`. "
-            "Edges reference this string. Conventional: `n1`, `n2`, …"
+            "Edges and `edited_diff` keys reference this string. "
+            "Conventional: `n1`, `n2`, …"
         ),
     )
-    tool_snapshot: PlanNodeToolSnapshot = Field(
-        description="Frozen Tool definition (ADR-0027). Worker validates against this.",
+    tool: str = Field(
+        max_length=128,
+        description=(
+            "Slug of the Tool invoked. Must match exactly one "
+            "`plan.tool_snapshots[].name` (ADR-0027 binding, "
+            "enforced by the `PlanBase` validator)."
+        ),
     )
     parameters: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Resolved Tool arguments at Plan generation. "
-            "Business user may edit (ADR-0019)."
+            "Resolved Tool arguments at Plan generation. Validated "
+            "against the referenced snapshot's `parameters_schema` "
+            "by the Worker (ADR-0020). Business user may edit "
+            "(ADR-0019)."
         ),
     )
     notes: str = Field(
@@ -980,20 +1066,51 @@ class PlanNode(BaseModel):
         max_length=512,
         description="Free-form semantic note the Planner attaches for the LLM-facing description.",
     )
-    depends_on: list[str] = Field(
-        default_factory=list,
-        description="Node ids this node waits on. Empty list = root of the DAG.",
-    )
+
+
+def _unique_names(values: list[str], label: str) -> set[str]:
+    """Collect `values` into a set, rejecting duplicates under `label`.
+
+    Shared by the node-id and snapshot-name checks in
+    `PlanBase._validate_structure` — both are "this array's key must
+    be a set" invariants with the same error shape.
+    """
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            raise ValueError(f"Plan has duplicate {label} '{value}'")
+        seen.add(value)
+    return seen
 
 
 class PlanBase(BaseModel):
     """Fields shared between create / read shapes for `plans`.
 
-    `nodes` carries the full DAG including the `tool_snapshots`
-    embedded on each node — the acceptance criterion for T06. Per
-    ADR-0019 the `edited_diff` field is populated when the business
-    user edits parameters; it's a `before → after` JSON diff so audit
-    trails can show exactly what the human changed.
+    The T17 (#15) document shape, mirroring SPEC §Data model —
+    `conversation_id / turn_id / nodes / edges / tool_snapshots /
+    status`:
+
+    * ``nodes`` — the Tool invocations (id, Tool slug, parameters,
+      notes). List order is not significant; `edges` carries
+      topology.
+    * ``edges`` — `source -> target` dependency pairs (ADR-0012).
+    * ``tool_snapshots`` — one frozen Tool definition per distinct
+      Tool referenced (ADR-0027). Nodes bind by `name`.
+
+    The model validator enforces the structural contract every
+    downstream consumer leans on — see `_validate_structure`:
+
+    1. `node_id` unique; snapshot `name` unique.
+    2. Every node's `tool` references a frozen snapshot (ADR-0027 —
+       a Plan must be executable and replayable from its own doc).
+    3. Edge endpoints reference existing nodes; no self-loops or
+       duplicate edges.
+    4. The graph is acyclic (the ADR-0012 executor topologically
+       sorts it; a cycle would hang the run).
+
+    Per ADR-0019 the `edited_diff` field (on `PlanInDB`) is populated
+    when the business user edits parameters; it's a `before → after`
+    JSON diff keyed by `node_id`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1010,12 +1127,86 @@ class PlanBase(BaseModel):
     )
     nodes: list[PlanNode] = Field(
         description=(
-            "DAG of Tool invocations. Each node carries its own "
-            "`tool_snapshot` per ADR-0027 — the acceptance criterion "
-            "for T06. The list order is not significant; the "
-            "`depends_on` edges carry the topology."
+            "Tool invocations in the Plan. Each `node.tool` must "
+            "match one `tool_snapshots[].name` (ADR-0027)."
         ),
     )
+    edges: list[PlanEdge] = Field(
+        default_factory=list,
+        description=(
+            "Dependency edges (`source` runs before `target`). "
+            "A node with no incoming edge is a root and may run in "
+            "parallel with other roots (ADR-0012)."
+        ),
+    )
+    tool_snapshots: list[ToolSnapshot] = Field(
+        description=(
+            "Tool definitions frozen at Plan-generation time, one per "
+            "distinct referenced Tool (ADR-0027). Required: a Plan "
+            "with nodes but no snapshots cannot bind them. "
+            "Unreferenced snapshots are tolerated (harmless Planner "
+            "noise); unfrozen references are rejected."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_structure(self) -> PlanBase:
+        """Enforce the structural invariants documented on `PlanBase`."""
+        seen_node_ids = _unique_names(
+            [node.node_id for node in self.nodes], "node_id"
+        )
+        snapshot_names = _unique_names(
+            [snap.name for snap in self.tool_snapshots], "tool_snapshot name"
+        )
+
+        for node in self.nodes:
+            if node.tool not in snapshot_names:
+                raise ValueError(
+                    f"node '{node.node_id}' references unknown tool snapshot "
+                    f"'{node.tool}' — every invocation must bind to a frozen "
+                    "snapshot (ADR-0027)"
+                )
+
+        seen_edges: set[tuple[str, str]] = set()
+        for edge in self.edges:
+            if edge.source == edge.target:
+                raise ValueError(
+                    f"edge {edge.source} -> {edge.target} is self-referencing"
+                )
+            for endpoint in (edge.source, edge.target):
+                if endpoint not in seen_node_ids:
+                    raise ValueError(
+                        f"edge {edge.source} -> {edge.target} references "
+                        f"unknown node '{endpoint}'"
+                    )
+            key = (edge.source, edge.target)
+            if key in seen_edges:
+                raise ValueError(f"Plan has duplicate edge {edge.source} -> {edge.target}")
+            seen_edges.add(key)
+
+        # Kahn's algorithm: whatever survives the leaf-peeling sits on
+        # (or feeds) a cycle.
+        indegree = {node.node_id: 0 for node in self.nodes}
+        outgoing: dict[str, list[str]] = {node.node_id: [] for node in self.nodes}
+        for edge in self.edges:
+            indegree[edge.target] += 1
+            outgoing[edge.source].append(edge.target)
+        frontier = [nid for nid, deg in indegree.items() if deg == 0]
+        resolved = 0
+        while frontier:
+            nid = frontier.pop()
+            resolved += 1
+            for nxt in outgoing[nid]:
+                indegree[nxt] -= 1
+                if indegree[nxt] == 0:
+                    frontier.append(nxt)
+        if resolved != len(indegree):
+            blocked = sorted(nid for nid, deg in indegree.items() if deg > 0)
+            raise ValueError(
+                "Plan edges contain a cycle; nodes on or downstream of it "
+                f"{blocked} — the DAG executor (ADR-0012) cannot schedule this Plan"
+            )
+        return self
 
 
 class PlanCreate(PlanBase):
@@ -1232,7 +1423,7 @@ class AuditLogBase(BaseModel):
     tool_name: str = Field(
         description="Slug of the Tool that was invoked. Indexed for filter UIs.",
     )
-    tool_snapshot: PlanNodeToolSnapshot = Field(
+    tool_snapshot: ToolSnapshot = Field(
         description="Frozen Tool definition per ADR-0027 — what the Worker actually saw.",
     )
     parameters: dict[str, Any] = Field(

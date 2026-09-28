@@ -1,9 +1,11 @@
-"""Tests for `PlanRepository` (T06 / #7).
+"""Tests for `PlanRepository` (T06 / #7; restructured by T17 / #15).
 
-Acceptance criterion for T06: "Plan 含 tool_snapshots 字段". The
-`PlanCreate` test embeds a node with a `tool_snapshot` and verifies
-the persisted document carries the freeze. Plan-edits (ADR-0019)
-are exercised through `record_edit`.
+Acceptance criteria for T17: "nodes / edges / tool_snapshots 字段"
+and "手动构造 Plan 可存可读". A hand-built Plan with all three
+fields must survive the round trip verbatim — the snapshot freeze
+(ADR-0027) is the point of the document. Structural invariants
+(tool refs, DAG-ness) are pinned in `test_plan_schema.py`; this file
+covers the persistence seam.
 """
 from __future__ import annotations
 
@@ -19,9 +21,10 @@ from app.db.errors import InvalidIdError, NotFoundError, ValidationError
 from app.db.init_db import init_database
 from app.db.schemas import (
     PlanCreate,
+    PlanEdge,
     PlanNode,
-    PlanNodeToolSnapshot,
     PlanUpdate,
+    ToolSnapshot,
 )
 from app.repositories.plans import PlanRepository
 
@@ -34,8 +37,9 @@ async def repo() -> PlanRepository:
     return PlanRepository(db)
 
 
-def _snapshot(**overrides: object) -> PlanNodeToolSnapshot:
+def _snapshot(**overrides: object) -> ToolSnapshot:
     base: dict[str, Any] = {
+        "tool_id": str(ObjectId()),
         "name": "list_customers",
         "description": "List customers by region.",
         "risk_level": "read",
@@ -50,16 +54,15 @@ def _snapshot(**overrides: object) -> PlanNodeToolSnapshot:
         "http_body_template": None,
     }
     base.update(overrides)
-    return PlanNodeToolSnapshot(**base)
+    return ToolSnapshot(**base)
 
 
 def _node(**overrides: object) -> PlanNode:
     base: dict[str, Any] = {
         "node_id": "n1",
-        "tool_snapshot": _snapshot(),
+        "tool": "list_customers",
         "parameters": {"region": "emea"},
         "notes": "Q3 lookups",
-        "depends_on": [],
     }
     base.update(overrides)
     return PlanNode(**base)
@@ -71,44 +74,88 @@ def _plan_input(**overrides: Any) -> PlanCreate:
         "turn_id": str(ObjectId()),
         "status": "pending",
         "nodes": [_node()],
+        "edges": [],
+        "tool_snapshots": [_snapshot()],
     }
     base.update(overrides)
     return PlanCreate(**base)
 
 
 class TestPlanCreate:
-    """`create` — accepts valid DAGs, rejects empty-DAG inputs."""
+    """`create` — persists the manual T17 shape; rejects empty DAGs."""
 
     @pytest.mark.asyncio
-    async def test_create_embeds_tool_snapshot_on_each_node(
+    async def test_manual_plan_with_all_three_fields_round_trips(
         self, repo: PlanRepository
     ) -> None:
-        """The acceptance criterion: Plan carries tool_snapshots (ADR-0027)."""
+        """The T17 acceptance criterion: a hand-built Plan carrying
+        `nodes` / `edges` / `tool_snapshots` stores and reads back."""
+        plan = await repo.create(_plan_input())
+        fetched = await repo.get(plan.id)
+
+        assert [n.node_id for n in fetched.nodes] == ["n1"]
+        assert fetched.edges == []
+        assert fetched.tool_snapshots[0].name == "list_customers"
+        assert fetched.nodes[0].tool == "list_customers"
+
+    @pytest.mark.asyncio
+    async def test_create_persists_top_level_tool_snapshots(
+        self, repo: PlanRepository
+    ) -> None:
+        """Snapshots live on the Plan document, not on nodes (ADR-0027).
+
+        The persisted raw doc is asserted too — replays read the
+        frozen schema from `plan.tool_snapshots`, so the shape must
+        match the ADR wording (`plan.tool_snapshots: [...]`).
+        """
         snap = _snapshot(name="list_customers", risk_level="write")
         plan = await repo.create(
-            _plan_input(nodes=[_node(tool_snapshot=snap, parameters={"region": "apac"})])
+            _plan_input(
+                tool_snapshots=[snap],
+                nodes=[_node(parameters={"region": "apac"})],
+            )
         )
-        assert plan.nodes[0].tool_snapshot.name == "list_customers"
-        assert plan.nodes[0].tool_snapshot.risk_level == "write"
-        # And on the raw Mongo doc — the snapshot persisted verbatim.
         raw = await repo._collection.find_one({"_id": ObjectId(plan.id)})
         assert raw is not None
-        assert raw["nodes"][0]["tool_snapshot"]["name"] == "list_customers"
+        assert raw["tool_snapshots"][0]["risk_level"] == "write"
+        assert raw["tool_snapshots"][0]["tool_id"] == snap.tool_id
+        assert "tool_snapshot" not in raw["nodes"][0]
+        assert raw["nodes"][0]["tool"] == "list_customers"
 
     @pytest.mark.asyncio
-    async def test_create_with_multi_node_dag(
+    async def test_create_with_multi_node_dag_and_shared_snapshot(
         self, repo: PlanRepository
     ) -> None:
-        n1 = _node(node_id="n1", parameters={"region": "emea"})
-        n2 = _node(
-            node_id="n2",
-            tool_snapshot=_snapshot(name="send_email"),
-            parameters={"to": "finance@x"},
-            depends_on=["n1"],
+        """Two nodes, one shared snapshot, one edge — the canonical
+        multi-Tool Plan shape."""
+        email = _snapshot(
+            name="send_email",
+            description="Send an email.",
+            risk_level="write",
+            http_method="POST",
+            http_url_template="https://api.example.com/emails",
         )
-        plan = await repo.create(_plan_input(nodes=[n1, n2]))
-        assert [n.node_id for n in plan.nodes] == ["n1", "n2"]
-        assert plan.nodes[1].depends_on == ["n1"]
+        plan = await repo.create(
+            _plan_input(
+                nodes=[
+                    _node(node_id="n1"),
+                    _node(node_id="n2", tool="send_email", parameters={"to": "f@x"}),
+                    _node(node_id="n3", parameters={"region": "apac"}),
+                ],
+                edges=[
+                    PlanEdge(source="n1", target="n2"),
+                    PlanEdge(source="n1", target="n3"),
+                ],
+                tool_snapshots=[_snapshot(), email],
+            )
+        )
+        assert [n.node_id for n in plan.nodes] == ["n1", "n2", "n3"]
+        assert [(e.source, e.target) for e in plan.edges] == [
+            ("n1", "n2"),
+            ("n1", "n3"),
+        ]
+        # The shared `list_customers` snapshot serves both n1 and n3.
+        assert [s.name for s in plan.tool_snapshots] == ["list_customers", "send_email"]
 
     @pytest.mark.asyncio
     async def test_create_rejects_empty_node_list(
@@ -131,7 +178,7 @@ class TestPlanCreate:
 
 
 class TestPlanRead:
-    """`get`, `get_in_db`, `get_latest_for_conversation`, list variants."""
+    """`get`, `get_latest_for_conversation`, list variants."""
 
     @pytest.mark.asyncio
     async def test_get_by_id(self, repo: PlanRepository) -> None:
@@ -143,7 +190,8 @@ class TestPlanRead:
     async def test_get_returns_canonical_shape_with_dag(
         self, repo: PlanRepository
     ) -> None:
-        """`get` returns the Plan with its embedded DAG and `tool_snapshots`.
+        """`get` returns the full T17 trio so the React Flow renderer
+        (T19) can lay out the graph without re-deriving anything.
 
         The T05 review noted a `get_in_db` seam was redundant for
         Plan — every persisted field is canonical. The audit
@@ -151,7 +199,9 @@ class TestPlanRead:
         """
         created = await repo.create(_plan_input())
         fetched = await repo.get(created.id)
-        assert fetched.nodes[0].tool_snapshot.name == "list_customers"
+        assert fetched.nodes[0].tool == "list_customers"
+        assert fetched.tool_snapshots[0].name == "list_customers"
+        assert "edges" in fetched.model_dump()
 
     @pytest.mark.asyncio
     async def test_get_missing_raises_not_found(self, repo: PlanRepository) -> None:
@@ -195,6 +245,17 @@ class TestPlanRead:
         await repo.create(_plan_input(turn_id=str(ObjectId())))
         ours = await repo.list_by_turn(turn_id)
         assert {p.id for p in ours} == {p1.id, p2.id}
+
+    @pytest.mark.asyncio
+    async def test_list_by_conversation_returns_newest_first(
+        self, repo: PlanRepository
+    ) -> None:
+        conv_id = str(ObjectId())
+        first = await repo.create(_plan_input(conversation_id=conv_id))
+        await asyncio.sleep(0.005)
+        newest = await repo.create(_plan_input(conversation_id=conv_id))
+        plans = await repo.list_by_conversation(conv_id)
+        assert [p.id for p in plans] == [newest.id, first.id]
 
     @pytest.mark.asyncio
     async def test_list_by_status_filters_correctly(
@@ -246,16 +307,15 @@ class TestPlanUpdate:
     async def test_record_edit_writes_diff_and_flips_status_to_modified(
         self, repo: PlanRepository
     ) -> None:
-        """`record_edit` is the dedicated HITL edit path (ADR-0019)."""
+        """`record_edit` is the dedicated HITL edit path (ADR-0019).
+
+        Only `parameters` / `notes` change — the T17 shape means the
+        frozen `tool_snapshots` and the `edges` topology are never
+        touched by an edit.
+        """
         created = await repo.create(_plan_input(status="pending"))
         edited_nodes = [
-            {
-                "node_id": "n1",
-                "tool_snapshot": _snapshot().model_dump(),
-                "parameters": {"region": "amer"},  # emea -> amer
-                "notes": "Edited by finance user.",
-                "depends_on": [],
-            }
+            _node(parameters={"region": "amer"}, notes="Edited by finance user.")
         ]
         diff = {
             "by_node_id": {
@@ -266,6 +326,46 @@ class TestPlanUpdate:
         assert updated.status == "modified"
         assert updated.nodes[0].parameters == {"region": "amer"}
         assert updated.edited_diff == diff
+        # Topology + snapshots survive the edit untouched.
+        assert [s.name for s in updated.tool_snapshots] == ["list_customers"]
+        assert updated.edges == []
+
+    @pytest.mark.asyncio
+    async def test_record_edit_rejects_repointed_tool(
+        self, repo: PlanRepository
+    ) -> None:
+        """ADR-0019: only `parameters` / `notes` are editable. Pointing
+        a node at another Tool (frozen or not) breaks the snapshot
+        binding (ADR-0027) and is rejected as a repository-level
+        `ValidationError`, with the stored doc untouched."""
+        created = await repo.create(_plan_input(status="pending"))
+        with pytest.raises(ValidationError, match="cannot change which Tool"):
+            await repo.record_edit(created.id, [_node(tool="not_frozen")], {})
+        untouched = await repo.get(created.id)
+        assert untouched.nodes[0].tool == "list_customers"
+        assert untouched.status == "pending"
+
+    @pytest.mark.asyncio
+    async def test_record_edit_rejects_added_and_removed_nodes(
+        self, repo: PlanRepository
+    ) -> None:
+        """ADR-0019: "不可增删节点" — the node set must match exactly.
+        An added node rides an already-frozen snapshot, so the
+        PlanBase invariants alone would NOT catch it; the set check
+        must."""
+        created = await repo.create(_plan_input(status="pending"))
+        with pytest.raises(ValidationError, match="cannot add or remove nodes") as exc:
+            await repo.record_edit(
+                created.id,
+                [_node(), _node(node_id="n9")],  # add n9
+                {},
+            )
+        assert exc.value.details == {"added": ["n9"], "removed": []}
+        with pytest.raises(ValidationError, match="cannot add or remove nodes"):
+            await repo.record_edit(created.id, [], {})
+        untouched = await repo.get(created.id)
+        assert [n.node_id for n in untouched.nodes] == ["n1"]
+        assert untouched.status == "pending"
 
     @pytest.mark.asyncio
     async def test_record_edit_missing_raises_not_found(

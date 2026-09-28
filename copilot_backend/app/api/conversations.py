@@ -101,8 +101,9 @@ class ConversationDetailResponse(BaseModel):
     )
     plans: list[dict[str, Any]] = Field(
         description=(
-            "Plans in `created_at` DESC order. Each row carries the full "
-            "`nodes` DAG with embedded `tool_snapshot`s per ADR-0027."
+            "Plans in `created_at` DESC order. Each row carries the "
+            "T17 shape — `nodes` / `edges` / `tool_snapshots` per "
+            "ADR-0027; nodes bind to snapshots by `tool` name."
         ),
     )
 
@@ -157,9 +158,10 @@ def _turn_to_dict(turn: Turn) -> dict[str, Any]:
 def _plan_to_dict(plan: Plan) -> dict[str, Any]:
     """Render a Plan row as a JSON-safe dict.
 
-    The embedded `nodes[].tool_snapshot` (ADR-0027) flows through
-    verbatim — the React Flow renderer reads the full DAG without
-    re-deriving edges.
+    The `nodes` / `edges` / `tool_snapshots` trio (ADR-0027, T17)
+    flows through verbatim — the React Flow renderer consumes edges
+    directly and resolves each node's Tool definition from the
+    Plan-level snapshot list without re-deriving anything.
     """
     return plan.model_dump(mode="json")
 

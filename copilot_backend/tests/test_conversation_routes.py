@@ -35,7 +35,7 @@ from bson import ObjectId
 from fastapi import FastAPI
 
 from app.db.init_db import init_database
-from app.db.schemas import PlanCreate, PlanNode, PlanNodeToolSnapshot, TurnCreate
+from app.db.schemas import PlanCreate, PlanNode, ToolSnapshot, TurnCreate
 from app.main import create_app
 from app.repositories.conversations import ConversationRepository
 from app.repositories.plans import PlanRepository
@@ -206,14 +206,18 @@ async def _seed_plan(
             nodes=[
                 PlanNode(
                     node_id="n1",
-                    tool_snapshot=PlanNodeToolSnapshot(
-                        name="echo",
-                        description="echo tool",
-                        risk_level="read",
-                        http_method="POST",
-                        http_url_template="https://example.test/echo",
-                    ),
+                    tool="echo",
                     parameters={"text": "hello"},
+                ),
+            ],
+            edges=[],
+            tool_snapshots=[
+                ToolSnapshot(
+                    name="echo",
+                    description="echo tool",
+                    risk_level="read",
+                    http_method="POST",
+                    http_url_template="https://example.test/echo",
                 ),
             ],
         ),
@@ -455,8 +459,12 @@ class TestGetConversationDetail:
         assert body["turns"][0]["content"] == "echo hello"
         assert body["turns"][0]["role"] == "user"
         assert len(body["plans"]) == 1
-        # The embedded tool_snapshot survives the round trip (ADR-0027).
-        assert body["plans"][0]["nodes"][0]["tool_snapshot"]["name"] == "echo"
+        # The T17 trio survives the round trip (ADR-0027): the node
+        # binds to the Plan-level frozen snapshot by name.
+        plan_row = body["plans"][0]
+        assert plan_row["nodes"][0]["tool"] == "echo"
+        assert plan_row["tool_snapshots"][0]["name"] == "echo"
+        assert plan_row["edges"] == []
 
     async def test_detail_missing_returns_404(
         self,
