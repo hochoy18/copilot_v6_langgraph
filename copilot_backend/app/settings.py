@@ -126,6 +126,114 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---- OIDC SSO (T08 / #46) ------------------------------------------
+    # `oidc_issuer_url` is the canonical identifier for the upstream IdP
+    # (e.g. Okta / Azure AD / Auth0). The adapter pulls metadata from
+    # `<issuer>/.well-known/openid-configuration` per the OIDC
+    # discovery spec — `oidc_issuer` MUST match the `issuer` claim
+    # returned by `id_token`s or verification will reject them.
+    oidc_issuer_url: str = Field(
+        default="https://idp.example.com",
+        description=(
+            "OIDC issuer URL. The adapter fetches "
+            "`<issuer>/.well-known/openid-configuration` once and caches it."
+        ),
+    )
+    oidc_client_id: str = Field(
+        default="copilot-dev",
+        description="OIDC client id issued by the IdP for this app.",
+    )
+    # Client secret is confidential; in dev a placeholder is fine because
+    # the value is only consulted when the adapter hits a real IdP. The
+    # IdP mock used in tests signs tokens with its own key and the
+    # verification path doesn't read this field.
+    oidc_client_secret: str = Field(
+        default="dev-client-secret-not-for-prod",
+        description="OIDC client secret. Confidential — set via env in prod.",
+    )
+    oidc_redirect_uri: str = Field(
+        default="http://localhost:3000/auth/callback",
+        description=(
+            "Redirect URI registered with the IdP. The token-exchange "
+            "call sends the same value so the IdP rejects any mismatch."
+        ),
+    )
+    # Audience the access token is *for* (this system). ADR-0009 says
+    # the access token is short-lived; the IdP-issued `id_token` has its
+    # own audience — `oidc_audience` is the value we expect to see in
+    # `id_token.aud` during verification.
+    oidc_audience: str = Field(
+        default="copilot-api",
+        description=(
+            "Expected `aud` claim of the IdP-issued `id_token`. The "
+            "adapter rejects any token whose `aud` doesn't match."
+        ),
+    )
+    # HS256 signing key for the access token we mint ourselves. Kept on
+    # the server only; clients only see the encoded form. T09 will add
+    # the verification middleware that consumes this same key.
+    oidc_jwt_signing_key: str = Field(
+        default="dev-internal-jwt-signing-key-not-for-prod",
+        min_length=16,
+        description=(
+            "HMAC-SHA256 secret used to sign the short-lived access "
+            "tokens we mint. T09 will read the same key to verify."
+        ),
+    )
+    # IdP-side signing key. Distinct from `oidc_jwt_signing_key` (the
+    # key WE use to sign access tokens). HS256 IdPs are uncommon in
+    # production (most use RS256 with JWKS) but our test IdP mock and
+    # some lightweight providers sign with HS256; this is the key
+    # that the verifier uses against `id_token`. RS256 deployments
+    # leave this empty and signature verification falls through to
+    # the JWKS path (T35).
+    oidc_id_token_signing_key: str = Field(
+        default="dev-idp-hs256-key-not-for-prod",
+        min_length=16,
+        description=(
+            "HMAC-SHA256 secret the IdP uses to sign `id_token`s. "
+            "Only consulted when the IdP's `id_token` uses HS256; "
+            "RS256 IdPs ignore this value and rely on JWKS."
+        ),
+    )
+    oidc_jwt_issuer: str = Field(
+        default="copilot-backend",
+        description="`iss` claim for the access tokens we mint.",
+    )
+    oidc_jwt_audience: str = Field(
+        default="copilot-api",
+        description="`aud` claim for the access tokens we mint.",
+    )
+    oidc_access_token_ttl_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=3600,
+        description=(
+            "Access-token TTL per ADR-0009 (15 minutes default). The "
+            "minimum guards against misconfiguration dropping the "
+            "window below an interactive session; the maximum keeps "
+            "blast radius bounded."
+        ),
+    )
+    oidc_discovery_cache_seconds: int = Field(
+        default=3600,
+        ge=0,
+        le=86_400,
+        description=(
+            "How long the adapter caches `/.well-known/openid-configuration`. "
+            "0 disables caching (each login re-fetches)."
+        ),
+    )
+    oidc_state_ttl_seconds: int = Field(
+        default=600,
+        ge=30,
+        le=3600,
+        description=(
+            "How long the backend holds `state → (nonce, code_verifier)` "
+            "between `GET /auth/sso/login` and `POST /auth/sso/callback`."
+        ),
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

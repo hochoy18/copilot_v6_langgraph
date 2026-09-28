@@ -84,9 +84,120 @@ class RefreshTokenReuseError(AppError):
     http_status = status.HTTP_401_UNAUTHORIZED
 
 
+# ---------------------------------------------------------------------------
+# OIDC SSO (T08 / #46)
+# ---------------------------------------------------------------------------
+#
+# These mirror the four "compromise-class" signals the OIDC spec and
+# ADR-0009 / ADR-0006 expect to see on a callback that we can't safely
+# complete. Every one of them is a 401 — the callback is gated on a
+# short-lived IdP authorisation and any mismatch means we either don't
+# trust the client (state / nonce) or don't trust the IdP (signature
+# / claims). The 401 envelope keeps the i18n layer unified with the
+# refresh-token path.
+
+
+class OIDCStateMismatchError(AppError):
+    """The `state` posted to the callback doesn't match one we issued.
+
+    Two causes — both treated as 401:
+
+    * the callback is a CSRF / replay (state never seen).
+    * the entry was swept by TTL (user took longer than
+      `oidc_state_ttl_seconds` to round-trip through the IdP).
+
+    Either way, the safe response is "start the login over".
+    """
+
+    code = "oidc_state_mismatch"
+    message_zh = "OIDC 登录会话已过期"
+    message_en = "OIDC login session expired or invalid"
+    http_status = status.HTTP_401_UNAUTHORIZED
+
+
+class OIDCIDTokenInvalidError(AppError):
+    """The IdP-issued `id_token` failed verification.
+
+    Covers signature mismatch, malformed JWT shape, malformed JSON
+    payload, and unsupported `alg`. The detail envelope names the
+    specific failure so audit forensics can log it without a
+    stringly-typed message.
+    """
+
+    code = "oidc_id_token_invalid"
+    message_zh = "IdP 返回的身份凭据无效"
+    message_en = "IdP-issued id_token is invalid"
+    http_status = status.HTTP_401_UNAUTHORIZED
+
+
+class OIDCClaimsMismatchError(AppError):
+    """An `id_token` claim didn't match what we expected.
+
+    Per ADR-0009 we pin `iss`, `aud`, `nonce`, and `exp`. Any mismatch
+    is rejected with a distinct `code` so the front-end can show
+    "configuration drifted" rather than the generic "invalid token".
+    """
+
+    code = "oidc_claims_mismatch"
+    message_zh = "IdP 身份凭据与本系统配置不匹配"
+    message_en = "OIDC claims do not match local configuration"
+    http_status = status.HTTP_401_UNAUTHORIZED
+
+
+class OIDCTokenExchangeError(AppError):
+    """The IdP's token endpoint returned an error or non-JSON response.
+
+    Distinct from `OIDCIDTokenInvalidError` — this is the upstream
+    HTTP call failing, not the resulting token being wrong. The
+    detail envelope carries the IdP-side `error` and optional
+    `error_description` so ops can correlate against the IdP logs.
+    """
+
+    code = "oidc_token_exchange_failed"
+    message_zh = "IdP 换票失败"
+    message_en = "OIDC token exchange with IdP failed"
+    http_status = status.HTTP_502_BAD_GATEWAY
+
+
+class OIDCDiscoveryError(AppError):
+    """Discovery document fetch or parse failed.
+
+    Surfaced as a 502 because the upstream IdP is the failure point.
+    The detail envelope carries the IdP URL + error message so the
+    front-end can render "SSO temporarily unavailable" with a
+    distinguishing error class.
+    """
+
+    code = "oidc_discovery_failed"
+    message_zh = "无法获取 IdP 元数据"
+    message_en = "Failed to fetch OIDC discovery document"
+    http_status = status.HTTP_502_BAD_GATEWAY
+
+
+class UserInactiveError(AppError):
+    """A previously-known user is deactivated and cannot log in.
+
+    Distinct from a missing/incorrect credential: the IdP can vouch
+    for identity, but local policy (admin offboarding, compliance
+    hold) supersedes that. Surfaced as 403 to distinguish from the
+    401/404 family that signals "credentials don't match".
+    """
+
+    code = "user_inactive"
+    message_zh = "用户已停用"
+    message_en = "User is deactivated"
+    http_status = status.HTTP_403_FORBIDDEN
+
+
 __all__ = [
     "RefreshTokenNotFoundError",
     "RefreshTokenRevokedError",
     "RefreshTokenExpiredError",
     "RefreshTokenReuseError",
+    "OIDCStateMismatchError",
+    "OIDCIDTokenInvalidError",
+    "OIDCClaimsMismatchError",
+    "OIDCTokenExchangeError",
+    "OIDCDiscoveryError",
+    "UserInactiveError",
 ]

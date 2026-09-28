@@ -114,6 +114,10 @@ class UserUpdate(BaseModel):
     Every field is optional so `PATCH` semantics hold: an empty patch is
     a no-op. `role_ids` replaces the list atomically — partial diff
     semantics belong in the admin API layer, not the repository.
+
+    `email` (T08 / #46) lets the OIDC login flow mirror an IdP-side
+    email change onto an existing `sso` user without forcing a
+    delete-and-recreate (which would orphan audit trails).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -122,6 +126,7 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
     role_ids: list[str] | None = None
     password_hash: str | None = None
+    email: EmailStr | None = None
 
 
 class UserInDB(UserBase):

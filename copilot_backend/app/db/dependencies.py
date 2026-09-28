@@ -18,6 +18,9 @@ from typing import Any
 from fastapi import Depends, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from app.auth.login import OIDCLoginService, OIDCStateStore
+from app.auth.oidc import OIDCAdapter
+from app.auth.tokens import RefreshTokenService
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.credentials import CredentialRepository
@@ -30,6 +33,7 @@ from app.repositories.tools import ToolRepository
 from app.repositories.turns import TurnRepository
 from app.repositories.users import UserRepository
 from app.security.crypto import CredentialEncryptor
+from app.settings import Settings, get_settings
 
 
 def get_database(request: Request) -> AsyncIOMotorDatabase[Any]:
@@ -125,3 +129,68 @@ def get_audit_log_repository(
 ) -> AuditLogRepository:
     """FastAPI dependency: build an `AuditLogRepository` for this request."""
     return AuditLogRepository(db)
+
+
+# ---------------------------------------------------------------------------
+# Auth / OIDC (T08 / #46)
+# ---------------------------------------------------------------------------
+
+
+def get_refresh_token_service(
+    repo: RefreshTokenRepository = Depends(get_refresh_token_repository),  # noqa: B008
+) -> RefreshTokenService:
+    """FastAPI dependency: build a `RefreshTokenService` for this request."""
+    return RefreshTokenService(repo)
+
+
+def get_oidc_state_store(request: Request) -> OIDCStateStore:
+    """FastAPI dependency: return the process-local `OIDCStateStore`.
+
+    The store is constructed once per process in the lifespan and
+    stashed on `app.state`. Tests inject a stub via the same
+    `dependency_overrides[...]` pattern as the other deps.
+    """
+    store: OIDCStateStore = request.app.state.oidc_state_store
+    return store
+
+
+def get_oidc_adapter(
+    request: Request,
+    settings: Settings = Depends(get_settings),  # noqa: B008  (FastAPI idiom)
+) -> OIDCAdapter:
+    """FastAPI dependency: return the process-wide `OIDCAdapter`.
+
+    The adapter owns an `httpx.AsyncClient`; the lifespan closes it
+    on shutdown so we don't leak sockets across a reload.
+    """
+    adapter: OIDCAdapter = request.app.state.oidc_adapter
+    # Bind the settings in case the lifespan-built instance was
+    # constructed against a different `Settings`. Tests override this
+    # dependency entirely; production uses the lifespan one.
+    if adapter is None:  # pragma: no cover — defensive
+        adapter = OIDCAdapter(settings)
+    return adapter
+
+
+def get_oidc_login_service(
+    request: Request,
+    settings: Settings = Depends(get_settings),  # noqa: B008  (FastAPI idiom)
+    state_store: OIDCStateStore = Depends(get_oidc_state_store),  # noqa: B008
+    user_repo: UserRepository = Depends(get_user_repository),  # noqa: B008
+    refresh_service: RefreshTokenService = Depends(get_refresh_token_service),  # noqa: B008
+) -> OIDCLoginService:
+    """FastAPI dependency: return an `OIDCLoginService` for this request.
+
+    Pulls each collaborator from `app.state` / other dependencies and
+    wires them together. The login service itself is stateless beyond
+    the collaborator references, so a fresh instance per request is
+    safe.
+    """
+    adapter = get_oidc_adapter(request, settings)
+    return OIDCLoginService(
+        settings=settings,
+        oidc_adapter=adapter,
+        state_store=state_store,
+        user_repository=user_repo,
+        refresh_service=refresh_service,
+    )

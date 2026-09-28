@@ -18,7 +18,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.auth import router as auth_router
 from app.api.health import router as health_router
+from app.auth.login import build_state_store
+from app.auth.oidc import OIDCAdapter
 from app.db.mongo import MongoClient
 from app.exceptions import register_exception_handlers
 from app.health import HealthChecker
@@ -70,10 +73,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.mongo = mongo
     app.state.database = mongo.database
     app.state.credential_encryptor = encryptor
+    # T08 / #46 — OIDC adapter + state store on app.state so the
+    # auth dependency seam can read them. Construction is cheap and
+    # pure; the OIDC adapter's network calls are deferred to the
+    # first `discovery()`.
+    oidc_adapter = OIDCAdapter(settings)
+    state_store = build_state_store(settings)
+    app.state.oidc_adapter = oidc_adapter
+    app.state.oidc_state_store = state_store
     try:
         await _probe_dependencies(settings)
         yield
     finally:
+        await oidc_adapter.aclose()
         await mongo.close()
         logger.info("backend shutting down")
 
@@ -109,6 +121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Routers
     app.include_router(health_router)
+    app.include_router(auth_router)
 
     # Unified error contract (ADR-0031).
     register_exception_handlers(app)

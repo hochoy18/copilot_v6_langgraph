@@ -314,3 +314,76 @@ class UserRepository(BaseRepository[User, UserCreate, UserUpdate]):
             return None
         updated: Any = doc.get("updated_at")
         return updated if isinstance(updated, datetime) else None
+
+    # ------------------------------------------------------------------
+    # SSO upsert (T08 / #46)
+    # ------------------------------------------------------------------
+
+    async def upsert_sso_user(
+        self,
+        *,
+        sso_subject: str,
+        email: str,
+        display_name: str,
+    ) -> tuple[User, bool]:
+        """Find-or-create the user bound to `sso_subject`.
+
+        Per ADR-0006 the IdP is the identity authority for SSO users;
+        a subject that re-presents itself should resolve to the same
+        `users._id` so audit trails and refresh-token families stay
+        attached. We *mirror* `email` and `display_name` from the IdP
+        claim onto the local row so admin tooling sees a current
+        name without needing to join IdP.
+
+        Returns:
+            `(user, created)` — `created=True` when this call
+            inserted a new row, `False` when the subject was already
+            present (with optional `email` / `display_name` updates).
+
+        Raises:
+            ValidationError: required fields are missing/empty.
+            DuplicateKeyError: another `sso_subject` row raced in
+                between our `get_by_sso_subject` and our `create` —
+                surfaced as the unified envelope so the caller can
+                retry. We deliberately don't catch this and fall
+                back to re-fetching, because the racing user will
+                have our `sso_subject` and the re-fetch path is
+                safe to take on the next request.
+        """
+        if not sso_subject:
+            raise ValidationError(
+                message_en="sso_subject is required for SSO upsert",
+                details={"sso_subject": sso_subject},
+            )
+
+        try:
+            existing = await self.get_by_sso_subject(sso_subject)
+        except NotFoundError:
+            existing = None
+
+        if existing is not None:
+            # Mirror IdP-side identity changes. The PATCH-style update
+            # bumps `updated_at` so downstream caches know to refetch.
+            patch = UserUpdate()
+            changed = False
+            if existing.email != email:
+                patch.email = email
+                changed = True
+            if existing.display_name != display_name:
+                patch.display_name = display_name
+                changed = True
+            if changed:
+                updated = await self.update(existing.id, patch)
+                return updated, False
+            return existing, False
+
+        created = await self.create(
+            UserCreate(
+                email=email,
+                display_name=display_name,
+                source="sso",
+                sso_subject=sso_subject,
+                role_ids=[],
+            )
+        )
+        return created, True
