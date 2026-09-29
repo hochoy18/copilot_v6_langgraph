@@ -1,13 +1,15 @@
 /**
- * `planTool` custom node — T19 / #17, T24 / #21.
+ * `planTool` custom node — T19 / #17, T24 / #21, T29 / #25.
  *
  * Renders one Plan invocation: Tool slug, frozen description, the
  * risk-level badge that satisfies the AC "节点按风险等级区分样式"
  * (card + badge classes come from `riskStyleFor`, keyed off the
  * ADR-0027 snapshot so the colour reflects the risk *at Plan
- * generation time*, not the live Tool row), and — for T24 — the
- * live runtime status pill the SSE stream flips in real time
- * ("节点实时切状态").
+ * generation time*, not the live Tool row), the live runtime
+ * status pill the SSE stream flips in real time ("节点实时切
+ * 状态"), and — for T29 — a card-level runtime overlay so parallel
+ * siblings all pulse at once and a failed sibling flips the whole
+ * card red.
  *
  * Clicking a node selects it and drives `NodeInfoPanel` — parameter
  * *editing* is T26/T27 (#23/#24); this card is read-only preview.
@@ -47,8 +49,18 @@ export function PlanToolNode({
       data-runtime={status ?? 'idle'}
       className={cn(
         'w-64 rounded-lg border-2 bg-card p-3 shadow-sm',
+        // Risk-level base colour. `failed` deliberately *overrides*
+        // this (red border + red fill wins) so a failed read-risk
+        // node can't masquerade as healthy at a glance.
         style ? style.card : 'border-dashed border-muted-foreground/50 bg-muted',
-        selected && 'ring-2 ring-ring ring-offset-1',
+        // Runtime overlay (ring + pulse for live states, red for
+        // failure). Listed after the risk card so its specificity
+        // wins in Tailwind's class merge.
+        runtime.card,
+        // Selection indicator — uses `outline` rather than `ring`
+        // so it never clobbers the runtime ring colour of a
+        // running / succeeded / failed sibling (T29 review fix).
+        selected && 'outline outline-2 outline-ring outline-offset-1',
       )}
     >
       {/* Edge anchors; T18 single-node Plans never draw them, T25 will. */}

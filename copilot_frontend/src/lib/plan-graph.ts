@@ -57,10 +57,16 @@ export interface RiskStyle {
 }
 
 /**
- * Per-node runtime status pulled off the SSE stream (T24 / #21).
+ * Per-node runtime status pulled off the SSE stream (T24 / #21, T29 / #25).
  * Reused by `PlanToolNode` so the node badge flips "执行中 / 成功 /
  * 失败" as the Worker reports progress without the consumer
  * knowing which event triggered the flip.
+ *
+ * T29 / #25 added `card` — the card-level overlay (ring + pulse for
+ * live states, red border/fill/ring + dark-red text on failure).
+ * Folding it into the same table keeps a single source of truth:
+ * an earlier draft kept `card` in a parallel table and required
+ * two lookups to stay exhaustive in lockstep (Shotgun Surgery).
  */
 export interface RuntimeStatusStyle {
   /** Tailwind classes for the small status pill below the title. */
@@ -69,6 +75,13 @@ export interface RuntimeStatusStyle {
   label: string
   /** Optional pulse animation — set on `running`. */
   pulse: boolean
+  /**
+   * Card-level overlay classes, layered on top of the risk-level
+   * card by `PlanToolNode`. `''` means "leave the risk card alone";
+   * `failed` deliberately overrides the risk colour so a failed
+   * `read`-risk node can't masquerade as healthy at a glance.
+   */
+  card: string
 }
 
 const RISK_STYLES: Record<ToolRiskLevel, RiskStyle> = {
@@ -100,13 +113,21 @@ export function riskStyleFor(level: ToolRiskLevel): RiskStyle {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime status — T24 / #21.
+// Runtime status — T24 / #21, T29 / #25.
 //
 // A node has a runtime status (running / succeeded / failed) that
 // the SSE stream flips independently of the frozen risk level.
 // `idle` is the absent case — when no `tool.*` event has fired
 // yet — so the lookup table stays exhaustive without a `null`
 // branch at every call site.
+//
+// T29 added the `card` field (the third sibling on each row) so
+// parallel siblings all pulse at once and a failed sibling flips
+// the whole card red. The `failed` overlay is intentionally
+// dramatic — `border-red-600 bg-red-100 ring-2 ring-red-500
+// ring-offset-1 text-red-900` — because `write`-risk is already
+// `border-red-500 bg-red-50` and the AC's "失败节点标红" requires
+// a clearly-different surface on every risk level.
 // ---------------------------------------------------------------------------
 
 const RUNTIME_STATUS_STYLES = {
@@ -114,31 +135,50 @@ const RUNTIME_STATUS_STYLES = {
     pill: 'bg-muted text-muted-foreground',
     label: '等待执行',
     pulse: false,
+    // Absent / no event yet — leave the risk card alone.
+    card: '',
   },
   running: {
     pill: 'bg-blue-100 text-blue-800',
     label: '执行中',
     pulse: true,
+    // Pulse the whole card, not just the spinner icon — two
+    // parallel siblings in `running` would otherwise look static
+    // side by side.
+    card: 'ring-2 ring-blue-500 ring-offset-1 animate-pulse',
   },
   succeeded: {
     pill: 'bg-emerald-100 text-emerald-800',
     label: '成功',
     pulse: false,
+    // Settled-green ring so the green pill isn't the only cue.
+    card: 'ring-2 ring-emerald-500 ring-offset-1',
   },
   failed: {
     pill: 'bg-red-100 text-red-800',
     label: '失败',
     pulse: false,
+    // Hard red override — the AC's literal "标红". Beats the
+    // risk-level emerald / amber / destructive-red so a failed
+    // read-risk or write-risk node can't masquerade as healthy at
+    // a glance. The thick red ring is the dominant signal; the
+    // `text-red-900` lifts the body off the red-100 fill so the
+    // description stays legible.
+    card: 'border-red-600 bg-red-100 ring-2 ring-red-500 ring-offset-1 text-red-900',
   },
   skipped: {
     pill: 'bg-zinc-100 text-zinc-700',
     label: '跳过',
     pulse: false,
+    // `skipped` / `cancelled` are quiet terminal states; the pill
+    // is enough signal and the risk colour stays legible.
+    card: '',
   },
   cancelled: {
     pill: 'bg-zinc-100 text-zinc-700',
     label: '已取消',
     pulse: false,
+    card: '',
   },
 } as const satisfies Record<ToolRuntimeStatus, RuntimeStatusStyle>
 

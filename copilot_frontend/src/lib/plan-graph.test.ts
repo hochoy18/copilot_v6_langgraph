@@ -169,11 +169,12 @@ describe('riskStyleFor', () => {
   })
 })
 
-describe('runtimeStatusStyleFor (T24 / #21)', () => {
+describe('runtimeStatusStyleFor (T24 / #21, T29 / #25)', () => {
   it('renders absent (never-seen) nodes as idle', () => {
     const idle = runtimeStatusStyleFor(undefined)
     expect(idle.label).toBe('等待执行')
     expect(idle.pulse).toBe(false)
+    expect(idle.card).toBe('')
   })
 
   it('labels the live execution states with Chinese badge copy', () => {
@@ -189,5 +190,40 @@ describe('runtimeStatusStyleFor (T24 / #21)', () => {
     for (const settled of ['succeeded', 'failed', 'skipped', 'cancelled'] as const) {
       expect(runtimeStatusStyleFor(settled).pulse).toBe(false)
     }
+  })
+
+  it('card overlay is empty for idle / skipped / cancelled (no change to risk card)', () => {
+    // T29 / #25: only live states decorate the card; quiet terminal
+    // states leave the risk-level card alone.
+    expect(runtimeStatusStyleFor('idle').card).toBe('')
+    expect(runtimeStatusStyleFor('skipped').card).toBe('')
+    expect(runtimeStatusStyleFor('cancelled').card).toBe('')
+  })
+
+  it('pulses the card border while running so parallel siblings are both visibly animated', () => {
+    const overlay = runtimeStatusStyleFor('running').card
+    // animate-pulse + a blue ring; the per-node spinner stays for the badge.
+    expect(overlay).toMatch(/animate-pulse/)
+    expect(overlay).toMatch(/ring-blue/)
+  })
+
+  it('rings the card emerald once the node succeeded', () => {
+    const overlay = runtimeStatusStyleFor('succeeded').card
+    expect(overlay).toMatch(/ring-emerald/)
+    expect(overlay).not.toMatch(/animate-pulse/)
+  })
+
+  it('overrides the card with red on failure — the AC "失败节点标红" requirement', () => {
+    const overlay = runtimeStatusStyleFor('failed').card
+    // Red border + red fill override the risk-level emerald / amber
+    // so a failed read-risk node can't masquerade as healthy. The
+    // thick `ring-red` is the dominant signal — `write`-risk is
+    // already `border-red-500 bg-red-50`, so without a separate ring
+    // the failed overlay would be near-indistinguishable from idle.
+    expect(overlay).toMatch(/border-red/)
+    expect(overlay).toMatch(/bg-red/)
+    expect(overlay).toMatch(/ring-red/)
+    expect(overlay).toMatch(/text-red/)
+    expect(overlay).not.toMatch(/animate-pulse/)
   })
 })

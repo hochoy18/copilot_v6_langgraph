@@ -658,16 +658,50 @@ describe('PlanDrawer parallel-node runtime status (T29 / #25)', () => {
     expect(ok).toHaveAttribute('data-runtime', 'succeeded')
     expect(bad).toHaveAttribute('data-runtime', 'failed')
 
-    // The AC wants the failed node clearly red — the card border
-    // and background flip, not just a tiny pill. The sibling's
-    // success ring stays emerald, so the user can see exactly which
-    // one broke.
+    // The AC wants the failed node clearly red — the card border,
+    // fill, ring and body text all flip, not just a tiny pill. The
+    // sibling's success ring stays emerald, so the user can see
+    // exactly which one broke. The `ring-red` is the dominant
+    // signal — `write`-risk is already `border-red-500 bg-red-50`,
+    // so without a separate ring the failed overlay would be
+    // near-indistinguishable from idle.
     expect(bad.className).toMatch(/border-red/)
     expect(bad.className).toMatch(/bg-red/)
+    expect(bad.className).toMatch(/ring-red/)
     expect(ok.className).toMatch(/ring-emerald/)
     expect(ok.className).not.toMatch(/border-red/)
 
     expect(screen.getByTestId('plan-node-status-n1')).toHaveTextContent('成功')
     expect(screen.getByTestId('plan-node-status-n2')).toHaveTextContent('失败')
+  })
+
+  it('keeps the running ring colour visible when the user clicks the node (selection must not clobber the runtime ring)', () => {
+    // Review finding: the previous selection indicator was
+    // `ring-2 ring-ring ring-offset-1`, which Tailwind-merge kept
+    // and overwrote the running `ring-blue-500`. We moved
+    // selection to `outline` so the two indicators never compete.
+    // The DOM-level invariant this pins: clicking a running node
+    // must not strip its blue ring. (The outline class itself is
+    // React Flow's internal `selected` prop, which jsdom doesn't
+    // drive from `fireEvent.click` — the source change is auditable
+    // at review time.)
+    usePlanDrawerStore.getState().showPlan(twoNodePlan())
+    render(<PlanDrawer />)
+
+    act(() => {
+      useConversationStreamStore.getState().markNodeRunning('n1')
+      useConversationStreamStore.getState().markNodeRunning('n2')
+    })
+
+    const a = screen.getByTestId('plan-node-n1')
+    expect(a.className).toMatch(/ring-blue/)
+    expect(a.className).toMatch(/animate-pulse/)
+
+    fireEvent.click(a)
+    expect(a.className).toMatch(/ring-blue/)
+    expect(a.className).toMatch(/animate-pulse/)
+    // `ring-ring` (the old selection class) must not appear —
+    // it would mean the runtime ring has been clobbered.
+    expect(a.className).not.toMatch(/ring-ring/)
   })
 })
