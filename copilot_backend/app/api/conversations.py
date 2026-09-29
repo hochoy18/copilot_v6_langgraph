@@ -1,4 +1,4 @@
-"""`/api/v1/conversations` router — T10 / #40, T18 / #16, T20 / #43.
+"""`/api/v1/conversations` router — T10 / #40, T18 / #16, T20 / #43, T22 / #19.
 
 The thin HTTP seam for conversation CRUD, turn submission, and the
 HITL Plan approve / reject endpoints. Seven endpoints per ADR-0031:
@@ -37,12 +37,15 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
 
+from app.answer.service import AnswerService
 from app.conversations.service import (
     ConversationDetail,
     ConversationService,
 )
 from app.db.dependencies import (
+    get_answer_service,
     get_conversation_service,
+    get_plan_execution_repository,
     get_plan_executor,
     get_planner_service,
 )
@@ -53,7 +56,13 @@ from app.db.schemas import (
     Turn,
     User,
 )
+from app.llm.errors import (
+    LLMConfigurationError,
+    LLMGenerationError,
+    PromptUnavailableError,
+)
 from app.planner.service import PlannerService, TurnOutcome
+from app.repositories.plan_executions import PlanExecutionRepository
 from app.security.auth import get_current_user
 from app.tools.executor import PlanExecutionOutcome, PlanExecutor
 
@@ -103,9 +112,9 @@ class ConversationResponse(BaseModel):
 class ConversationDetailResponse(BaseModel):
     """Wire shape of `GET /api/v1/conversations/{id}`.
 
-    Wraps the conversation row alongside the message history and
-    the Plan DAG history. The Frontend's chat panel reads `turns`;
-    the React Flow renderer reads `plans` (T19).
+    Wraps the conversation row alongside the message history and the
+    Plan DAG history. The Frontend's chat panel reads `turns`; the
+    React Flow renderer reads `plans` (T19).
     """
 
     conversation: ConversationResponse
@@ -163,8 +172,7 @@ class TurnResponse(BaseModel):
     status `pending` — the HITL preview (T19/T20) consumes it from
     here; `None` when the Turn needed no Plan (smalltalk) or the
     Planner degraded (see `warnings`). Dict-typed like `turns` in the
-    detail response so new Plan fields don't force a client
-    redeploy.
+    detail response so new Plan fields don't force a client redeploy.
     """
 
     turn: dict[str, Any] = Field(description="The created user Turn row.")
@@ -377,7 +385,7 @@ async def archive_conversation(
 ) -> ConversationResponse:
     """`POST /api/v1/conversations/{id}/archive` — manual end.
 
-    Per ADR-0011 the explicit "结束会话" path moves the row into
+    Per ADR-0011 the explicit "结束会话" path moves a row into
     `idle`. The Frontend's "结束会话" button hits this endpoint;
     re-archiving is a no-op (already-archived rows stay archived).
     """
@@ -409,8 +417,8 @@ async def approve_plan(
     ADR-0005 a conversation has at most one "active" Plan at a time
     — that's the row the React Flow drawer is rendering. Status
     conflicts (Plan already approved / rejected / executing) raise
-    409 with code `plan_not_pending`; cross-user access surfaces
-    the same 404 envelope as an absent row.
+    409 with code `plan_not_pending`; cross-user access surfaces the
+    same 404 envelope as an absent row.
     """
     plan = await svc.approve_plan(
         conversation_id=conversation_id,
@@ -444,7 +452,7 @@ async def reject_plan(
 
 
 class PlanExecutionResponse(BaseModel):
-    """Wire shape of `POST /api/v1/conversations/{id}/plan/execute` — T21 / #18.
+    """Wire shape of `POST /api/v1/conversations/{id}/plan/execute` — T21 / #18, T22 / #19.
 
     Returns the post-execution Plan (status `succeeded` / `failed`)
     plus the `audit_log_ids` the Frontend can render alongside the
@@ -452,6 +460,15 @@ class PlanExecutionResponse(BaseModel):
     `plan_executions.node_results` and is fetched by a future
     conversation-detail endpoint; T21 only ships the high-level
     envelope.
+
+    T22 adds the streaming final-answer fields:
+
+    * `assistant_turn_id` — the persisted `assistant` Turn when the
+      final-answer LLM produced a non-empty reply. `None` on every
+      degraded path (LLM not configured, Plan failed, empty stream).
+    * `answer_degraded` — the human-readable reason when the LLM
+      step was skipped. Empty on the happy path so the chat panel
+      renders nothing extra.
     """
 
     plan: dict[str, Any] = Field(
@@ -463,33 +480,57 @@ class PlanExecutionResponse(BaseModel):
     audit_log_ids: list[str] = Field(
         description="One `audit_logs` row id per node, in execution order."
     )
+    assistant_turn_id: str | None = Field(
+        default=None,
+        description=(
+            "ObjectId of the `assistant` Turn persisted by the final-answer "
+            "stream (T22 / #19). `null` when the LLM step was skipped "
+            "(degraded configuration, Plan failed, empty stream)."
+        ),
+    )
+    answer_degraded: str = Field(
+        default="",
+        description=(
+            "Human-readable reason the final-answer stream was skipped, "
+            "empty on success. Surfaced to the chat panel."
+        ),
+    )
 
 
 @router.post(
     "/{conversation_id}/plan/execute",
     response_model=PlanExecutionResponse,
-    summary="Execute the conversation's approved Plan (T21 / #18)",
+    summary="Execute the conversation's approved Plan (T21 / #18, T22 / #19)",
 )
 async def execute_plan(
     conversation_id: str,
     user: User = Depends(get_current_user),  # noqa: B008
     svc: ConversationService = Depends(get_conversation_service),  # noqa: B008
     executor: PlanExecutor = Depends(get_plan_executor),  # noqa: B008
+    answer_service: AnswerService = Depends(get_answer_service),  # noqa: B008
+    plan_execution_repo: PlanExecutionRepository = Depends(  # noqa: B008
+        get_plan_execution_repository
+    ),
 ) -> PlanExecutionResponse:
-    """`POST /api/v1/conversations/{id}/plan/execute` — Worker trigger.
+    """`POST /api/v1/conversations/{id}/plan/execute` — Worker + answer trigger.
 
     Per ADR-0004 the Plan preview is mandatory and one-shot: the
     HITL flow is approve → execute. Approval flips the Plan to
     `approved`; this endpoint drives the Worker (T21) over every
-    node and writes the audit trail. Cross-user access surfaces the
-    same 404 envelope as an absent conversation; a Plan that isn't
-    in `approved` / `modified` raises 409 (the same envelope as
-    `PlanNotPendingError`).
+    node, writes the audit trail, and (T22 / #19) streams the LLM
+    final-answer reply on a successful run.
+
+    Cross-user access surfaces the same 404 envelope as an absent
+    conversation; a Plan that isn't in `approved` / `modified` raises
+    409 (the same envelope as `PlanNotPendingError`).
 
     Failures (HITL escalation, schema violation, upstream error)
     land here as a 200 with `plan.status = "failed"` — the call
     succeeded, the Plan didn't. The audit log ids tell the Frontend
-    where to drill in.
+    where to drill in. The final-answer stream is skipped on every
+    non-`succeeded` terminal (per `AnswerService.stream_final_answer`'s
+    contract); an LLM-layer error during streaming surfaces as the
+    same degradation warning the Planner path uses, never as a 5xx.
     """
     plan = await svc.get_latest_approved_plan(
         conversation_id=conversation_id,
@@ -502,10 +543,44 @@ async def execute_plan(
         conversation_id=conversation_id,
         turn_id=turn.id,
     )
+
+    # T22 / #19 — on a successful Plan, fetch the per-node results
+    # and stream the final-answer reply. We reload from the
+    # repository rather than threading `node_results` through the
+    # executor's outcome to keep T21's outcome shape stable.
+    assistant_turn_id: str | None = None
+    answer_degraded: str = ""
+    if outcome.plan.status == "succeeded":
+        execution_row = await plan_execution_repo.get(outcome.execution_id)
+        try:
+            answer_outcome = await answer_service.stream_final_answer(
+                conversation_id=conversation_id,
+                user_turn_id=turn.id,
+                plan=outcome.plan,
+                instruction=turn.content,
+                node_results=execution_row.node_results,
+            )
+        except (LLMConfigurationError, PromptUnavailableError, LLMGenerationError):
+            # Same degradation envelope the Planner path uses — an
+            # LLM-layer hiccup must not turn a successful Plan into
+            # a 5xx. The chat panel renders the tool outcomes from
+            # the audit log; the user just doesn't see an LLM
+            # summary.
+            answer_degraded = (
+                "Final-answer LLM stream failed; Plan results are visible "
+                "in the audit log without an LLM-written summary."
+            )
+        else:
+            if answer_outcome.assistant_turn is not None:
+                assistant_turn_id = answer_outcome.assistant_turn.id
+            answer_degraded = answer_outcome.degraded
+
     return PlanExecutionResponse(
         plan=_plan_to_dict(outcome.plan),
         execution_id=outcome.execution_id,
         audit_log_ids=outcome.audit_log_ids,
+        assistant_turn_id=assistant_turn_id,
+        answer_degraded=answer_degraded,
     )
 
 

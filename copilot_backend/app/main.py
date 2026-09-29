@@ -23,6 +23,7 @@ from app.api.admin_tools import router as admin_tools_router
 from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
+from app.answer.generator import AnswerGenerator
 from app.auth.login import build_state_store
 from app.auth.oidc import OIDCAdapter
 from app.db.mongo import MongoClient
@@ -110,6 +111,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chat_model_factory=lambda: build_chat_model(settings),
     )
     app.state.tool_planner = ToolPlanner(
+        settings=settings,
+        prompt_provider=prompt_provider,
+        chat_model_factory=lambda: build_chat_model(settings),
+    )
+    # T22 / #19 — the final-answer LLM call. Lazy chat-model build for
+    # the same reason as the description generator / Planner: an
+    # unconfigured LLM is allowed at boot (degraded-mode /healthz
+    # contract) so we never construct a ChatModel eagerly here.
+    app.state.answer_generator = AnswerGenerator(
         settings=settings,
         prompt_provider=prompt_provider,
         chat_model_factory=lambda: build_chat_model(settings),

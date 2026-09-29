@@ -30,6 +30,7 @@ from app.db.schemas import (
     TurnCreate,
 )
 from app.main import create_app
+from app.realtime.bus import SseEventBus
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.credentials import CredentialRepository
@@ -81,6 +82,10 @@ async def app(settings: Settings) -> FastAPI:
     app.state.credential_encryptor = AesGcmEncryptor(
         MasterKey(key_bytes=b"\x00" * 32, key_id="test-exec-routes")
     )
+    # T22 / #19 — the final-answer route reaches for the bus; tests
+    # that don't subscribe to the stream still need a process-wide
+    # instance on `app.state` so the dependency factory passes.
+    app.state.sse_bus = SseEventBus()
     await init_database(app.state.database)
     return app
 

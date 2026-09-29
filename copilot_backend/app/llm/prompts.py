@@ -49,6 +49,13 @@ TOOL_DESCRIPTION_GENERATOR_PROMPT = "tool-description-generator"
 # (T18 / #16, T25 multi-node upgrade edits the Langfuse copy only).
 PLANNER_PROMPT = "planner"
 
+# SPEC §Langfuse Prompt 列表: `result-summarizer` is the final-answer
+# Prompt (T22 / #19). After a Plan finishes, the user's instruction
+# plus the per-node Tool results render into `{{instruction}}` /
+# `{{results}}`, and the model streams a concise Chinese business-
+# language reply back to the chat panel.
+RESULT_SUMMARIZER_PROMPT = "result-summarizer"
+
 # Langfuse-style `{{variable}}` placeholder. `\w+` matches the variable
 # names we render; anything else (e.g. JSON braces in the template)
 # passes through untouched.
@@ -119,9 +126,31 @@ _BOOTSTRAP_PLANNER = """\
 不需要调用任何 Tool(闲聊 / 无法匹配)时输出 {"nodes": []}。
 """
 
+# Bootstrap fallback for `result-summarizer` (T22 / #19). The Prompt
+# takes the user's instruction plus the per-node execution results
+# (ordered, with status / response / error) and asks for a concise
+# Chinese reply — no preamble, no "好的" / "根据结果" prefix, no JSON
+# wrapper. The streamed output IS the answer, byte-for-byte.
+_BOOTSTRAP_RESULT_SUMMARIZER = """\
+你是企业 API Copilot 的回答生成助手。请把 Tool 执行结果整理成给业务人员的中文回答。
+
+用户原始问题:
+{{instruction}}
+
+Tool 执行结果(按 Plan 节点顺序, status / response / error 一起给出):
+{{results}}
+
+要求:
+1. 用业务人员易懂的语言回答, 直接给出结论或要点, 不要重复用户问题。
+2. 多节点结果时, 综合各节点信息形成整体答案, 不要逐条复述调用细节。
+3. 部分节点失败时, 简洁说明哪些步骤失败以及失败原因; 成功的部分照常呈现。
+4. 只输出回答正文, 不要任何前缀(如"好的"、"根据结果")或元说明, 也不要 JSON 围栏。
+"""
+
 _BOOTSTRAP_PROMPTS: dict[str, str] = {
     TOOL_DESCRIPTION_GENERATOR_PROMPT: _BOOTSTRAP_TOOL_DESCRIPTION_GENERATOR,
     PLANNER_PROMPT: _BOOTSTRAP_PLANNER,
+    RESULT_SUMMARIZER_PROMPT: _BOOTSTRAP_RESULT_SUMMARIZER,
 }
 
 
@@ -248,6 +277,7 @@ __all__ = [
     "PLANNER_PROMPT",
     "PromptProvider",
     "PromptTemplate",
+    "RESULT_SUMMARIZER_PROMPT",
     "TOOL_DESCRIPTION_GENERATOR_PROMPT",
     "render_template",
 ]

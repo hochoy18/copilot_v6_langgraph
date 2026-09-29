@@ -24,6 +24,8 @@ from app.auth.local import LocalLoginService
 from app.auth.login import OIDCLoginService, OIDCStateStore
 from app.auth.oidc import OIDCAdapter
 from app.auth.tokens import RefreshTokenService
+from app.answer.generator import AnswerGenerator
+from app.answer.service import AnswerService
 from app.conversations.service import ConversationService
 from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
@@ -390,6 +392,32 @@ async def get_tool_planner(
     )
 
 
+async def get_answer_generator(
+    request: Request,
+    settings: Settings = Depends(get_settings),  # noqa: B008  (FastAPI idiom)
+    prompt_provider: PromptProvider = Depends(get_prompt_provider),  # noqa: B008
+) -> AsyncIterator[AnswerGenerator]:
+    """FastAPI dependency: the shared `AnswerGenerator` (T22 / #19).
+
+    Mirrors `get_tool_planner`: the lifespan stashes the instance
+    on `app.state`, so a single AnswerGenerator amortises its lazily
+    built ChatModel across requests. Tests that want to drive the
+    streaming flow override this dependency outright; tests that
+    don't care about LLM behaviour let the lifespan-built default
+    stand and `AnswerService` short-circuits on `ready=False`.
+    """
+    existing = getattr(request.app.state, "answer_generator", None)
+    if isinstance(existing, AnswerGenerator):
+        yield existing
+        return
+
+    yield AnswerGenerator(
+        settings=settings,
+        prompt_provider=prompt_provider,
+        chat_model_factory=lambda: build_chat_model(settings),
+    )
+
+
 def get_planner_service(
     conversation_repo: ConversationRepository = Depends(get_conversation_repository),  # noqa: B008
     turn_repo: TurnRepository = Depends(get_turn_repository),  # noqa: B008
@@ -478,4 +506,38 @@ def get_sse_bus(request: Request) -> SseEventBus:
         message_zh="SSE 事件总线未初始化",
         message_en="SSE event bus not initialised; missing lifespan?",
         details={},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Answer service (T22 / #19) — declared after `get_sse_bus` because
+# its dependency chain references it directly.
+# ---------------------------------------------------------------------------
+
+
+def get_answer_service(
+    generator: AnswerGenerator = Depends(get_answer_generator),  # noqa: B008
+    bus: SseEventBus = Depends(get_sse_bus),  # noqa: B008
+    turn_repo: TurnRepository = Depends(get_turn_repository),  # noqa: B008
+    conversation_repo: ConversationRepository = Depends(get_conversation_repository),  # noqa: B008
+) -> AnswerService:
+    """FastAPI dependency: build an `AnswerService` for this request (T22 / #19).
+
+    Stateless beyond its collaborator references; a fresh instance
+    per request keeps the wiring aligned with the other shared
+    services (Planner / Conversation / Tool). Tests override this
+    dependency to swap in a fixture-built instance wired to a fake
+    generator / stub bus.
+    """
+    from datetime import datetime, timezone
+
+    def _now_utc() -> datetime:
+        return datetime.now(timezone.utc)
+
+    return AnswerService(
+        generator=generator,
+        sse_bus=bus,
+        turn_repository=turn_repo,
+        conversation_repository=conversation_repo,
+        now_fn=_now_utc,
     )
