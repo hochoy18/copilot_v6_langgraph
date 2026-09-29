@@ -14,22 +14,24 @@ would create import cycles.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC
 from typing import Any
 
 import httpx
 from fastapi import Depends, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from app.answer.generator import AnswerGenerator
+from app.answer.service import AnswerService
 from app.auth.local import LocalLoginService
 from app.auth.login import OIDCLoginService, OIDCStateStore
 from app.auth.oidc import OIDCAdapter
 from app.auth.tokens import RefreshTokenService
-from app.answer.generator import AnswerGenerator
-from app.answer.service import AnswerService
 from app.conversations.service import ConversationService
 from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
 from app.memory.plan_history import MilvusPlanHistoryWriter
+from app.memory.recall import MilvusPlanHistoryReader
 from app.planner.planner import ToolPlanner
 from app.planner.service import PlannerService
 from app.realtime.bus import SseEventBus
@@ -343,6 +345,31 @@ def get_milvus_plan_history_writer(
     return writer
 
 
+def get_milvus_plan_history_reader(
+    request: Request,
+) -> MilvusPlanHistoryReader | None:
+    """FastAPI dependency: return the long-term-memory reader (T32 / #28).
+
+    The reader is built once per process in the lifespan and stashed
+    on `app.state.milvus_plan_history_reader`. Tests override this
+    dependency to swap in a stub; production uses the
+    `InMemoryMilvusReader` instance the lifespan installed (the real
+    `pymilvus`-backed reader is a deliberate follow-up — ADR-0008
+    explicitly permits this degraded seam while the SDK lands).
+
+    Returns `None` if no reader was installed; the PlannerService
+    treats `None` as "no memory recall" and renders the empty
+    placeholder in `{{long_term_memory}}`. The `None` fallback is the
+    seam's documented graceful-degradation path — same contract as
+    `get_milvus_plan_history_writer` (T31): recall is best-effort,
+    and a missing reader is a no-op rather than a 5xx.
+    """
+    reader: MilvusPlanHistoryReader | None = getattr(
+        request.app.state, "milvus_plan_history_reader", None
+    )
+    return reader
+
+
 def get_plan_executor(
     plan_repo: PlanRepository = Depends(get_plan_repository),  # noqa: B008
     plan_execution_repo: PlanExecutionRepository = Depends(get_plan_execution_repository),  # noqa: B008
@@ -435,6 +462,8 @@ async def get_tool_planner(
         settings=settings,
         prompt_provider=prompt_provider,
         chat_model_factory=lambda: build_chat_model(settings),
+        memory_window_k=settings.memory_window_k,
+        memory_recall_top_n=settings.memory_recall_top_n,
     )
 
 
@@ -470,6 +499,7 @@ def get_planner_service(
     plan_repo: PlanRepository = Depends(get_plan_repository),  # noqa: B008
     tool_repo: ToolRepository = Depends(get_tool_repository),  # noqa: B008
     planner: ToolPlanner = Depends(get_tool_planner),  # noqa: B008
+    milvus_reader: MilvusPlanHistoryReader | None = Depends(get_milvus_plan_history_reader),  # noqa: B008
 ) -> PlannerService:
     """FastAPI dependency: build a `PlannerService` for this request.
 
@@ -477,6 +507,14 @@ def get_planner_service(
     `ToolPlanner` does the caching); a fresh instance per request keeps
     the repository wiring request-scoped like the conversation
     service's.
+
+    T32 / #28 threads `milvus_reader` through: the service asks the
+    reader for the Top-N most-similar historical Plan summaries
+    before each Planner call and renders them into the
+    `{{long_term_memory}}` Prompt slot. `None` is the documented
+    graceful-degradation path — a deployment that hasn't wired the
+    reader yet skips recall and renders the empty placeholder,
+    same envelope as the writer seam in the Executor (T31).
     """
     return PlannerService(
         conversation_repository=conversation_repo,
@@ -484,6 +522,7 @@ def get_planner_service(
         plan_repository=plan_repo,
         tool_repository=tool_repo,
         planner=planner,
+        milvus_reader=milvus_reader,
     )
 
 
@@ -575,10 +614,10 @@ def get_answer_service(
     dependency to swap in a fixture-built instance wired to a fake
     generator / stub bus.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     def _now_utc() -> datetime:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
 
     return AnswerService(
         generator=generator,

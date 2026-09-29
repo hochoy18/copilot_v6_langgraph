@@ -32,6 +32,7 @@ from app.health import HealthChecker
 from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
 from app.memory.plan_history import InMemoryMilvusWriter
+from app.memory.recall import InMemoryMilvusReader
 from app.planner.planner import ToolPlanner
 from app.realtime.bus import SseEventBus
 from app.realtime.stream import router as sse_router
@@ -117,6 +118,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         prompt_provider=prompt_provider,
         chat_model_factory=lambda: build_chat_model(settings),
         memory_window_k=settings.memory_window_k,
+        memory_recall_top_n=settings.memory_recall_top_n,
     )
     # T22 / #19 — the final-answer LLM call. Lazy chat-model build for
     # the same reason as the description generator / Planner: an
@@ -138,7 +140,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # dedicated SDK ticket) — ADR-0008 explicitly permits a degraded
     # write path while the SDK lands: Milvus is the derived index,
     # MongoDB is the truth.
-    app.state.milvus_plan_history_writer = InMemoryMilvusWriter()
+    milvus_plan_history_writer = InMemoryMilvusWriter()
+    app.state.milvus_plan_history_writer = milvus_plan_history_writer
+    # T32 / #28 — long-term-memory Plan-history reader. The reader
+    # wraps the same in-memory store the writer pushes into, so a
+    # test that runs the Executor (T31's seam) and then the Planner
+    # (T32's seam) sees the records it just wrote. Production swaps
+    # the writer / reader pair to a `pymilvus`-backed one — the
+    # reader is constructed with the writer instance so the seam
+    # carries one store across the two protocols. ADR-0008 explicitly
+    # permits a degraded read path while the SDK lands: a missing
+    # reader is best-effort, not a 5xx.
+    app.state.milvus_plan_history_reader = InMemoryMilvusReader(
+        milvus_plan_history_writer
+    )
     try:
         await _probe_dependencies(settings)
         yield

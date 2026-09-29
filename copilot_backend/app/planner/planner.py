@@ -54,6 +54,7 @@ from app.db.schemas import Tool
 from app.llm.errors import LLMGenerationError
 from app.llm.output import content_to_text, extract_json_object
 from app.llm.prompts import PLANNER_PROMPT, PromptProvider, render_template
+from app.memory.recall import DEFAULT_RECALL_TOP_N
 from app.planner.memory import DEFAULT_MEMORY_WINDOW_K
 from app.settings import Settings
 from app.tools.description_generator import summarize_parameters
@@ -142,11 +143,13 @@ class ToolPlanner:
         prompt_provider: PromptProvider,
         chat_model_factory: Callable[[], BaseChatModel],
         memory_window_k: int = DEFAULT_MEMORY_WINDOW_K,
+        memory_recall_top_n: int = DEFAULT_RECALL_TOP_N,
     ) -> None:
         self._settings = settings
         self._prompts = prompt_provider
         self._model_factory = chat_model_factory
         self._memory_window_k = memory_window_k
+        self._memory_recall_top_n = memory_recall_top_n
         self._model: BaseChatModel | None = None
 
     @property
@@ -164,12 +167,25 @@ class ToolPlanner:
         """
         return self._memory_window_k
 
+    @property
+    def memory_recall_top_n(self) -> int:
+        """How many historical Plan summaries the service must recall (T32 / ADR-0007).
+
+        Exposed so the orchestration code can hand the right `top_n`
+        to the Milvus reader without holding a parallel reference to
+        the configured value. Always `>= 1` after construction; the
+        reader treats `<= 0` as "skip recall" but the constructor's
+        default and the Settings binding both pin a positive floor.
+        """
+        return self._memory_recall_top_n
+
     async def plan(
         self,
         instruction: str,
         tools: Sequence[Tool],
         *,
         memory_window: str = "",
+        long_term_memory: str = "",
     ) -> PlanIntent:
         """Run one Planner turn against the given catalog.
 
@@ -184,6 +200,14 @@ class ToolPlanner:
                 conversation itself — the service is the seam that
                 builds and sizes the window, and it always hands a
                 fully rendered block here.
+            long_term_memory: the Milvus-recalled Top-N historical
+                Plan summaries already rendered by
+                `app.memory.recall.render_recall_block` (T32 /
+                ADR-0007). Empty string for the cold-start case;
+                passed through verbatim into the `{{long_term_memory}}`
+                Prompt slot. Same "service is the seam" rule as
+                `memory_window`: the planner never reads Milvus
+                itself, and a fully rendered block is always handed in.
 
         Raises:
             LLMConfigurationError: provider refused by config (ADR-0016)
@@ -199,6 +223,7 @@ class ToolPlanner:
                 "tools": render_tool_catalog(tools),
                 "input": instruction,
                 "memory_window": memory_window,
+                "long_term_memory": long_term_memory,
             },
         )
 

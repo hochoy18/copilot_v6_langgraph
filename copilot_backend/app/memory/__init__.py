@@ -1,16 +1,18 @@
 """Long-term memory seam (ADR-0007 / ADR-0008).
 
-T31 (#27) ships the *write* half: `PlanExecutor` funnels terminal
-Plans into the `plan_history_vectors` Milvus collection so T32 (#28)
-can recall them by semantic similarity. The seam is stable enough to
-be the read side's input contract — recall lands in a follow-up.
+T31 (#27) shipped the *write* half: `PlanExecutor` funnels terminal
+Plans into the `plan_history_vectors` Milvus collection. T32 (#28)
+ships the *read* half: the Planner asks the reader for the Top-N
+most-similar historical Plan summaries and renders them into the
+`{{long_term_memory}}` Prompt section.
 
 The seam is best-effort by design (ADR-0008 "Milvus 重建不影响业务"):
-a Milvus write failure must never unwind a Plan execution. The
-writer contract is `upsert_summary(record)`; the production swap-in
-is a `pymilvus`-backed implementation that lands alongside T32 (or
-in a dedicated SDK ticket). For T31 the default implementation is
-`InMemoryMilvusWriter` — same surface, recorded calls.
+a Milvus write or recall failure must never unwind a Plan execution
+or a Planner call. The writer contract is `upsert_summary(record)`;
+the reader contract is `search(query, *, top_n)`. The production
+swap-in is a `pymilvus`-backed pair that lands in a dedicated SDK
+ticket; for T31/T32 the default is the in-memory recorder pair —
+same surface, recorded calls.
 """
 from __future__ import annotations
 
@@ -21,12 +23,24 @@ from app.memory.plan_history import (
     PlanHistoryRecord,
     summarize_plan,
 )
+from app.memory.recall import (
+    DEFAULT_RECALL_TOP_N,
+    InMemoryMilvusReader,
+    MilvusPlanHistoryReader,
+    PlanHistoryMatch,
+    render_recall_block,
+)
 
 __all__ = [
     "DEFAULT_EMBEDDING_DIM",
+    "DEFAULT_RECALL_TOP_N",
+    "InMemoryMilvusReader",
     "InMemoryMilvusWriter",
+    "MilvusPlanHistoryReader",
     "MilvusPlanHistoryWriter",
+    "PlanHistoryMatch",
     "PlanHistoryRecord",
     "embed_text",
+    "render_recall_block",
     "summarize_plan",
 ]

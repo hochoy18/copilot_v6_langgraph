@@ -41,6 +41,7 @@ and the user can rephrase.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from app.conversations.errors import (
@@ -63,6 +64,10 @@ from app.llm.errors import (
     LLMGenerationError,
     PromptUnavailableError,
 )
+from app.memory.recall import (
+    MilvusPlanHistoryReader,
+    render_recall_block,
+)
 from app.planner.memory import build_memory_window
 from app.planner.planner import PlannedEdge, PlannedNode, ToolPlanner
 from app.repositories.conversations import ConversationRepository
@@ -74,6 +79,8 @@ from app.repositories.turns import TurnRepository
 # enforces 512 max; clamping beats a validation error over an LLM
 # that rambles.
 _MAX_NOTES_LENGTH = 512
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -108,12 +115,20 @@ class PlannerService:
         plan_repository: PlanRepository,
         tool_repository: ToolRepository,
         planner: ToolPlanner,
+        milvus_reader: MilvusPlanHistoryReader | None = None,
     ) -> None:
         self._conversations = conversation_repository
         self._turns = turn_repository
         self._plans = plan_repository
         self._tools = tool_repository
         self._planner = planner
+        # `None` is the documented graceful-degradation path: a
+        # deployment that hasn't wired the reader yet (the seam is
+        # best-effort, same contract as `milvus_writer` in the
+        # Executor / T31) skips recall entirely. The rendered block
+        # in that case is the empty placeholder — the LLM still sees
+        # a recognisable string in the `{{long_term_memory}}` slot.
+        self._milvus_reader = milvus_reader
 
     async def submit_turn(
         self,
@@ -171,9 +186,23 @@ class PlannerService:
                     conversation_id=conversation_id,
                     excluding_turn_id=turn.id,
                 )
+                # T32 / #28 — long-term-memory recall. The reader
+                # surfaces the Top-N most-similar historical Plan
+                # summaries (across all conversations, including this
+                # one) so the LLM can resolve cross-session references
+                # like "上周那个". Best-effort: a reader-not-wired or
+                # search-raised path falls back to the empty placeholder
+                # rather than unwinding the Planner call — same
+                # graceful-degradation contract as the writer (T31).
+                long_term_memory = await self._build_long_term_memory(
+                    instruction=content,
+                )
                 try:
                     intent = await self._planner.plan(
-                        content, tools, memory_window=memory_window,
+                        content,
+                        tools,
+                        memory_window=memory_window,
+                        long_term_memory=long_term_memory,
                     )
                 except (
                     LLMConfigurationError,
@@ -254,6 +283,40 @@ class PlannerService:
             plans_by_turn_id,
             k=k,
         )
+
+    async def _build_long_term_memory(self, *, instruction: str) -> str:
+        """Recall the Top-N historical Plan summaries for `instruction` (T32 / #28).
+
+        Delegates to `MilvusPlanHistoryReader.search` and renders the
+        matches through `render_recall_block`. Two non-fatal paths:
+
+        * Reader not wired (`None`) — returns the empty placeholder.
+          Same graceful-degradation as the writer seam in the Executor:
+          a deployment that hasn't installed the Milvus SDK skips
+          recall without taking down the Planner call.
+        * Search raised — logged and swallowed; returns the empty
+          placeholder. ADR-0008 forbids the recall path from
+          unwinding a successful Planner call.
+
+        `top_n` is read off the configured `ToolPlanner` so the service
+        never holds a parallel reference to the value — the seam is
+        one place to change.
+        """
+        if self._milvus_reader is None:
+            return render_recall_block([])
+        try:
+            matches = await self._milvus_reader.search(
+                instruction,
+                top_n=self._planner.memory_recall_top_n,
+            )
+        except Exception:
+            logger.exception(
+                "milvus plan_history recall failed (top_n=%d); "
+                "falling back to empty long-term-memory placeholder",
+                self._planner.memory_recall_top_n,
+            )
+            return render_recall_block([])
+        return render_recall_block(matches)
 
     async def _persist_plan(
         self,

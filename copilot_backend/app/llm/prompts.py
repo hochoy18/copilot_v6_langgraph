@@ -101,7 +101,7 @@ HTTP 方法与路径: {{method}} {{path}}
 其中 typical_use_cases 为 2-4 条中文短句。
 """
 
-# Bootstrap fallback for `planner` (T18 / #16, T25 / #22, T30 / #26). Same
+# Bootstrap fallback for `planner` (T18 / #16, T25 / #22, T30 / #26, T32 / #28). Same
 # contract the Langfuse copy must keep: strict-JSON output, `nodes`
 # array, Tool names drawn from the rendered catalog, plus (T25)
 # `edges` for data-dependency DAGs. `edges` is optional: omit it
@@ -114,6 +114,16 @@ HTTP 方法与路径: {{method}} {{path}}
 # like "上周那个项目". When the window is empty (cold start) the
 # placeholder reads "(当前没有历史对话 / no prior turns)" — never the
 # literal "None".
+#
+# T32 / #28 adds `{{long_term_memory}}` for the Milvus-recalled
+# Top-N historical Plan summaries (ADR-0007 长期记忆). The slot is
+# separate from the memory window because the two streams answer
+# different questions — window = "what did we just talk about in
+# this conversation?", long-term = "have we done something like this
+# before across sessions?". When recall comes up empty (cold start
+# or no matches) the placeholder reads
+# "(当前没有相关历史 Plan / no matching history)" — never the literal
+# "None".
 _BOOTSTRAP_PLANNER = """\
 你是企业 API Copilot 的 Planner。请把业务人员的自然语言指令翻译成 Tool 调用计划(可以有多个节点)。
 
@@ -122,6 +132,9 @@ _BOOTSTRAP_PLANNER = """\
 
 近期对话记忆(最近 K 轮用户原文, K 可配, 默认 5; 没有历史时显示占位):
 {{memory_window}}
+
+长期记忆(从 Milvus 召回的历史 Plan 摘要, Top-N, N 可配, 默认 3; 没有相关历史时显示占位):
+{{long_term_memory}}
 
 用户指令: {{input}}
 

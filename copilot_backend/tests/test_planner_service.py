@@ -29,6 +29,12 @@ from app.conversations.errors import (
 from app.db.errors import NotFoundError
 from app.db.schemas import ConversationCreate, PlanEdge, ToolCreate, TurnCreate
 from app.llm.prompts import PromptProvider
+from app.memory.embedding import embed_text
+from app.memory.plan_history import (
+    InMemoryMilvusWriter,
+    PlanHistoryRecord,
+)
+from app.memory.recall import InMemoryMilvusReader
 from app.planner.planner import ToolPlanner
 from app.planner.service import PlannerService
 from app.repositories.conversations import ConversationRepository
@@ -105,6 +111,7 @@ def _planner(
     should_fail: bool = False,
     configured: bool = True,
     memory_window_k: int | None = None,
+    memory_recall_top_n: int | None = None,
 ) -> tuple[ToolPlanner, _FakeChatModel]:
     fake = _FakeChatModel(response_text=response_text, should_fail=should_fail)
     settings = Settings(
@@ -124,6 +131,8 @@ def _planner(
     kwargs: dict[str, object] = {}
     if memory_window_k is not None:
         kwargs["memory_window_k"] = memory_window_k
+    if memory_recall_top_n is not None:
+        kwargs["memory_recall_top_n"] = memory_recall_top_n
     return (
         ToolPlanner(
             settings=settings,
@@ -142,6 +151,7 @@ def _service(
     plan_repo: PlanRepository,
     tool_repo: ToolRepository,
     planner: ToolPlanner,
+    milvus_reader: object | None = None,
 ) -> PlannerService:
     return PlannerService(
         conversation_repository=conversation_repo,
@@ -149,6 +159,7 @@ def _service(
         plan_repository=plan_repo,
         tool_repository=tool_repo,
         planner=planner,
+        milvus_reader=milvus_reader,  # type: ignore[arg-type]
     )
 
 
@@ -882,3 +893,330 @@ class TestPlannerMemoryWindow:
         # The Plan summary line for the linked Plan appears too.
         assert "本轮 Plan" in second_prompt
         assert "echo" in second_prompt
+
+
+class TestPlannerLongTermMemory:
+    """End-to-end coverage of the T32 / #28 wiring.
+
+    The pure reader / renderer are pinned in
+    `test_plan_history_recall.py`; this class pins the integration:
+    the service asks the reader for the Top-N matches before each
+    Planner call, hands them through `render_recall_block`, and the
+    resulting block lands inside the LLM-facing prompt on the
+    `{{long_term_memory}}` slot.
+
+    Each test wires the same `InMemoryMilvusWriter` /
+    `InMemoryMilvusReader` pair the production lifespan installs (one
+    shared store, two protocol-flavoured views) so the seam is
+    exercised end-to-end without a Milvus SDK on the box.
+    """
+
+    async def test_cold_start_renders_empty_long_term_memory(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """No Milvus records wired → the documented placeholder, not 'None'.
+
+        The reader is wired but its store is empty (no prior Plans),
+        so the LLM sees the empty-recall placeholder in
+        `{{long_term_memory}}`. This guards against a prompt against
+        the contract seeing a literal `None` — the same
+        "no-empty-slots" rule T30's memory window honours.
+        """
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        writer = InMemoryMilvusWriter()
+        reader = InMemoryMilvusReader(writer)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+            milvus_reader=reader,
+        )
+
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="first turn",
+        )
+
+        prompt = fake.seen_prompts[0]
+        # The placeholder is the same string the bootstrap prompt
+        # documents — exact match keeps the contract pinned.
+        assert "(当前没有相关历史 Plan / no matching history)" in prompt
+        # The placeholder is *not* the literal "None".
+        assert "long_term_memory=None" not in prompt
+        # No raw placeholder leaked through the template renderer.
+        assert "{{long_term_memory}}" not in prompt
+
+    async def test_recall_renders_top_match_into_prompt(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """A matching prior Plan lands in the `{{long_term_memory}}` slot.
+
+        Sets up a corpus with one A-side record whose text reuses
+        tokens from the current instruction; the next Planner call
+        must surface A's summary in the rendered block.
+        """
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        writer = InMemoryMilvusWriter()
+        # A prior Plan from conversation-A that matches the upcoming
+        # query — the seam exists to surface exactly this kind of
+        # "上周那个"-style reference.
+        writer.records.append(
+            PlanHistoryRecord(
+                plan_id="plan-A",
+                conversation_id="conv-A",
+                text="列出 客户列表 区域=亚太",
+                vector=embed_text("列出 客户列表 区域=亚太"),
+            )
+        )
+        reader = InMemoryMilvusReader(writer)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+            milvus_reader=reader,
+        )
+
+        await svc.submit_turn(
+            conversation_id=conv_id,
+            user_id=_USER_ID,
+            content="客户列表 区域=亚太 上周那个",
+        )
+
+        prompt = fake.seen_prompts[0]
+        # The match is rendered into the slot — both the
+        # conversation / plan ids and the text body make it through.
+        assert "[历史 1]" in prompt
+        assert "conv=conv-A" in prompt
+        assert "plan=plan-A" in prompt
+        assert "列出 客户列表 区域=亚太" in prompt
+        # The empty-placeholder text must NOT also appear — a match
+        # landed, so the placeholder is replaced by the rendered block.
+        assert "(当前没有相关历史 Plan" not in prompt
+        # No raw placeholder leaked through the template renderer.
+        assert "{{long_term_memory}}" not in prompt
+
+    async def test_cross_session_recall(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """AC #1: 会话 A Plan → 会话 B 提上周那个 → B 收到 A 摘要.
+
+        A conversation-A Plan lands in Milvus first; a follow-up
+        turn in conversation B with a "上周那个"-style reference
+        must surface A's summary in the next Planner call. The
+        reader does not filter by `conversation_id` — long-term
+        memory exists precisely for cross-session recall.
+        """
+        # Seed conversation A and a Plan in it. The Plan is what
+        # the executor would have written; we hand-instantiate so
+        # the test exercises the recall seam in isolation from the
+        # Executor (T31).
+        conv_a_id = await _seed_conversation(
+            conversation_repo, user_id=_USER_ID,
+        )
+        # Seed conversation B (where the user types the follow-up).
+        conv_b_id = await _seed_conversation(
+            conversation_repo, user_id=_USER_ID,
+        )
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        writer = InMemoryMilvusWriter()
+        writer.records.append(
+            PlanHistoryRecord(
+                plan_id="plan-A",
+                conversation_id=conv_a_id,
+                text="列出 客户列表 区域=亚太",
+                vector=embed_text("列出 客户列表 区域=亚太"),
+            )
+        )
+        reader = InMemoryMilvusReader(writer)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+            milvus_reader=reader,
+        )
+
+        # The user in conversation B says "上周那个"-style reference.
+        await svc.submit_turn(
+            conversation_id=conv_b_id,
+            user_id=_USER_ID,
+            content="客户列表 区域=亚太 上周那个",
+        )
+
+        prompt = fake.seen_prompts[0]
+        # A's record is rendered — the cross-session scenario works.
+        assert f"conv={conv_a_id}" in prompt
+        assert "plan=plan-A" in prompt
+        assert "列出 客户列表 区域=亚太" in prompt
+        # Empty-placeholder text must not also appear — the match
+        # replaced it.
+        assert "(当前没有相关历史 Plan" not in prompt
+
+    async def test_top_n_two_truncates_to_two(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """AC #2: Top-N 默认 3 可配置.
+
+        With `memory_recall_top_n=2`, only the top-2 most-similar
+        matches reach the prompt. The other 3 records are filtered
+        out at the reader, not by the renderer.
+        """
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON, memory_recall_top_n=2)
+        writer = InMemoryMilvusWriter()
+        for index in range(5):
+            text = f"客户列表 第 {index} 次"
+            writer.records.append(
+                PlanHistoryRecord(
+                    plan_id=f"plan-{index}",
+                    conversation_id="conv-shared",
+                    text=text,
+                    vector=embed_text(text),
+                )
+            )
+        reader = InMemoryMilvusReader(writer)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+            milvus_reader=reader,
+        )
+
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="客户列表",
+        )
+
+        prompt = fake.seen_prompts[0]
+        # Top-2 only — exactly two `[历史 ` markers in the rendered block.
+        assert prompt.count("[历史 ") == 2
+
+    async def test_default_top_n_three_when_unset(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """AC #2: Top-N 默认 3.
+
+        With `memory_recall_top_n` left at its default (3), only the
+        top-3 most-similar matches reach the prompt. Verifies the
+        default value the SPEC floors against.
+        """
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        # `memory_recall_top_n=None` ⇒ falls back to the ToolPlanner's
+        # default, which is `DEFAULT_RECALL_TOP_N = 3`.
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        writer = InMemoryMilvusWriter()
+        for index in range(5):
+            text = f"客户列表 第 {index} 次"
+            writer.records.append(
+                PlanHistoryRecord(
+                    plan_id=f"plan-{index}",
+                    conversation_id="conv-shared",
+                    text=text,
+                    vector=embed_text(text),
+                )
+            )
+        reader = InMemoryMilvusReader(writer)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+            milvus_reader=reader,
+        )
+
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="客户列表",
+        )
+
+        prompt = fake.seen_prompts[0]
+        assert prompt.count("[历史 ") == 3
+
+    async def test_reader_not_wired_renders_empty_placeholder(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """A reader-less service degrades to the empty placeholder.
+
+        Matches the graceful-degradation contract the executor
+        honours for the writer seam (T31): a missing collaborator
+        is a no-op, not a 5xx. The LLM still sees a recognisable
+        string in the slot.
+        """
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+            milvus_reader=None,
+        )
+
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="hello",
+        )
+
+        prompt = fake.seen_prompts[0]
+        # Same placeholder the empty-corpus path renders.
+        assert "(当前没有相关历史 Plan / no matching history)" in prompt
+
+    async def test_reader_raised_does_not_abort_planner(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """A raising reader is logged and swallowed.
+
+        ADR-0008 forbids the recall path from unwinding a
+        successful Planner call. The user Turn lands, the Plan
+        lands (the LLM was reached with the placeholder), no
+        exception propagates out of `submit_turn`.
+        """
+
+        class _RaisingReader:
+            async def search(self, query: str, *, top_n: int) -> list[object]:
+                raise RuntimeError("milvus sdk exploded")
+
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+            milvus_reader=_RaisingReader(),
+        )
+
+        outcome = await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="hello",
+        )
+
+        # Turn lands. Plan lands (the planner still saw the empty
+        # placeholder and produced a valid answer). No exception.
+        assert outcome.turn is not None
+        assert outcome.plan is not None
+        # The LLM saw the placeholder, not the exception text.
+        prompt = fake.seen_prompts[0]
+        assert "(当前没有相关历史 Plan / no matching history)" in prompt
+        assert "milvus sdk exploded" not in prompt

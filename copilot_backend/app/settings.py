@@ -106,6 +106,26 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---- Long-term memory recall (T32 / #28, ADR-0007) -------------------
+    # How many historical Plan summaries the Planner receives alongside
+    # the recent-K memory window. T32 (#28) asks the Milvus reader for
+    # the Top-N most-similar `plan_history_vectors` rows for the current
+    # instruction and renders them as the `{{long_term_memory}}` Prompt
+    # slot. Default 3 per SPEC; operators widen when "上周那个"-style
+    # cross-session references dominate and tighten when the budget is
+    # tight. Minimum 1 — a value of 0 would silence recall entirely
+    # and lose the cross-session continuity the seam exists to provide.
+    memory_recall_top_n: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description=(
+            "Top-N historical Plan summaries the Planner sees as "
+            "long-term memory (T32 / ADR-0007 '长期记忆'). Default 3 "
+            "per SPEC; configure to widen/narrow recall."
+        ),
+    )
+
     # ---- LLM Provider (T16 / #14, ADR-0014 / ADR-0016) -------------------
     # The LangChain ChatModel seam. Every LLM call in the backend is
     # made against an OpenAI-compatible endpoint built from these three
