@@ -3,7 +3,7 @@ import { cleanup, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { LoginPage } from '@/pages/LoginPage'
-import { renderWithRouter } from '@/test-utils'
+import { jsonResponse, mockFetch, renderWithRouter } from '@/test-utils'
 
 /**
  * LoginPage — T08 / #9 AC: "点登录跳 IdP".
@@ -13,22 +13,6 @@ import { renderWithRouter } from '@/test-utils'
  * fetch side and the navigation side separately so we can verify
  * both halves without coupling them.
  */
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-}
-
-function mockFetch(responses: ReadonlyArray<Response>): ReturnType<typeof vi.fn> {
-  const fn = vi.fn()
-  for (const response of responses) {
-    fn.mockResolvedValueOnce(response)
-  }
-  globalThis.fetch = fn as unknown as typeof fetch
-  return fn
-}
 
 /**
  * jsdom's `window.location` is read-only by default; we replace it

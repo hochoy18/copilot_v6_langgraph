@@ -19,7 +19,7 @@
  * because every consumer of the store needs to mutate it, not just
  * the auth shell.
  */
-import { apiFetch } from '@/lib/api-client'
+import { ApiError, apiFetch } from '@/lib/api-client'
 import type { AuthUser } from '@/stores/auth'
 
 /**
@@ -36,7 +36,8 @@ export interface SsoLoginStartResponse {
  * Wire shape of `POST /api/v1/auth/sso/callback`. Mirrors the
  * refresh endpoint so a single parser feeds both call sites
  * (ADR-0009 §"Refresh Token" — the spec calls for the same envelope
- * for token issuance and rotation).
+ * for token issuance and rotation). The auth store also consumes
+ * the same shape from `/auth/refresh` (T08b / #49).
  */
 export interface SsoLoginCompleteResponse {
   access_token: string
@@ -75,4 +76,29 @@ export async function completeSsoLogin(
     method: 'POST',
     body: JSON.stringify({ code, state }),
   })
+}
+
+/**
+ * Render an `ApiError` from the SSO surface as a Chinese sentence
+ * the user can act on. `prefix` describes the call that failed
+ * ("登录失败", "无法发起登录") so the same helper drives the
+ * login + callback pages without each page re-deriving the error
+ * envelope shape.
+ *
+ * Returns the backend's `message_zh` when present (ADR-0031
+ * guarantees it on every error response); falls back to a generic
+ * sentence for transport failures (no body to draw from).
+ */
+export function formatAuthApiError(err: unknown, prefix: string): string {
+  if (err instanceof ApiError) {
+    const body = err.body as { message_zh?: unknown } | null
+    if (body && typeof body.message_zh === 'string') {
+      return body.message_zh
+    }
+    return `${prefix} (HTTP ${err.status}), 请稍后重试。`
+  }
+  if (err instanceof TypeError) {
+    return '无法连接后端服务, 请确认服务已启动。'
+  }
+  return '发生未知错误, 请重试。'
 }

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, screen, waitFor } from '@testing-library/react'
 
 import App from '@/App'
-import { renderWithRouter } from '@/test-utils'
+import { jsonResponse, mockFetch, renderWithRouter, makeAuthUser } from '@/test-utils'
 import { useAuthStore } from '@/stores/auth'
 
 /**
@@ -25,35 +25,16 @@ import { useAuthStore } from '@/stores/auth'
  * after the redirect.
  */
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-}
-
-function mockFetch(responses: ReadonlyArray<Response>): ReturnType<typeof vi.fn> {
-  const fn = vi.fn()
-  for (const response of responses) {
-    fn.mockResolvedValueOnce(response)
-  }
-  globalThis.fetch = fn as unknown as typeof fetch
-  return fn
-}
-
 const callbackResponse = {
   access_token: 'jwt.callback',
   refresh_token: 'rt.callback',
   token_type: 'Bearer',
   expires_in: 900,
-  user: {
+  user: makeAuthUser({
     id: 'u-callback',
     email: 'alice@example.com',
     display_name: 'Alice Liu',
-    source: 'sso',
-    username: null,
-    role_ids: [],
-  },
+  }),
 }
 
 beforeEach(() => {

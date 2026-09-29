@@ -21,24 +21,7 @@
 import { useState } from 'react'
 
 import { Button } from '@/components/ui/button'
-import { ApiError } from '@/lib/api-client'
-import { startSsoLogin } from '@/lib/auth-api'
-
-/**
- * Surface a network / API failure as a Chinese sentence the user
- * can act on. Lives here (not in `auth-api.ts`) because the only
- * caller that renders this string is this page; future admin /
- * programmatic callers can branch on `ApiError.status` directly.
- */
-function formatStartError(err: unknown): string {
-  if (err instanceof ApiError) {
-    return `无法发起登录 (HTTP ${err.status}), 请稍后重试。`
-  }
-  if (err instanceof TypeError) {
-    return '无法连接后端服务, 请确认服务已启动。'
-  }
-  return '发生未知错误, 请重试。'
-}
+import { formatAuthApiError, startSsoLogin } from '@/lib/auth-api'
 
 export function LoginPage(): React.ReactElement {
   const [error, setError] = useState<string | null>(null)
@@ -57,7 +40,7 @@ export function LoginPage(): React.ReactElement {
       const { authorization_url } = await startSsoLogin()
       window.location.assign(authorization_url)
     } catch (err) {
-      setError(formatStartError(err))
+      setError(formatAuthApiError(err, '无法发起登录'))
       setLoading(false)
     }
   }

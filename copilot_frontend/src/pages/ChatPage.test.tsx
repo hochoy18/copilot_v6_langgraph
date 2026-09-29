@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
-import { renderWithRouter } from '@/test-utils'
+import { jsonResponse, makeAuthUser, mockFetch, renderWithRouter } from '@/test-utils'
 import { ChatPage } from '@/pages/ChatPage'
 import { useAuthStore } from '@/stores/auth'
 import { usePlanDrawerStore } from '@/stores/plan-drawer'
@@ -66,22 +66,6 @@ function turnResponse(overrides: Partial<TurnResponse> = {}): TurnResponse {
     warnings: [],
     ...overrides,
   }
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-}
-
-function mockFetch(responses: ReadonlyArray<Response>): ReturnType<typeof vi.fn> {
-  const fn = vi.fn()
-  for (const response of responses) {
-    fn.mockResolvedValueOnce(response)
-  }
-  globalThis.fetch = fn as unknown as typeof fetch
-  return fn
 }
 
 const conversationResponse = {
@@ -217,14 +201,11 @@ describe('ChatPage', () => {
       refreshToken: 'rt',
       expiresAt: Date.now() + 900_000,
       refreshFailed: false,
-      user: {
+      user: makeAuthUser({
         id: 'u1',
         email: 'alice@example.com',
         display_name: 'Alice Liu',
-        source: 'sso',
-        username: null,
-        role_ids: [],
-      },
+      }),
     })
     renderWithRouter(<ChatPage />)
     expect(screen.getByTestId('chat-username')).toHaveTextContent('Alice Liu')
@@ -236,14 +217,11 @@ describe('ChatPage', () => {
       refreshToken: 'rt',
       expiresAt: Date.now() + 900_000,
       refreshFailed: false,
-      user: {
+      user: makeAuthUser({
         id: 'u1',
         email: 'alice@example.com',
         display_name: '',
-        source: 'sso',
-        username: null,
-        role_ids: [],
-      },
+      }),
     })
     renderWithRouter(<ChatPage />)
     expect(screen.getByTestId('chat-username')).toHaveTextContent('alice@example.com')

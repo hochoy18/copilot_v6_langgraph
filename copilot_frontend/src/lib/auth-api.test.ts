@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError } from '@/lib/api-client'
 import { completeSsoLogin, startSsoLogin } from '@/lib/auth-api'
+import { jsonResponse, mockFetch } from '@/test-utils'
 
 /**
  * `auth-api` — T08 / #9. The two SSO call sites:
@@ -12,22 +13,6 @@ import { completeSsoLogin, startSsoLogin } from '@/lib/auth-api'
  * `fetch` is stubbed per test so we exercise the real `apiFetch`
  * envelope (URL prefix, JSON content-type, error wrapping).
  */
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-}
-
-function mockFetch(responses: ReadonlyArray<Response>): ReturnType<typeof vi.fn> {
-  const fn = vi.fn()
-  for (const response of responses) {
-    fn.mockResolvedValueOnce(response)
-  }
-  globalThis.fetch = fn as unknown as typeof fetch
-  return fn
-}
 
 afterEach(() => {
   vi.restoreAllMocks()

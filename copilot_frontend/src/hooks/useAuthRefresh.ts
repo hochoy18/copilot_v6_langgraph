@@ -1,15 +1,22 @@
 /**
  * `useAuthRefresh` — T08 / #9, ADR-0009 §"Access Token" / AC §3-4.
  *
- * Drives the silent-rotation path: while the user is signed in, the
- * Access Token's lifetime is short (15 min). Whenever the remaining
- * window drops to ≤ 2 minutes we want a fresh JWT landing in the
- * store *before* any consumer notices — otherwise the SSE hook
- * (T24) hits the auth-loss branch on its next connect attempt and
- * the chat shell flashes a re-login banner.
+ * Drives the silent-rotation path. Two trigger windows:
  *
- * The hook is intentionally tiny: a `setTimeout` per `expiresAt`
- * change. Mounting it once at the SPA root (`App.tsx`) is enough.
+ * 1. **Rehydrate on mount** — the Refresh Token is persisted to
+ *    `localStorage` (ADR-0032) but the Access Token is in-memory
+ *    only, so a hard reload lands with `accessToken === null` and
+ *    `refreshToken !== null`. The hook fires `refreshAccessToken`
+ *    once in that gap; the call succeeds → `setTokens` populates
+ *    `accessToken` + `expiresAt` → the timer branch below takes
+ *    over; the call fails (revoked / replayed chain) →
+ *    `clearTokens` runs → the user lands on the re-login UI instead
+ *    of looking half-authenticated.
+ *
+ * 2. **Schedule on `expiresAt`** — once an Access Token is in
+ *    memory, the hook sets a `setTimeout` for `(expiresAt - now) -
+ *    REFRESH_LEAD_MS`, clamped at 0 so a token whose remaining
+ *    lifetime is already inside the lead rotates on the next tick.
  *
  * Why not poll?
  * --------------
@@ -41,52 +48,40 @@ import { refreshAccessToken, useAuthStore } from '@/stores/auth'
 const REFRESH_LEAD_MS = 2 * 60 * 1000
 
 /**
- * Cap on the delay before refreshing: a token whose remaining
- * lifetime is *shorter* than the lead (e.g. a freshly-issued JWT with
- * a 30-second TTL in tests) should still rotate immediately, so we
- * clamp at 0. We use Math.max rather than a `?? 0` to keep the type
- * narrow.
- */
-function clampRefreshDelay(ms: number): number {
-  return Math.max(0, ms)
-}
-
-/**
- * Mount once at the SPA root. Schedules the next refresh, awaits
- * it, then schedules the next one off the fresh `expiresAt`. The
- * effect re-runs whenever `expiresAt` lands in the store (login,
- * refresh) or `accessToken` is wiped (logout / refresh failure),
- * so the loop keeps itself current without any global state.
+ * Mount once at the SPA root. The effect re-runs whenever the
+ * store's access / refresh / expiry slots change, so the loop keeps
+ * itself current without any global state.
  */
 export function useAuthRefresh(): void {
   const accessToken = useAuthStore((s) => s.accessToken)
+  const refreshToken = useAuthStore((s) => s.refreshToken)
   const expiresAt = useAuthStore((s) => s.expiresAt)
 
   useEffect(() => {
-    // The refresh-access-token seam (`stores/auth.ts`) handles both
-    // the no-token branch and the failed-rotation branch — when
-    // either wipes `accessToken`, this effect re-runs and the
-    // `accessToken === null || expiresAt === null` guard short-
-    // circuits below.
+    // Rehydrate path — persisted Refresh Token with no in-memory
+    // Access Token. A login completing after mount follows the
+    // second branch on the next render because `setTokens` flips
+    // both fields at once.
+    if (accessToken === null && refreshToken !== null) {
+      void refreshAccessToken()
+      return
+    }
+    // No credentials at all — nothing to rotate.
     if (accessToken === null || expiresAt === null) return
 
-    const delay = clampRefreshDelay(expiresAt - Date.now() - REFRESH_LEAD_MS)
+    const delay = Math.max(0, expiresAt - Date.now() - REFRESH_LEAD_MS)
 
-    let timer: ReturnType<typeof setTimeout> | null = null
-    let cancelled = false
-
-    timer = setTimeout(() => {
-      // The user logged out between the timer being scheduled and
-      // it firing — `refreshAccessToken` would early-return with
-      // `null` anyway, but skipping the call saves a needless
-      // round-trip and avoids the `refreshFailed` flip.
-      if (cancelled) return
+    const timer = setTimeout(() => {
+      // The user logged out between scheduling and firing —
+      // `refreshAccessToken` would early-return with `null` anyway,
+      // but `clearTimeout` in the cleanup already guarantees the
+      // callback is dead before `setTokens` flipped `accessToken`
+      // back to `null`.
       void refreshAccessToken()
     }, delay)
 
     return () => {
-      cancelled = true
-      if (timer !== null) clearTimeout(timer)
+      clearTimeout(timer)
     }
-  }, [accessToken, expiresAt])
+  }, [accessToken, refreshToken, expiresAt])
 }

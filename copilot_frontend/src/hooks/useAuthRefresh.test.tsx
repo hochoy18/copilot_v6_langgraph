@@ -3,17 +3,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useAuthRefresh } from '@/hooks/useAuthRefresh'
 import { useAuthStore } from '@/stores/auth'
+import { jsonResponse, makeAuthUser } from '@/test-utils'
 
 /**
- * `useAuthRefresh` — T08 / #9 AC: "Token 剩 ≤2 min 自动续期".
+ * `useAuthRefresh` — T08 / #9 AC: "刷新仍登录" + "Token 剩 ≤2 min
+ * 自动续期".
  *
- * Three properties drive the hook:
+ * Four properties drive the hook:
  *
- * 1. With `expiresAt` set such that `expiresAt - now > REFRESH_LEAD_MS`,
- *    the hook waits the difference minus the lead.
- * 2. When the remaining window drops to ≤ the lead, the timer fires
+ * 1. With no credentials at all, the hook is dormant.
+ * 2. After a hard reload — `refreshToken` persisted to
+ *    localStorage, `accessToken` / `expiresAt` null — the hook
+ *    fires `refreshAccessToken()` exactly once to rehydrate the
+ *    session (T08 AC §3).
+ * 3. With `expiresAt` set such that `expiresAt - now > REFRESH_LEAD_MS`,
+ *    the hook waits the difference minus the lead (T08 AC §4).
+ * 4. When the remaining window drops to ≤ the lead, the timer fires
  *    and `refreshAccessToken` is called.
- * 3. When `accessToken` becomes null (logout / refresh failure), the
+ * 5. When `accessToken` becomes null (logout / refresh failure), the
  *    hook is dormant — no timer is scheduled, no fetch is fired.
  *
  * `vi.useFakeTimers()` lets us step the clock deterministically.
@@ -21,13 +28,6 @@ import { useAuthStore } from '@/stores/auth'
  * keeps the test focused on the timing decision without dragging in
  * the full API surface.
  */
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-}
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -56,6 +56,37 @@ describe('useAuthRefresh', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  it('rehydrates the session on mount when a refresh token is persisted but no access token is in memory (刷新仍登录)', async () => {
+    // The store rehydrates the refresh token from localStorage on
+    // import; a hard reload lands in exactly this state.
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        access_token: 'jwt.next',
+        refresh_token: 'rt.next',
+        token_type: 'Bearer',
+        expires_in: 900,
+        user: makeAuthUser(),
+      }),
+    )
+    globalThis.fetch = fetchMock
+    useAuthStore.setState({
+      refreshToken: 'rt-persisted',
+    })
+
+    renderHook(() => useAuthRefresh())
+
+    // `refreshAccessToken` is async — the hook fires it inside a
+    // microtask. Drain the queue so the assertion sees the resolved
+    // fetch call.
+    await act(async () => {
+      await vi.runAllTimersAsync()
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/auth/refresh')
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)
+    expect(body).toEqual({ refresh_token: 'rt-persisted' })
+  })
+
   it('schedules the refresh for (remaining - 2min) when the lead is comfortably far', () => {
     const fetchMock = vi.fn()
     globalThis.fetch = fetchMock
@@ -65,14 +96,7 @@ describe('useAuthRefresh', () => {
       useAuthStore.getState().setTokens(
         'jwt',
         'rt',
-        {
-          id: 'u1',
-          email: 'u@example.com',
-          display_name: 'User',
-          source: 'sso',
-          username: null,
-          role_ids: [],
-        },
+        makeAuthUser(),
         15 * 60,
       )
     })
@@ -95,14 +119,7 @@ describe('useAuthRefresh', () => {
         refresh_token: 'rt.next',
         token_type: 'Bearer',
         expires_in: 900,
-        user: {
-          id: 'u1',
-          email: 'u@example.com',
-          display_name: 'User',
-          source: 'sso',
-          username: null,
-          role_ids: [],
-        },
+        user: makeAuthUser(),
       }),
     )
     globalThis.fetch = fetchMock
@@ -111,15 +128,8 @@ describe('useAuthRefresh', () => {
       useAuthStore.getState().setTokens(
         'jwt',
         'rt',
-        {
-          id: 'u1',
-          email: 'u@example.com',
-          display_name: 'User',
-          source: 'sso',
-          username: null,
-          role_ids: [],
-        },
-        // 60 s — already inside the 2-minute lead. `clampRefreshDelay`
+        makeAuthUser(),
+        // 60 s — already inside the 2-minute lead. `Math.max(0, …)`
         // floors the delay at 0 so the timer fires on the next tick.
         60,
       )
@@ -137,14 +147,7 @@ describe('useAuthRefresh', () => {
       useAuthStore.getState().setTokens(
         'jwt',
         'rt',
-        {
-          id: 'u1',
-          email: 'u@example.com',
-          display_name: 'User',
-          source: 'sso',
-          username: null,
-          role_ids: [],
-        },
+        makeAuthUser(),
         15 * 60,
       )
     })

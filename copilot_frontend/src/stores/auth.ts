@@ -28,6 +28,7 @@
 import { create } from 'zustand'
 
 import { apiFetch, ApiError } from '@/lib/api-client'
+import type { SsoLoginCompleteResponse } from '@/lib/auth-api'
 
 /**
  * The subset of `User` the front-end needs to render the chat shell
@@ -48,18 +49,8 @@ export interface AuthUser {
   role_ids: string[]
 }
 
-/**
- * Wire shape of `POST /api/v1/auth/refresh` (T08b / #49) and the SSO
- * callback (T08 / #46) — deliberately identical so a single parser
- * feeds both paths (ADR-0032).
- */
-interface TokenResponse {
-  access_token: string
-  refresh_token: string
-  token_type: string
-  expires_in: number
-  user: AuthUser
-}
+/** Re-exported so consumer-side code keeps importing from one place. */
+export type { SsoLoginCompleteResponse }
 
 /**
  * Wall-clock instant (ms since epoch) when the Access Token stops
@@ -187,7 +178,10 @@ export async function refreshAccessToken(): Promise<string | null> {
   }
   try {
     // `apiFetch` sets `Content-Type: application/json` from the body.
-    const response = await apiFetch<TokenResponse>('/auth/refresh', {
+    // `SsoLoginCompleteResponse` is shared with the SSO callback by
+    // design — ADR-0009 calls for the same envelope on issuance
+    // and rotation, so one parser feeds both call sites.
+    const response = await apiFetch<SsoLoginCompleteResponse>('/auth/refresh', {
       method: 'POST',
       body: JSON.stringify({ refresh_token: refresh }),
     })

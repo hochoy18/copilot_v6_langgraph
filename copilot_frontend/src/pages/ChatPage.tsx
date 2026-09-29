@@ -121,25 +121,30 @@ export function ChatPage(): React.ReactElement {
       >
         <header className="flex items-center gap-2 border-b pb-4">
           <h1 className="text-xl font-semibold">Copilot Chat</h1>
-          {hasPlan && drawerMode === 'collapsed' && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="ml-auto gap-1"
-              onClick={reopen}
-            >
-              <Wrench size={14} />
-              查看 Plan
-            </Button>
-          )}
-          {user !== null && (
-            <span
-              data-testid="chat-username"
-              className="ml-auto text-sm text-muted-foreground"
-            >
-              {user.display_name || user.email}
-            </span>
-          )}
+          {/* Right-side controls share one `ml-auto` so the
+              Plan-reopen button and the username slot don't compete
+              for the same flex space when both render. */}
+          <div className="ml-auto flex items-center gap-2">
+            {hasPlan && drawerMode === 'collapsed' && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1"
+                onClick={reopen}
+              >
+                <Wrench size={14} />
+                查看 Plan
+              </Button>
+            )}
+            {user !== null && (
+              <span
+                data-testid="chat-username"
+                className="text-sm text-muted-foreground"
+              >
+                {user.display_name || user.email}
+              </span>
+            )}
+          </div>
         </header>
 
         <section

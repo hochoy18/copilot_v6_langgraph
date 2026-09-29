@@ -5,9 +5,7 @@
  * URL. The page POSTs both to `/api/v1/auth/sso/callback`, the
  * backend verifies the `id_token` + PKCE + state, and returns the
  * access + refresh bundle. We fold it into the auth store and
- * route the user to `/chat` (or back to wherever the login
- * originated — `state.return_to` query param if a future ticket
- * adds it; T08 always lands on `/chat`).
+ * route the user to `/chat`.
  *
  * Why `replace` (not `push`) on the success navigate?
  * ---------------------------------------------------
@@ -22,22 +20,11 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 
-import { ApiError } from '@/lib/api-client'
-import { completeSsoLogin } from '@/lib/auth-api'
+import { formatAuthApiError, completeSsoLogin } from '@/lib/auth-api'
 import { useAuthStore } from '@/stores/auth'
 
 /** Where to land after the callback succeeds. Matches the AC's "回调 /chat 显示用户名". */
 const POST_LOGIN_PATH = '/chat'
-
-function formatCallbackError(err: unknown): string {
-  if (err instanceof ApiError) {
-    return `登录失败 (HTTP ${err.status}), 请重试。`
-  }
-  if (err instanceof TypeError) {
-    return '无法连接后端服务, 请确认服务已启动。'
-  }
-  return '发生未知错误, 请重试。'
-}
 
 export function AuthCallbackPage(): React.ReactElement {
   const [searchParams] = useSearchParams()
@@ -77,7 +64,7 @@ export function AuthCallbackPage(): React.ReactElement {
         navigate(POST_LOGIN_PATH, { replace: true })
       } catch (err) {
         if (cancelled) return
-        setError(formatCallbackError(err))
+        setError(formatAuthApiError(err, '登录失败'))
       }
     })()
     return () => {
