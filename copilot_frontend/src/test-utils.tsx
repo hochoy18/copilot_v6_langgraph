@@ -1,24 +1,35 @@
 import { type ReactElement, type ReactNode } from 'react'
 import { render, type RenderOptions } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { type Mock, vi } from 'vitest'
 
 import type { AuthUser } from '@/stores/auth'
 import { useAuthStore } from '@/stores/auth'
 
 /**
- * Test renderer that wraps the tree in a MemoryRouter with an initial entry,
- * so route components can be exercised at a specific path.
+ * Test renderer that wraps the tree in a fresh `QueryClient` +
+ * `MemoryRouter`. Mirrors the production app providers in `main.tsx`
+ * so components using `useQuery` / `useMutation` (T13 Tool
+ * Registry, T11 Conversation List) find a client on mount.
  *
- * Defaults to `/` which — per the App router — redirects to /chat.
+ * Each call gets a fresh `QueryClient` (no cache sharing across
+ * tests) and `retry: 0` so a failing assertion isn't masked by
+ * React Query's retry loop. Defaults to `/` which — per the App
+ * router — redirects to /chat.
  */
 export function renderWithRouter(
   ui: ReactElement,
   { initialEntries = ['/'], ...options }: RenderOptions & { initialEntries?: string[] } = {},
 ): ReturnType<typeof render> {
   function Wrapper({ children }: { children?: ReactNode }): ReactElement {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: 0 } },
+    })
     return (
-      <MemoryRouter initialEntries={initialEntries}>{children}</MemoryRouter>
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={initialEntries}>{children}</MemoryRouter>
+      </QueryClientProvider>
     )
   }
   return render(ui, { wrapper: Wrapper, ...options })

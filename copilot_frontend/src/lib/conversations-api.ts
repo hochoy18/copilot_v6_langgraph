@@ -15,15 +15,23 @@
 import { ApiError, apiFetch } from '@/lib/api-client'
 import type { Plan, TurnResponse } from '@/types/plan'
 
+/** Lifecycle states — mirrors backend `ConversationStatus` (ADR-0011). */
+export type ConversationStatus = 'active' | 'idle' | 'archived'
+
 /** Wire shape of `POST /api/v1/conversations` (`ConversationResponse`). */
 export interface ConversationResponse {
   id: string
   user_id: string
   title: string
-  status: 'active' | 'idle' | 'archived'
+  status: ConversationStatus
   last_activity_at: string
   created_at: string
   updated_at: string
+}
+
+/** Wire shape of `GET /api/v1/conversations` (`ConversationListResponse`). */
+export interface ConversationListResponse {
+  conversations: ConversationResponse[]
 }
 
 function jsonInit(method: 'POST', body: unknown, signal?: AbortSignal): RequestInit {
@@ -95,6 +103,44 @@ export async function createConversation(
   signal?: AbortSignal,
 ): Promise<ConversationResponse> {
   return apiFetch<ConversationResponse>('/conversations', jsonInit('POST', { title }, signal))
+}
+
+/**
+ * List the signed-in user's conversations, optionally filtered by
+ * lifecycle status — T11 / #41, ADR-0011.
+ *
+ * The three-tab Frontend surface (active / idle / archived) maps
+ * 1:1 onto the `status` query param (`GET /api/v1/conversations`).
+ * With `status=null` the backend returns every conversation the
+ * user owns; we always pass an explicit value because the Frontend
+ * never needs the "all statuses" view — that's what the tabs are
+ * for.
+ */
+export async function fetchConversations(
+  status: ConversationStatus,
+  signal?: AbortSignal,
+): Promise<ConversationResponse[]> {
+  const path = `/conversations?status=${encodeURIComponent(status)}`
+  const init: RequestInit = signal ? { signal } : {}
+  const body = await apiFetch<ConversationListResponse>(path, init)
+  return body.conversations
+}
+
+/**
+ * Manually end a conversation — T11 / #41, ADR-0011.
+ *
+ * Transitions `active` / `idle` → `idle`. Re-archiving an
+ * already-archived row is a backend no-op (the row stays archived),
+ * but the caller shouldn't rely on that — the list view filters
+ * out archived rows from the active tab, so this action surfaces
+ * only for non-archived rows.
+ */
+export async function archiveConversation(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<ConversationResponse> {
+  const path = `/conversations/${encodeURIComponent(conversationId)}/archive`
+  return apiFetch<ConversationResponse>(path, jsonInit('POST', {}, signal))
 }
 
 /**
