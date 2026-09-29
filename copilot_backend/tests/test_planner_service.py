@@ -38,13 +38,17 @@ from app.repositories.turns import TurnRepository
 from app.settings import Settings
 
 _USER_ID = "507f1f77bcf86cd799439011"
-_PLANNER_TEMPLATE = "CATALOG>>{{tools}}<<INSTRUCTION>>{{input}}<<"
+_PLANNER_TEMPLATE = (
+    "CATALOG>>{{tools}}<<MEMORY>>{{memory_window}}<<"
+    "INSTRUCTION>>{{input}}<<"
+)
 
 
 class _FakeChatModel(BaseChatModel):
     response_text: str = '{"nodes": []}'
     should_fail: bool = False
     call_count: int = 0
+    seen_prompts: list[str] = []
 
     @property
     def _llm_type(self) -> str:
@@ -58,6 +62,11 @@ class _FakeChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         self.call_count += 1
+        # `seen_prompts` is the planner-side assertion handle: tests
+        # verify the memory-window slot renders the text the service
+        # built (T30 / ADR-0007). Each entry is the full prompt text
+        # the fake model saw on one Planner call.
+        self.seen_prompts.append(str(messages[-1].content))
         if self.should_fail:
             raise RuntimeError("upstream model exploded")
         generation = ChatGeneration(message=AIMessage(content=self.response_text))
@@ -95,6 +104,7 @@ def _planner(
     *,
     should_fail: bool = False,
     configured: bool = True,
+    memory_window_k: int | None = None,
 ) -> tuple[ToolPlanner, _FakeChatModel]:
     fake = _FakeChatModel(response_text=response_text, should_fail=should_fail)
     settings = Settings(
@@ -111,11 +121,15 @@ def _planner(
             )
         ),
     )
+    kwargs: dict[str, object] = {}
+    if memory_window_k is not None:
+        kwargs["memory_window_k"] = memory_window_k
     return (
         ToolPlanner(
             settings=settings,
             prompt_provider=provider,
             chat_model_factory=lambda: fake,
+            **kwargs,  # type: ignore[arg-type]
         ),
         fake,
     )
@@ -694,3 +708,177 @@ class TestTurnRepositorySetPlanId:
     async def test_set_plan_id_missing_turn_raises(self, turn_repo: TurnRepository) -> None:
         with pytest.raises(NotFoundError):
             await turn_repo.set_plan_id("507f1f77bcf86cd799439999", "507f1f77bcf86cd7994390aa")
+
+
+class TestPlannerMemoryWindow:
+    """End-to-end coverage of the T30 / #26 wiring.
+
+    The pure renderer (`build_memory_window`) is pinned in
+    `test_planner_memory.py`; this class pins the integration: the
+    service fetches the previous K turns, hands them through the
+    renderer, and the resulting block lands inside the LLM-facing
+    prompt on the next Planner call.
+    """
+
+    async def test_sixth_turn_planner_sees_prior_five(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """AC#1 (T30): the 6th-turn Planner input contains the prior
+        5 user turns verbatim. The 6th turn's content itself lands
+        in `{{input}}` (the current instruction), not the window.
+
+        AC#2 (T30): once the conversation outgrows K, older turns
+        drop off the front. Submitting a 7th turn with K=5 truncates
+        the very first turn; the 7th turn is the first to observe
+        the truncation.
+        """
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+        )
+
+        # Submit the first six turns. At the 6th call, the prior 5
+        # turns (1..5) all fit in the K=5 window — no truncation yet.
+        for i in range(1, 6):
+            await svc.submit_turn(
+                conversation_id=conv_id, user_id=_USER_ID, content=f"指令 {i}",
+            )
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="指令 6",
+        )
+
+        assert len(fake.seen_prompts) == 6
+        sixth_prompt = fake.seen_prompts[-1]
+        # AC#1: at the 6th call the window holds the prior 5 turns.
+        assert sixth_prompt.count("[轮次 ") == 5
+        for label in ("指令 1", "指令 2", "指令 3", "指令 4", "指令 5"):
+            assert label in sixth_prompt
+        # The 6th turn arrives via {{input}}, not the window.
+        assert "指令 6" in sixth_prompt
+
+        # AC#2: a 7th call forces the window past K; turn 1 truncates.
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="指令 7",
+        )
+        seventh_prompt = fake.seen_prompts[-1]
+        assert seventh_prompt.count("[轮次 ") == 5
+        for label in ("指令 2", "指令 3", "指令 4", "指令 5", "指令 6"):
+            assert label in seventh_prompt
+        # Turn 1 dropped off the front (AC#2).
+        assert "指令 1" not in seventh_prompt
+        # The placeholder for {{memory_window}} was fully rendered.
+        assert "{{memory_window}}" not in seventh_prompt
+        assert "{{input}}" not in seventh_prompt
+
+    async def test_cold_start_planner_sees_empty_memory_window(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """A conversation with no prior turns renders the documented
+        placeholder rather than crashing on the empty slice."""
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+        )
+
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="first turn",
+        )
+        prompt = fake.seen_prompts[0]
+        assert "(当前没有历史对话" in prompt
+
+    async def test_memory_window_k_three_drops_older_turns(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """AC#3 (T30): K is configurable. With K=3 the window only
+        carries the last three user turns at call time — older turns
+        are truncated, the rest is unchanged. The service reads K
+        from the configured `ToolPlanner.memory_window_k`."""
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON, memory_window_k=3)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+        )
+
+        # Five user turns submitted. At the 5th call the prior 4
+        # turns (1..4) are eligible for the window; K=3 keeps only
+        # the last 3 (2..4). The 1st turn drops off; the 5th turn
+        # arrives via {{input}}, not the memory slot.
+        for i in range(1, 6):
+            await svc.submit_turn(
+                conversation_id=conv_id, user_id=_USER_ID, content=f"指令 {i}",
+            )
+
+        last_prompt = fake.seen_prompts[-1]
+        # The window carries exactly K=3 `[轮次 ` entries; older
+        # turns were dropped at the renderer (only `[轮次 ` markers
+        # come from the window).
+        assert last_prompt.count("[轮次 ") == 3
+        for label in ("指令 2", "指令 3", "指令 4"):
+            assert label in last_prompt, (
+                f"{label!r} missing from K=3 window: {last_prompt!r}"
+            )
+        # 指令 1 was truncated; the 5th turn still arrives via
+        # {{input}} (the prompt carries the current instruction
+        # regardless of K).
+        assert "指令 1" not in last_prompt
+        assert "指令 5" in last_prompt
+
+    async def test_memory_window_renders_plan_summary(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """A prior turn that produced a Plan carries an inline Plan
+        summary so the LLM sees "Tool X was called with params Y".
+        The summary stays compact — the full frozen snapshot lives
+        on the Plan row for audit replay (ADR-0027)."""
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, fake = _planner(_ECHO_PLAN_JSON)
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+        )
+
+        # First turn: a Plan lands and links to the Turn.
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="echo hello",
+        )
+        # Second turn: the planner now sees the prior turn + its
+        # Plan summary inline in the rendered window.
+        await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="再来一次",
+        )
+
+        # The fake model saw two prompts; the 2nd one is the one we
+        # inspect — the memory-window slot must contain both the
+        # user instruction and the Plan summary line.
+        assert len(fake.seen_prompts) == 2
+        second_prompt = fake.seen_prompts[-1]
+        # The first turn's instruction lands verbatim in the window.
+        assert "echo hello" in second_prompt
+        # The Plan summary line for the linked Plan appears too.
+        assert "本轮 Plan" in second_prompt
+        assert "echo" in second_prompt

@@ -88,6 +88,24 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ---- Memory window (T30 / #26, ADR-0007) -----------------------------
+    # How many recent user turns the Planner sees verbatim. SPEC
+    # floors K=5; operators tighten to fit a smaller context budget
+    # or widen when cross-turn references dominate. The minimum of 1
+    # guards against a misconfiguration that would otherwise disable
+    # the window entirely (the LLM would see only the current
+    # instruction and lose all cross-turn continuity).
+    memory_window_k: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description=(
+            "Number of recent user turns the Planner receives as "
+            "verbatim context (ADR-0007 '记忆窗口'). Default 5 per "
+            "SPEC; configure to widen/narrow the window."
+        ),
+    )
+
     # ---- LLM Provider (T16 / #14, ADR-0014 / ADR-0016) -------------------
     # The LangChain ChatModel seam. Every LLM call in the backend is
     # made against an OpenAI-compatible endpoint built from these three

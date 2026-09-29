@@ -13,8 +13,12 @@ user's natural-language instruction into a Plan. Two layers live here:
   ownership guard, Turn persistence, snapshot freezing (ADR-0027),
   Plan persistence (status `pending`, awaiting the HITL preview —
   ADR-0004), and the graceful-degradation ladder.
+* `app.planner.memory` — the recent-K-turn context (T30 / #26,
+  ADR-0007) the Planner prompt renders before the current instruction.
 
 T18's scope is the single-Tool Plan (ticket #16); multi-node output
 arrives with T25 (#22) by editing the Langfuse copy — the parser here
-already accepts N nodes.
+already accepts N nodes. The memory-window assembly (T30 / #26) is a
+single `build_memory_window` helper plus a `ToolPlanner.memory_window_k`
+configuration; the prompt contract itself still lives on Langfuse.
 """

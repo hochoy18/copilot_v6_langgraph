@@ -114,6 +114,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings=settings,
         prompt_provider=prompt_provider,
         chat_model_factory=lambda: build_chat_model(settings),
+        memory_window_k=settings.memory_window_k,
     )
     # T22 / #19 — the final-answer LLM call. Lazy chat-model build for
     # the same reason as the description generator / Planner: an

@@ -54,6 +54,7 @@ from app.db.schemas import Tool
 from app.llm.errors import LLMGenerationError
 from app.llm.output import content_to_text, extract_json_object
 from app.llm.prompts import PLANNER_PROMPT, PromptProvider, render_template
+from app.planner.memory import DEFAULT_MEMORY_WINDOW_K
 from app.settings import Settings
 from app.tools.description_generator import summarize_parameters
 
@@ -140,10 +141,12 @@ class ToolPlanner:
         settings: Settings,
         prompt_provider: PromptProvider,
         chat_model_factory: Callable[[], BaseChatModel],
+        memory_window_k: int = DEFAULT_MEMORY_WINDOW_K,
     ) -> None:
         self._settings = settings
         self._prompts = prompt_provider
         self._model_factory = chat_model_factory
+        self._memory_window_k = memory_window_k
         self._model: BaseChatModel | None = None
 
     @property
@@ -151,12 +154,36 @@ class ToolPlanner:
         """Cheap "is the LLM configured" check — never touches the network."""
         return bool(self._settings.llm_base_url and self._settings.llm_api_key)
 
-    async def plan(self, instruction: str, tools: Sequence[Tool]) -> PlanIntent:
+    @property
+    def memory_window_k(self) -> int:
+        """How many recent user turns the service must hand in (T30 / ADR-0007).
+
+        Exposed so the orchestration code can size its turn-fetch
+        query (`limit=k`) without holding a parallel reference to the
+        configured K. Always `>= 1` after construction.
+        """
+        return self._memory_window_k
+
+    async def plan(
+        self,
+        instruction: str,
+        tools: Sequence[Tool],
+        *,
+        memory_window: str = "",
+    ) -> PlanIntent:
         """Run one Planner turn against the given catalog.
 
         Args:
             instruction: the user's natural-language message.
             tools: the `active` Tool rows the model may choose from.
+            memory_window: the recent-K-turn context already rendered
+                by `app.planner.memory.build_memory_window` (T30 /
+                ADR-0007). Empty string for the cold-start case;
+                passed through verbatim into the `{{memory_window}}`
+                Prompt slot. The Planner never reads the prior
+                conversation itself — the service is the seam that
+                builds and sizes the window, and it always hands a
+                fully rendered block here.
 
         Raises:
             LLMConfigurationError: provider refused by config (ADR-0016)
@@ -171,6 +198,7 @@ class ToolPlanner:
             {
                 "tools": render_tool_catalog(tools),
                 "input": instruction,
+                "memory_window": memory_window,
             },
         )
 

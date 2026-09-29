@@ -47,6 +47,7 @@ from app.conversations.errors import (
     ConversationAccessDeniedError,
     ConversationArchivedError,
 )
+from app.db.errors import NotFoundError
 from app.db.schemas import (
     Plan,
     PlanCreate,
@@ -62,6 +63,7 @@ from app.llm.errors import (
     LLMGenerationError,
     PromptUnavailableError,
 )
+from app.planner.memory import build_memory_window
 from app.planner.planner import PlannedEdge, PlannedNode, ToolPlanner
 from app.repositories.conversations import ConversationRepository
 from app.repositories.plans import PlanRepository
@@ -159,8 +161,20 @@ class PlannerService:
             if not tools:
                 warnings.append("Tool Registry 没有 active Tool, 本轮无法规划。")
             else:
+                # T30 / ADR-0007: render the recent-K-turn memory window
+                # *before* the Planner call so the LLM sees the prior
+                # conversation verbatim. The fetch happens here (not at
+                # tool-build time) because K is read off the configured
+                # `ToolPlanner` and the conversation's transcript grows
+                # during the lifespan of a long-lived planner.
+                memory_window = await self._build_memory_window(
+                    conversation_id=conversation_id,
+                    excluding_turn_id=turn.id,
+                )
                 try:
-                    intent = await self._planner.plan(content, tools)
+                    intent = await self._planner.plan(
+                        content, tools, memory_window=memory_window,
+                    )
                 except (
                     LLMConfigurationError,
                     PromptUnavailableError,
@@ -188,6 +202,58 @@ class PlannerService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _build_memory_window(
+        self,
+        *,
+        conversation_id: str,
+        excluding_turn_id: str,
+    ) -> str:
+        """Render the recent-K-turn context the Planner will see (T30 / #26).
+
+        Reads the previous K user turns (K is taken from the configured
+        `ToolPlanner.memory_window_k`) plus their linked Plan rows
+        when available, and hands the rendered block to the Planner.
+        The freshly-created Turn is excluded — the user instruction
+        that triggered this call lands in `instruction`, not in the
+        window. Plans are looked up best-effort: a missing snapshot
+        degrades to a "no Plan" line rather than aborting the call.
+
+        The fetch size is `K + 1` because the most-recent turn in the
+        list is the one we just persisted; `build_memory_window` then
+        slices the last K user turns, dropping any assistant turns
+        along the way. Keeping the round-trip small matters because
+        per-Plan lookups can fan out: an idle conversation that hits
+        `K = 5` may need up to 5 Plan fetches in series.
+        """
+        k = self._planner.memory_window_k
+        # Pull K + 1 turns: the newest one is the Turn we just
+        # created, so the prior K user turns are guaranteed inside
+        # the slice once `build_memory_window` filters by role.
+        recent = await self._turns.list_by_conversation(
+            conversation_id,
+            limit=k + 1,
+        )
+        prior = [
+            turn for turn in recent if turn.id != excluding_turn_id
+        ]
+
+        plans_by_turn_id: dict[str, Plan | None] = {}
+        for turn in prior:
+            if turn.plan_id is None:
+                continue
+            try:
+                plans_by_turn_id[turn.id] = await self._plans.get(turn.plan_id)
+            except NotFoundError:
+                # Plan may have been hard-deleted by an admin path
+                # (T10); a missing snapshot is a non-fatal degrade.
+                plans_by_turn_id[turn.id] = None
+
+        return build_memory_window(
+            prior,
+            plans_by_turn_id,
+            k=k,
+        )
 
     async def _persist_plan(
         self,

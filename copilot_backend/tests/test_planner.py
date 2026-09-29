@@ -49,7 +49,12 @@ _NOW = datetime(2026, 9, 1, tzinfo=UTC)
 
 # A minimal template mirroring the Langfuse `planner` contract: both
 # placeholders visible so a test can assert the render actually ran.
-_PLANNER_TEMPLATE = "CATALOG>>{{tools}}<<INSTRUCTION>>{{input}}<<JSON ONLY"
+# `{{memory_window}}` (T30 / ADR-0007) is rendered too — the LLM
+# contract now embeds the recent-K-turn context block.
+_PLANNER_TEMPLATE = (
+    "CATALOG>>{{tools}}<<MEMORY>>{{memory_window}}<<"
+    "INSTRUCTION>>{{input}}<<JSON ONLY"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -120,12 +125,17 @@ def _planner(
     should_fail: bool = False,
     settings: Settings | None = None,
     template: str = _PLANNER_TEMPLATE,
+    memory_window_k: int | None = None,
 ) -> tuple[ToolPlanner, _FakeChatModel]:
     fake = _FakeChatModel(response_text=response_text, should_fail=should_fail)
+    kwargs: dict[str, object] = {}
+    if memory_window_k is not None:
+        kwargs["memory_window_k"] = memory_window_k
     planner = ToolPlanner(
         settings=settings or _settings(),
         prompt_provider=_provider_with_template(template),
         chat_model_factory=lambda: fake,
+        **kwargs,  # type: ignore[arg-type]
     )
     return planner, fake
 
@@ -180,6 +190,11 @@ async def test_planner_bootstrap_ladder_floor() -> None:
     assert template.source == "bootstrap"
     assert "{{tools}}" in template.text
     assert "{{input}}" in template.text
+    # T30 / ADR-0007: the bootstrap must expose the memory-window
+    # slot so a Langfuse copy that omits it gets caught at first
+    # fetch instead of silently dropping recent turns from the
+    # Planner context.
+    assert "{{memory_window}}" in template.text
     assert '"nodes"' in template.text
     # T25 multi-node contract: the bootstrap must allow N nodes and
     # expose the `edges` key so a model reading the floor stays
@@ -478,6 +493,38 @@ class TestToolPlanner:
         assert "echo" in prompt  # tool catalog landed in {{tools}}
         assert "echo hello" in prompt  # instruction landed in {{input}}
         assert "{{tools}}" not in prompt and "{{input}}" not in prompt
+        # T30 / ADR-0007: the memory-window slot was rendered too.
+        assert "{{memory_window}}" not in prompt
+
+    async def test_plan_passes_memory_window_through(self) -> None:
+        """The Planner embeds the service-built memory window verbatim.
+
+        The service owns the rendering (sizing, fetching, Plan
+        lookup); the Planner is a pure pass-through for the rendered
+        string. This contract keeps the LLM-side slot a dumb
+        placeholder — any rendering logic belongs on the service
+        seam, not in the LLM call.
+        """
+        planner, fake = _planner('{"nodes": []}')
+        await planner.plan(
+            "echo hello", [_tool()], memory_window="RECENT-K-BLOCK",
+        )
+        assert "RECENT-K-BLOCK" in fake.seen_prompts[0]
+
+    async def test_plan_default_memory_window_is_empty_string(self) -> None:
+        """Calling without `memory_window` renders an empty slot.
+
+        The cold-start case (no prior turns) is the empty-string
+        sentinel — the Langfuse Prompt sees `{{memory_window}}` →
+        `` and the LLM has nothing to look at. This is the default
+        for tests that don't care about the window.
+        """
+        planner, fake = _planner('{"nodes": []}')
+        await planner.plan("echo hello", [_tool()])
+        # The slot is between `<<MEMORY>>` and `<<INSTRUCTION>>` in
+        # `_PLANNER_TEMPLATE`; assert it rendered empty.
+        prompt = fake.seen_prompts[0]
+        assert "<<MEMORY>><<INSTRUCTION>>" in prompt
 
     async def test_plan_transport_error_becomes_generation_error(self) -> None:
         planner, _ = _planner(should_fail=True)
@@ -511,6 +558,20 @@ class TestToolPlanner:
         )
         assert configured.ready is True
         assert unconfigured.ready is False
+
+    def test_memory_window_k_defaults_to_five(self) -> None:
+        """T30 SPEC floor: K=5 by default; the service uses this
+        value to size its turn-fetch query (`limit=k + 1`)."""
+        planner, _ = _planner()
+        assert planner.memory_window_k == 5
+
+    def test_memory_window_k_is_configurable(self) -> None:
+        """ADR-0007: K is a configurable parameter; an operator can
+        tighten to fit a smaller context budget or widen to capture
+        longer cross-turn references. The constructor mirrors that
+        contract — no code change required to ship a different K."""
+        planner, _ = _planner(memory_window_k=10)
+        assert planner.memory_window_k == 10
 
 
 # ---------------------------------------------------------------------------

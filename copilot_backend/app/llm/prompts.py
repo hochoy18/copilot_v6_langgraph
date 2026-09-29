@@ -101,17 +101,27 @@ HTTP 方法与路径: {{method}} {{path}}
 其中 typical_use_cases 为 2-4 条中文短句。
 """
 
-# Bootstrap fallback for `planner` (T18 / #16, T25 / #22). Same
+# Bootstrap fallback for `planner` (T18 / #16, T25 / #22, T30 / #26). Same
 # contract the Langfuse copy must keep: strict-JSON output, `nodes`
 # array, Tool names drawn from the rendered catalog, plus (T25)
 # `edges` for data-dependency DAGs. `edges` is optional: omit it
 # (or send `[]`) when the nodes are independent — the executor
 # schedules them as a parallel branch (ADR-0012).
+#
+# T30 / ADR-0007 inserts `{{memory_window}}` for the recent-K-turn
+# context: a flat text block listing the last K user turns (with
+# linked Plan summaries) so the LLM can resolve cross-turn references
+# like "上周那个项目". When the window is empty (cold start) the
+# placeholder reads "(当前没有历史对话 / no prior turns)" — never the
+# literal "None".
 _BOOTSTRAP_PLANNER = """\
 你是企业 API Copilot 的 Planner。请把业务人员的自然语言指令翻译成 Tool 调用计划(可以有多个节点)。
 
 可用 Tool 目录(每行一个 Tool):
 {{tools}}
+
+近期对话记忆(最近 K 轮用户原文, K 可配, 默认 5; 没有历史时显示占位):
+{{memory_window}}
 
 用户指令: {{input}}
 
