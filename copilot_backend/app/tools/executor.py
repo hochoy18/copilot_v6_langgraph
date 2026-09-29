@@ -29,6 +29,13 @@ Acceptance criteria (issue #18, then #24 for the parallel layer):
    predecessor finishes, and a sibling's failure does not stop the
    other sibling.
 
+T31 / #27 adds the long-term-memory side-effect: after the terminal
+Plan writes land in MongoDB, the Executor summarises the Plan and
+asks the optional `MilvusPlanHistoryWriter` to upsert the row into
+Milvus `plan_history_vectors`. The write is best-effort — a Milvus
+failure logs and swallows, never rolls back the Plan execution
+(ADR-0008: Milvus is the derived index, MongoDB is the truth).
+
 Why a separate module from the Worker: the Worker is a pure async
 function over its inputs (test seam). The Executor is the
 side-effecting glue: it owns Plan / PlanExecution / AuditLog writes
@@ -52,10 +59,16 @@ from app.db.schemas import (
     ToolRiskLevel,
     ToolSnapshot,
 )
+from app.memory.plan_history import (
+    MilvusPlanHistoryWriter,
+    build_plan_history_record,
+)
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.plan_executions import PlanExecutionRepository
 from app.repositories.plans import PlanRepository
 from app.repositories.tools import ToolRepository
+from app.repositories.turns import TurnRepository
+from app.security.redactor import redact
 from app.tools.dag import NodeRunOutcome, PlanDagRunner
 from app.tools.worker import ToolCallResult, ToolWorker
 from app.tools.worker_errors import (
@@ -83,12 +96,14 @@ class PlanExecutionOutcome:
 
 
 class PlanExecutor:
-    """Orchestrates the execution of one Plan — T21 / #18.
+    """Orchestrates the execution of one Plan — T21 / #18, T31 / #27.
 
     Stateless beyond the collaborator references; one instance per
     request is fine. The Worker is injected so tests can swap it for
     a stub that returns canned `ToolCallResult`s without touching
-    the network.
+    the network. The Milvus writer is **optional** so the existing
+    T21 test seam (no Milvus) keeps passing — when wired, T31 writes
+    the terminal Plan's summary to long-term memory.
     """
 
     def __init__(
@@ -99,12 +114,20 @@ class PlanExecutor:
         audit_log_repository: AuditLogRepository,
         tool_repository: ToolRepository,
         worker: ToolWorker,
+        turn_repository: TurnRepository | None = None,
+        milvus_writer: MilvusPlanHistoryWriter | None = None,
     ) -> None:
         self._plans = plan_repository
         self._plan_executions = plan_execution_repository
         self._audit = audit_log_repository
         self._tools = tool_repository
         self._worker = worker
+        # T31 / #27 — optional collaborators for the long-term-memory
+        # write path. `None` means "no memory write" — used by tests
+        # that haven't wired T31 yet, and by deployments that haven't
+        # enabled Milvus. The production lifespan wires both.
+        self._turns = turn_repository
+        self._milvus = milvus_writer
 
     # ------------------------------------------------------------------
     # Public seam
@@ -214,6 +237,14 @@ class PlanExecutor:
         )
         await self._plan_executions.set_status(execution.id, aggregate)
         terminal_plan = await self._plans.set_status(executing_plan.id, final_status)
+
+        # T31 / #27 + ADR-0008 — Milvus write happens AFTER every
+        # Mongo write is durable. The write is best-effort: a Milvus
+        # exception logs and swallows so a degraded Milvus cannot
+        # unwind a successful Plan execution. Mongo is the truth;
+        # Milvus is the derived index that T32 will recall from.
+        await self._write_plan_history(terminal_plan)
+
         return PlanExecutionOutcome(
             plan=terminal_plan,
             execution_id=execution.id,
@@ -555,6 +586,19 @@ class PlanExecutor:
             risk_level = snapshot_for_audit.risk_level
             final_retry_count = retry_count if retry_count is not None else 0
 
+        # T33 / #29 — defence-in-depth credential scrub before the
+        # audit row leaves the executor. The Worker's request
+        # envelope is already redacted (`ToolCallResult.request`), but
+        # `parameters` and `response_body` flow straight from the
+        # upstream API into the row. An upstream that echoes an
+        # `api_key` field (or a parameter that happens to be named
+        # `password`) must not survive into MongoDB. The same
+        # redactor scrubs the audit UI surface (T43) and any future
+        # Langfuse trace (T40), so a single seam protects every sink.
+        scrubbed_parameters = redact(node.parameters)
+        scrubbed_response = redact(response_body) if response_body is not None else None
+        scrubbed_error = redact(error_envelope) if error_envelope is not None else None
+
         row = await self._audit.create(
             AuditLogCreate(
                 actor_id=actor_id,
@@ -564,10 +608,10 @@ class PlanExecutor:
                 plan_execution_id="",  # back-filled below
                 tool_name=snapshot_for_audit.name,
                 tool_snapshot=snapshot_for_audit,
-                parameters=node.parameters,
-                response=response_body,
+                parameters=scrubbed_parameters,
+                response=scrubbed_response,
                 status=status,
-                error=error_envelope,
+                error=scrubbed_error,
                 risk_level=risk_level,
                 retry_count=final_retry_count,
             ),
@@ -603,6 +647,55 @@ class PlanExecutor:
             "message_en": message_en,
             "message_zh": message_en,  # MVP: messages are EN-only
         }
+
+    # ------------------------------------------------------------------
+    # T31 / #27 — long-term-memory write seam
+    # ------------------------------------------------------------------
+
+    async def _write_plan_history(self, terminal_plan: Plan) -> None:
+        """Push the terminal Plan's summary into Milvus (best-effort).
+
+        Two collaborators are required: a `MilvusPlanHistoryWriter` for
+        the upsert and a `TurnRepository` for the user instruction that
+        triggered the Plan (the Plan doc doesn't carry the instruction
+        — only the FK to its triggering Turn). Missing either means
+        the write is skipped silently: T31 ships the seam, and an
+        operator that hasn't wired Milvus yet sees no behaviour change.
+
+        Errors at any stage (Turn lookup, record build, upsert) are
+        logged and swallowed — `MongoDB 先写后 Milvus` is the contract;
+        the inverse ("Milvus fails ⇒ Plan rolls back") is explicitly
+        forbidden by ADR-0008.
+        """
+        if self._milvus is None or self._turns is None:
+            return
+        if not terminal_plan.nodes:
+            # Smalltalk / no-Plan path — skip so the index doesn't
+            # accumulate noise rows the recall code can't act on.
+            return
+        try:
+            turn = await self._turns.get(terminal_plan.turn_id)
+            record = build_plan_history_record(
+                plan=terminal_plan,
+                user_instruction=turn.content,
+            )
+        except Exception:
+            # Build-side errors (missing Turn, embedding failure).
+            # Same swallow policy as the upsert path: the Plan is
+            # already terminal in Mongo; the index can be rebuilt from
+            # MongoDB later if the failure persists.
+            logger.exception(
+                "milvus plan_history record build failed (plan_id=%s)",
+                terminal_plan.id,
+            )
+            return
+        try:
+            await self._milvus.upsert_summary(record)
+        except Exception:
+            logger.exception(
+                "milvus plan_history upsert failed (plan_id=%s)",
+                terminal_plan.id,
+            )
 
 
 __all__ = ["PlanExecutor", "PlanExecutionOutcome"]

@@ -55,6 +55,7 @@ from jsonschema import ValidationError as JsonSchemaValidationError
 from app.db.schemas import PlanNode, ToolSnapshot
 from app.repositories.credentials import CredentialRepository
 from app.security.crypto import EncryptionError
+from app.security.redactor import redact_envelope, redact_headers
 from app.tools.worker_errors import (
     CredentialInvalidError,
     HITLRequiredError,
@@ -465,21 +466,34 @@ class ToolWorker:
         return _shape_secret(snapshot, str(secret))
 
     @staticmethod
+    def _redact_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+        """Return a redacted copy of the outgoing-request envelope.
+
+        Per T33 / #29 the audit row, future Langfuse trace, and any
+        other downstream consumer must never see a credential byte.
+        Headers are scrubbed by key (the obvious auth headers) AND the
+        body is walked recursively so an upstream API that takes a
+        `api_key` field inside its JSON payload also gets caught.
+
+        The redactor lives in `app.security.redactor` — single seam,
+        tested in isolation. Keeping this method as a thin wrapper
+        means the Worker's audit-grade contract stays a one-line
+        transformation; future schema additions to the envelope (a
+        `params` field, a `metadata` field) get scrubbed for free.
+        """
+        return redact_envelope(envelope)
+
+    @staticmethod
     def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
         """Return a copy of `headers` with credential values replaced.
 
-        Used for the audit log: every header value is preserved
-        except those obviously tied to auth (Authorization, X-Api-Key,
-        X-Auth-Token, Cookie). The redaction is intentionally
-        lossy — replay safety beats replay completeness (ADR-0002).
+        Backwards-compatible header-only scrubber. The full envelope
+        scrubber (`_redact_envelope`) is preferred for new call
+        sites; this helper stays around so the existing test
+        `test_credential_header_injected_into_outgoing_request`
+        keeps working without a rewrite.
         """
-        redacted: dict[str, str] = {}
-        for key, value in headers.items():
-            if _is_sensitive_header(key):
-                redacted[key] = "[REDACTED]"
-            else:
-                redacted[key] = value
-        return redacted
+        return redact_headers(headers)
 
     # ------------------------------------------------------------------
     # Step 3 — Call with risk-aware retry (ADR-0017)
@@ -531,12 +545,14 @@ class ToolWorker:
                     tool_name=snapshot.name,
                     risk_level=snapshot.risk_level,
                     status="succeeded",
-                    request={
-                        "method": method,
-                        "url": url,
-                        "headers": self._redact_headers(headers),
-                        "body": body,
-                    },
+                    request=self._redact_envelope(
+                        {
+                            "method": method,
+                            "url": url,
+                            "headers": headers,
+                            "body": body,
+                        }
+                    ),
                     response=response_body,
                     retry_count=attempt - 1,
                 )
@@ -686,21 +702,11 @@ def _shape_secret(snapshot: ToolSnapshot, secret: str) -> tuple[str, str]:
     return ("X-Api-Key", secret)
 
 
-def _is_sensitive_header(name: str) -> bool:
-    """Decide whether a header's value is safe to put in the audit log.
-
-    Case-insensitive — HTTP header names are case-insensitive at the
-    semantic level even if the wire form is normalised.
-    """
-    upper = name.upper()
-    return upper in {
-        "AUTHORIZATION",
-        "X-API-KEY",
-        "X-AUTH-TOKEN",
-        "COOKIE",
-        "SET-COOKIE",
-        "PROXY-AUTHORIZATION",
-    }
+# Header-sensitive detection now lives in `app.security.redactor` —
+# the centralised `SENSITIVE_FIELDS` set keeps the Worker's audit
+# envelope and the logging filter on the same page. `_shape_secret`
+# stays here because it's a call-time helper that depends on the
+# snapshot's auth scheme, not a credential-bounding rule.
 
 
 def _substitute_template(value: Any, parameters: dict[str, Any]) -> Any:

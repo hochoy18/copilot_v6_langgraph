@@ -374,6 +374,91 @@ class TestCredentialInjection:
         assert "X-Api-Key" not in result.request["headers"]
         assert result.request["headers"]["Content-Type"] == "application/json"
 
+    async def test_body_credential_field_redacted_in_audit_envelope(
+        self,
+        credential_repo: CredentialRepository,
+    ) -> None:
+        """T33 / #29: an `api_key` body field is scrubbed from the audit envelope.
+
+        Defence-in-depth: the Worker's header scrubber (T21) caught
+        `Authorization` / `X-Api-Key`, but an upstream API that takes
+        the credential inside the JSON body would have leaked. The
+        new envelope scrubber walks the body recursively so the
+        `audit_logs` row + future Langfuse trace never see the secret.
+        """
+        snap = ToolSnapshot(
+            name="body_cred",
+            description="Tool that takes an api_key in body",
+            risk_level="read",
+            parameters_schema={
+                "type": "object",
+                "properties": {"customer": {"type": "string"}},
+                "required": ["customer"],
+            },
+            http_method="POST",
+            http_url_template="https://upstream.test/body",
+            http_headers={"Content-Type": "application/json"},
+            http_body_template={"customer": "{customer}", "api_key": "sk-secret-1234"},
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ok": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            w = ToolWorker(credential_repository=credential_repo, http_client=client)
+            result = await w.execute_with_credential(
+                plan_id="p",
+                node=PlanNode(
+                    node_id="n1",
+                    tool="body_cred",
+                    parameters={"customer": "ACME"},
+                ),
+                snapshot=snap,
+                actor_id="u",
+                credential_ref=None,
+            )
+        # The outgoing request carried the secret (the upstream needs it).
+        # But the audit envelope sees it scrubbed.
+        assert result.request["body"]["api_key"] == "[REDACTED]"
+        assert result.request["body"]["customer"] == "ACME"
+
+    async def test_audit_envelope_has_no_credential_bytes(
+        self,
+        credential_repo: CredentialRepository,
+    ) -> None:
+        """T33 acceptance — `result.request` carries no plaintext credential.
+
+        Mirrors the worker's full outgoing-request envelope and asserts
+        that a downstream consumer (audit log, Langfuse trace) can't
+        recover the secret by walking the dict.
+        """
+        await credential_repo.create(
+            CredentialCreate(
+                name="echo-key-2",
+                auth_type="api_key",
+                plaintext_payload={"api_key": "sk-secret-value"},
+            )
+        )
+        creds = await credential_repo.list_all()
+        row = await credential_repo.get_in_db(creds[0].id)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ok": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            w = ToolWorker(credential_repository=credential_repo, http_client=client)
+            result = await w.execute_with_credential(
+                plan_id="p",
+                node=_echo_node({"text": "x"}),
+                snapshot=_echo_snapshot(),
+                actor_id="u",
+                credential_ref=row.id,
+            )
+        # Walk the whole envelope to be sure no field carries the secret.
+        serialised = json.dumps(result.request)
+        assert "sk-secret-value" not in serialised
+        assert result.request["headers"].get("X-Api-Key") == "[REDACTED]"
+
 
 # ---------------------------------------------------------------------------
 # Risk-level retry matrix (ADR-0017)

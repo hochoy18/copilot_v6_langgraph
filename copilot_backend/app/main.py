@@ -19,11 +19,11 @@ import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.answer.generator import AnswerGenerator
 from app.api.admin_tools import router as admin_tools_router
 from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
-from app.answer.generator import AnswerGenerator
 from app.auth.login import build_state_store
 from app.auth.oidc import OIDCAdapter
 from app.db.mongo import MongoClient
@@ -31,11 +31,13 @@ from app.exceptions import register_exception_handlers
 from app.health import HealthChecker
 from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
+from app.memory.plan_history import InMemoryMilvusWriter
 from app.planner.planner import ToolPlanner
 from app.realtime.bus import SseEventBus
 from app.realtime.stream import router as sse_router
 from app.security.crypto import CredentialEncryptor
 from app.security.keys import build_credential_encryptor
+from app.security.logging_filter import install_credential_redaction_filter
 from app.settings import Settings, get_settings
 from app.tools.description_generator import ToolDescriptionGenerator
 
@@ -129,6 +131,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # permits this for the MVP. Stash on `app.state` so the SSE route's
     # dependency finds the same instance every request.
     app.state.sse_bus = SseEventBus()
+    # T31 / #27 — long-term-memory Plan-history writer. Default
+    # implementation is the in-memory recorder (tests + dev) so the
+    # seam is exercisable without a Milvus SDK on the box. A real
+    # `pymilvus`-backed writer is the deliberate follow-up (T32 or a
+    # dedicated SDK ticket) — ADR-0008 explicitly permits a degraded
+    # write path while the SDK lands: Milvus is the derived index,
+    # MongoDB is the truth.
+    app.state.milvus_plan_history_writer = InMemoryMilvusWriter()
     try:
         await _probe_dependencies(settings)
         yield
@@ -195,6 +205,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Unified error contract (ADR-0031).
     register_exception_handlers(app)
+
+    # T33 / #29 — credential redaction logging filter. Installed on
+    # the root logger so every `logger.info(...)` / `logger.exception(...)`
+    # that ever receives a credential byte (via `extra=`, `exc_info`,
+    # or accidental string-format of the Worker's `plaintext_payload`)
+    # sees the bytes replaced with `[REDACTED]` before the formatter
+    # writes to stdout / file / log-shipper sidecar. Idempotent — the
+    # helper short-circuits when the filter is already attached so
+    # test-suite app boots don't accumulate duplicate filters.
+    install_credential_redaction_filter()
 
     return app
 
