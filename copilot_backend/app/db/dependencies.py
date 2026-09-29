@@ -29,6 +29,7 @@ from app.answer.service import AnswerService
 from app.conversations.service import ConversationService
 from app.llm.prompts import PromptProvider
 from app.llm.provider import build_chat_model
+from app.memory.plan_history import MilvusPlanHistoryWriter
 from app.planner.planner import ToolPlanner
 from app.planner.service import PlannerService
 from app.realtime.bus import SseEventBus
@@ -315,18 +316,57 @@ def get_tool_worker(
     )
 
 
+def get_milvus_plan_history_writer(
+    request: Request,
+) -> MilvusPlanHistoryWriter | None:
+    """FastAPI dependency: return the long-term-memory writer (T31 / #27).
+
+    The writer is built once per process in the lifespan and stashed
+    on `app.state.milvus_plan_history_writer`. Tests override this
+    dependency to swap in a stub; production uses the
+    `InMemoryMilvusWriter` instance the lifespan installed (the real
+    `pymilvus`-backed writer is a deliberate follow-up — ADR-0008
+    explicitly permits this degraded seam while the SDK lands).
+
+    Returns `None` if no writer was installed; the Executor treats
+    `None` as "no memory write" and skips the Milvus upsert
+    altogether. The `None` fallback is the seam's documented
+    graceful-degradation path — unlike `get_sse_bus`, which raises
+    on the missing-bus branch because the SSE channel is the request's
+    primary delivery surface, the Milvus writer is a best-effort
+    derived index (ADR-0008) so a missing writer is a no-op rather
+    than a 5xx.
+    """
+    writer: MilvusPlanHistoryWriter | None = getattr(
+        request.app.state, "milvus_plan_history_writer", None
+    )
+    return writer
+
+
 def get_plan_executor(
     plan_repo: PlanRepository = Depends(get_plan_repository),  # noqa: B008
     plan_execution_repo: PlanExecutionRepository = Depends(get_plan_execution_repository),  # noqa: B008
     audit_repo: AuditLogRepository = Depends(get_audit_log_repository),  # noqa: B008
     tool_repo: ToolRepository = Depends(get_tool_repository),  # noqa: B008
     worker: ToolWorker = Depends(get_tool_worker),  # noqa: B008
+    turn_repo: TurnRepository = Depends(get_turn_repository),  # noqa: B008
+    milvus_writer: MilvusPlanHistoryWriter | None = Depends(get_milvus_plan_history_writer),  # noqa: B008
 ) -> PlanExecutor:
     """FastAPI dependency: build a `PlanExecutor` for this request (T21 / #18).
 
     Composes the four repositories the Executor writes to and the
     shared `ToolWorker`. The Executor itself holds no I/O buffers;
     a fresh instance per request is fine.
+
+    T31 / #27 threads two new optional collaborators through:
+
+    * `turn_repo` — the Executor needs the user instruction that
+      triggered the Plan (the Plan doc only carries the FK). The
+      dependency is required for the Milvus write seam; the seam is
+      best-effort, so a missing write simply skips.
+    * `milvus_writer` — process-wide writer stashed on `app.state` by
+      the lifespan. `None` in tests that haven't wired T31; the
+      Executor treats that as "no memory write" rather than raising.
     """
     return PlanExecutor(
         plan_repository=plan_repo,
@@ -334,6 +374,8 @@ def get_plan_executor(
         audit_log_repository=audit_repo,
         tool_repository=tool_repo,
         worker=worker,
+        turn_repository=turn_repo,
+        milvus_writer=milvus_writer,
     )
 
 

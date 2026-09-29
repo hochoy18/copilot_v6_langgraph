@@ -1,4 +1,4 @@
-"""Tests for `PlanExecutor` — T21 / #18.
+"""Tests for `PlanExecutor` — T21 / #18, T31 / #27.
 
 The Executor is the orchestrator that ties a Plan's approval to its
 run. Tests cover the four acceptance criteria from issue #18:
@@ -15,11 +15,24 @@ run. Tests cover the four acceptance criteria from issue #18:
    snapshot.
 5. **凭证调用瞬间注入** — verified by passing `credential_ref` and
    observing the Worker's outgoing request shape.
+
+T31 / #27 adds the `TestMilvusWrite` class which exercises the
+long-term-memory write path:
+
+* **AC #1 — Milvus 能查到对应向量** — a successful run pushes one
+  record into the writer with the conversation_id, plan_id, text,
+  and a 128-dim vector (matching `DEFAULT_EMBEDDING_DIM`).
+* **AC #2 — 含 conversation_id / plan_id / text** — pinned by the
+  same test.
+* **AC #3 — MongoDB 先写后 Milvus** — pinned by observing the Plan
+  row is at terminal status when the writer sees the upsert
+  (write ordering is testable without instrumenting Mongo).
 """
 from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -34,12 +47,20 @@ from app.db.schemas import (
     PlanNode,
     ToolCreate,
     ToolSnapshot,
+    TurnCreate,
+)
+from app.memory.embedding import DEFAULT_EMBEDDING_DIM
+from app.memory.plan_history import (
+    InMemoryMilvusWriter,
+    MilvusPlanHistoryWriter,
+    PlanHistoryRecord,
 )
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.credentials import CredentialRepository
 from app.repositories.plan_executions import PlanExecutionRepository
 from app.repositories.plans import PlanRepository
 from app.repositories.tools import ToolRepository
+from app.repositories.turns import TurnRepository
 from app.security.crypto import AesGcmEncryptor, MasterKey
 from app.tools.executor import PlanExecutor
 from app.tools.worker import ToolWorker
@@ -77,6 +98,11 @@ async def plan_repo(db: Any) -> PlanRepository:
 
 
 @pytest.fixture
+async def turn_repo(db: Any) -> TurnRepository:
+    return TurnRepository(db)
+
+
+@pytest.fixture
 async def plan_execution_repo(db: Any) -> PlanExecutionRepository:
     return PlanExecutionRepository(db)
 
@@ -107,6 +133,8 @@ def _make_worker_and_executor(
     plan_execution_repo: PlanExecutionRepository,
     audit_repo: AuditLogRepository,
     handler: Any,
+    turn_repo: TurnRepository | None = None,
+    milvus_writer: MilvusPlanHistoryWriter | None = None,
 ) -> tuple[ToolWorker, PlanExecutor]:
     transport = httpx.MockTransport(handler)
     http_client = httpx.AsyncClient(transport=transport)
@@ -120,6 +148,8 @@ def _make_worker_and_executor(
         audit_log_repository=audit_repo,
         tool_repository=tool_repo,
         worker=worker,
+        turn_repository=turn_repo,
+        milvus_writer=milvus_writer,
     )
     return worker, executor
 
@@ -175,6 +205,87 @@ async def _seed_approved_plan(
             tool_snapshots=[snapshot],
         ),
     )
+
+
+async def _seed_turn_with_plan(
+    turn_repo: TurnRepository,
+    plan_repo: PlanRepository,
+    *,
+    conversation_id: str,
+    user_instruction: str,
+    snapshot: ToolSnapshot,
+    node: PlanNode,
+) -> Plan:
+    """Seed a Turn, then an `approved` Plan whose `turn_id` points
+    to the freshly-created Turn.
+
+    The Executor (T31) looks up the Turn via `TurnRepository.get`
+    to render the user instruction into the Milvus summary — a
+    Plan with a non-ObjectId turn_id would roundtrip cleanly through
+    `create` but blow up at write time. This helper wires both rows
+    the way production would.
+    """
+    turn = await turn_repo.create(
+        TurnCreate(
+            conversation_id=conversation_id,
+            role="user",
+            content=user_instruction,
+            extra={},
+        ),
+    )
+    return await plan_repo.create(
+        PlanCreate(
+            conversation_id=conversation_id,
+            turn_id=turn.id,
+            status="approved",
+            nodes=[node],
+            edges=[],
+            tool_snapshots=[snapshot],
+        ),
+    )
+
+
+async def _make_echo_plan(
+    *,
+    tool_repo: ToolRepository,
+    turn_repo: TurnRepository,
+    plan_repo: PlanRepository,
+    user_instruction: str = "hi",
+) -> tuple[str, Plan]:
+    """Seed an `echo` Tool, a Turn, and a one-node Plan.
+
+    The four TestMilvusWrite tests share the same Plan shape — a
+    read-risk `echo` Tool with a `text` parameter and a body
+    template that re-emits it. Centralising the boilerplate here
+    keeps the per-test bodies focused on what each one actually
+    pins.
+    """
+    tool_id = await _seed_tool(tool_repo)
+    snapshot = ToolSnapshot(
+        tool_id=tool_id,
+        name="echo",
+        description="Echo back the input text",
+        risk_level="read",
+        parameters_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        http_method="POST",
+        http_url_template="https://upstream.test/echo",
+        http_headers={"Content-Type": "application/json"},
+        http_body_template={"echo": "{text}"},
+    )
+    node = PlanNode(node_id="n1", tool="echo", parameters={"text": "hi"})
+    plan = await _seed_turn_with_plan(
+        turn_repo=turn_repo,
+        plan_repo=plan_repo,
+        conversation_id="conv-1",
+        user_instruction=user_instruction,
+        snapshot=snapshot,
+        node=node,
+    )
+    return tool_id, plan
 
 
 # ---------------------------------------------------------------------------
@@ -651,3 +762,251 @@ class TestSchemaViolationFeedback:
             v["validator"] == "type"
             for v in audit_row.error["violations"]
         )
+
+
+# ---------------------------------------------------------------------------
+# T31 / #27 — long-term-memory write path
+# ---------------------------------------------------------------------------
+
+
+class _MilvusWriteProbe:
+    """Test double that records calls and optionally raises on upsert.
+
+    The `raise_on_upsert` switch is the failure-doesn't-abort seam
+    for the defensive `try/except` test.
+    """
+
+    def __init__(self, *, raise_on_upsert: bool = False) -> None:
+        self.records: list[PlanHistoryRecord] = []
+        self.raise_on_upsert = raise_on_upsert
+
+    async def upsert_summary(self, record: PlanHistoryRecord) -> None:
+        if self.raise_on_upsert:
+            raise RuntimeError("simulated milvus outage")
+        self.records.append(record)
+
+
+class TestMilvusWrite:
+    """T31 / #27 — Plan completion pushes a summary into long-term memory.
+
+    The Executor accepts an optional Milvus writer. When wired, a
+    successful run lands exactly one record in the writer's
+    `records` list; the record carries every field the SPEC
+    §Data model promises for `plan_history_vectors` (AC #1 + AC #2).
+
+    The writer is best-effort: a Milvus exception does not unwind
+    the Plan execution (AC #3 + ADR-0008).
+    """
+
+    async def test_succeeded_plan_writes_summary_to_milvus(
+        self,
+        credential_repo: CredentialRepository,
+        tool_repo: ToolRepository,
+        plan_repo: PlanRepository,
+        plan_execution_repo: PlanExecutionRepository,
+        audit_repo: AuditLogRepository,
+        turn_repo: TurnRepository,
+    ) -> None:
+        """A successful run pushes one record carrying conversation_id,
+        plan_id, non-empty text, and a 128-dim vector (AC #1 + #2)."""
+        _, plan = await _make_echo_plan(
+            tool_repo=tool_repo,
+            turn_repo=turn_repo,
+            plan_repo=plan_repo,
+            user_instruction="echo something for me",
+        )
+
+        writer = InMemoryMilvusWriter()
+        _, executor = _make_worker_and_executor(
+            credential_repo=credential_repo,
+            tool_repo=tool_repo,
+            plan_repo=plan_repo,
+            plan_execution_repo=plan_execution_repo,
+            audit_repo=audit_repo,
+            handler=_echo_handler,
+            turn_repo=turn_repo,
+            milvus_writer=writer,
+        )
+        outcome = await executor.execute_plan(
+            plan=plan,
+            actor_id="user-1",
+            conversation_id="conv-1",
+            turn_id=plan.turn_id,
+        )
+
+        assert outcome.plan.status == "succeeded"
+        # Exactly one write — the Plan completed exactly once.
+        assert len(writer.records) == 1
+        record = writer.records[0]
+        assert record.plan_id == plan.id
+        assert record.conversation_id == "conv-1"
+        assert record.text  # non-empty
+        assert "echo something for me" in record.text
+        assert len(record.vector) == DEFAULT_EMBEDDING_DIM
+
+    async def test_milvus_write_failure_does_not_abort_plan(
+        self,
+        credential_repo: CredentialRepository,
+        tool_repo: ToolRepository,
+        plan_repo: PlanRepository,
+        plan_execution_repo: PlanExecutionRepository,
+        audit_repo: AuditLogRepository,
+        turn_repo: TurnRepository,
+    ) -> None:
+        """A raising Milvus writer does NOT prevent the Plan from
+        flipping to `succeeded`. ADR-0008: Milvus is the derived
+        index; MongoDB is the truth. The best-effort envelope is the
+        seam that enforces this."""
+        _, plan = await _make_echo_plan(
+            tool_repo=tool_repo,
+            turn_repo=turn_repo,
+            plan_repo=plan_repo,
+        )
+
+        probe = _MilvusWriteProbe(raise_on_upsert=True)
+        _, executor = _make_worker_and_executor(
+            credential_repo=credential_repo,
+            tool_repo=tool_repo,
+            plan_repo=plan_repo,
+            plan_execution_repo=plan_execution_repo,
+            audit_repo=audit_repo,
+            handler=_echo_handler,
+            turn_repo=turn_repo,
+            milvus_writer=probe,
+        )
+        # The exception is swallowed; the Plan still flips to
+        # `succeeded` and the executor returns normally.
+        outcome = await executor.execute_plan(
+            plan=plan,
+            actor_id="user-1",
+            conversation_id="conv-1",
+            turn_id=plan.turn_id,
+        )
+        assert outcome.plan.status == "succeeded"
+        # No records landed because the upsert raised before append.
+        assert probe.records == []
+
+    async def test_mongo_writes_complete_before_milvus(
+        self,
+        credential_repo: CredentialRepository,
+        tool_repo: ToolRepository,
+        plan_repo: PlanRepository,
+        plan_execution_repo: PlanExecutionRepository,
+        audit_repo: AuditLogRepository,
+        turn_repo: TurnRepository,
+    ) -> None:
+        """AC #3 — MongoDB 先写后 Milvus. The Executor's call order
+        is: `plan_executions.set_status(aggregate)` →
+        `plans.set_status(final)` → `upsert_summary(record)`. The
+        Plan row read inside `_write_plan_history` (and again from
+        the response object) must already reflect `succeeded` /
+        `failed` when the writer fires.
+
+        Pinning this with an in-memory probe + a follow-up repo read
+        is the cheapest way to assert ordering without instrumenting
+        Mongo; the test fails loudly if the seam is ever reversed.
+        """
+        _, plan = await _make_echo_plan(
+            tool_repo=tool_repo,
+            turn_repo=turn_repo,
+            plan_repo=plan_repo,
+        )
+
+        # The probe records the Plan's persisted status at the moment
+        # of the upsert. By contract, the upsert fires AFTER both
+        # `plan_executions.set_status` and `plans.set_status`, so the
+        # probe should observe the terminal status (`succeeded`).
+        class _OrderingProbe:
+            def __init__(self, plan_repo: PlanRepository) -> None:
+                self._plans = plan_repo
+                self.observed_statuses: list[str] = []
+
+            async def upsert_summary(self, record: PlanHistoryRecord) -> None:
+                # Read the persisted Plan row inside the upsert
+                # callback — this is what production would observe.
+                current = await self._plans.get(record.plan_id)
+                self.observed_statuses.append(current.status)
+
+        probe = _OrderingProbe(plan_repo)
+        _, executor = _make_worker_and_executor(
+            credential_repo=credential_repo,
+            tool_repo=tool_repo,
+            plan_repo=plan_repo,
+            plan_execution_repo=plan_execution_repo,
+            audit_repo=audit_repo,
+            handler=_echo_handler,
+            turn_repo=turn_repo,
+            milvus_writer=probe,
+        )
+        await executor.execute_plan(
+            plan=plan,
+            actor_id="user-1",
+            conversation_id="conv-1",
+            turn_id=plan.turn_id,
+        )
+        assert probe.observed_statuses == ["succeeded"]
+
+    async def test_empty_plan_does_not_write_milvus(
+        self,
+        credential_repo: CredentialRepository,
+        tool_repo: ToolRepository,
+        plan_repo: PlanRepository,
+        plan_execution_repo: PlanExecutionRepository,
+        audit_repo: AuditLogRepository,
+        turn_repo: TurnRepository,
+    ) -> None:
+        """Smalltalk / zero-node Plans (ADR-0004) do NOT pollute the
+        Milvus index.
+
+        The `PlanRepository.create` seam enforces `if not data.nodes:
+        raise ValidationError`, so a zero-node Plan cannot reach the
+        Executor's full pipeline — but the seam still has a guard
+        for any future caller (e.g. a backfill job) that bypasses the
+        repo. Reach for the seam directly with a hand-built empty
+        `Plan` so the guard is exercised without fighting the repo.
+        """
+        snapshot = ToolSnapshot(
+            name="echo",
+            description="Echo back the input text",
+            risk_level="read",
+            parameters_schema={"type": "object"},
+            http_method="POST",
+            http_url_template="https://upstream.test/echo",
+            http_headers={"Content-Type": "application/json"},
+            http_body_template=None,
+        )
+        # A bare `Plan(...)` with `nodes=[]` is structurally valid —
+        # only the binding check (every node.tool must appear in
+        # `tool_snapshots`) trips on zero-node docs, and that check
+        # is silent when there are no nodes to validate. We don't
+        # need a Turn in the DB because the guard short-circuits
+        # before any lookup happens.
+        empty_plan = Plan(
+            _id="000000000000000000000000",
+            conversation_id="conv-1",
+            turn_id="000000000000000000000000",
+            status="approved",
+            nodes=[],
+            edges=[],
+            tool_snapshots=[snapshot],
+            edited_diff=None,
+            created_at=datetime.now(tz=UTC),
+            updated_at=datetime.now(tz=UTC),
+        )
+        writer = InMemoryMilvusWriter()
+        _, executor = _make_worker_and_executor(
+            credential_repo=credential_repo,
+            tool_repo=tool_repo,
+            plan_repo=plan_repo,
+            plan_execution_repo=plan_execution_repo,
+            audit_repo=audit_repo,
+            handler=_echo_handler,
+            turn_repo=turn_repo,
+            milvus_writer=writer,
+        )
+        # Drive the guard directly. `_write_plan_history` is the seam
+        # the executor's `execute_plan` calls after the Mongo writes;
+        # calling it in isolation keeps the test honest about which
+        # branch it pins.
+        await executor._write_plan_history(empty_plan)  # noqa: SLF001 — seam test
+        assert writer.records == []
