@@ -1,4 +1,4 @@
-"""`ToolPlanner` — the Planner LLM call (T18 / #16, ADR-0004 / ADR-0013).
+"""`ToolPlanner` — the Planner LLM call (T18 / #16, T25 / #22, ADR-0004 / ADR-0013).
 
 Implements the "Planner LLM 调用" step of SPEC §Planner 执行流: render
 the Langfuse `planner` Prompt with the active-Tool catalog and the
@@ -19,12 +19,19 @@ Behavioural rules worth knowing before editing:
   the import route. The Prompt ladder (ADR-0013) stays invisible
   here — `PromptProvider.get_prompt` already degrades fetch → cache
   → bootstrap.
-* **T18 emits single-node Plans through the Prompt, not the code.**
-  The bootstrap template constrains output to ≤1 Tool call; the
-  parser accepts N nodes and returns them in order so T25 (#22) can
-  upgrade the Langfuse copy without a deploy. Edges stay out of the
-  contract until T25 (data-dependency binding is Worker-side,
-  ADR-0012).
+* **T25 emits multi-node Plans through the Prompt.** The bootstrap
+  template asks for `nodes` (N invocations) plus `edges`
+  (`{"source": i, "target": j}` 1-based pairs, ADR-0012 data-
+  dependency edges); the parser accepts up to N nodes and a matching
+  edge list. Edge endpoints are positional indices into the LLM's
+  own `nodes` array — the service maps them onto the assigned
+  `n{index}` `node_id`s once they survive validation.
+* **Edges are validated with the same "drop-with-warning, never bind
+  to a guessed row" rule.** Self-loops, unknown indices, duplicate
+  pairs, and cycle-closing edges are silently dropped (with a
+  warning) so a single malformed edge cannot reject an otherwise
+  valid Plan. The `PlanBase` validator still re-checks the surviving
+  edges at persistence time as a defence-in-depth guard.
 * **Parameters are not schema-validated here.** The Worker validates
   against the frozen `parameters_schema` before invoking (ADR-0020,
   T21 / T34); a half-filled argument set is reviewable in the HITL
@@ -63,6 +70,13 @@ MAX_TOOLS_IN_CATALOG = 50
 # a sane prompt budget.
 _MAX_DESCRIPTION_IN_CATALOG = 300
 
+# Upper bound on the Planner-authored Plan DAG size — T25 / #22.
+# A bound here keeps a hallucinated `"nodes": [...9999 entries...]`
+# from turning one user Turn into a Plan the executor hangs on.
+# MVP Plans are <10 nodes; the cap leaves headroom without inviting
+# unbounded generation.
+MAX_NODES_PER_PLAN = 50
+
 
 @dataclass(frozen=True, slots=True)
 class PlannedNode:
@@ -80,17 +94,35 @@ class PlannedNode:
 
 
 @dataclass(frozen=True, slots=True)
+class PlannedEdge:
+    """One data-dependency edge in the LLM-side contract (T25 / #22).
+
+    `source` / `target` are 1-based indices into the LLM's `nodes`
+    array, NOT the assigned `node_id`s — those land at persistence
+    time (`PlannerService._persist_plan` maps the positions onto the
+    `n{index}` convention). Positional indices keep the LLM contract
+    terse and side-step stringly-typed mistakes like `"n1"` / `"N1"`.
+    """
+
+    source: int
+    target: int
+
+
+@dataclass(frozen=True, slots=True)
 class PlanIntent:
-    """Parsed Planner output: bound nodes plus non-fatal warnings.
+    """Parsed Planner output: bound nodes, edges, and non-fatal warnings.
 
     Empty `nodes` is a legitimate answer — ADR-0004 lets the Planner
     skip Plan generation when no Tool is involved (smalltalk, or a
-    required parameter it could not resolve). `warnings` explain
-    *why* nodes are missing when the drop was not the model's choice
-    (unknown Tool names, catalog truncation).
+    required parameter it could not resolve). `edges` are positional
+    (see `PlannedEdge`); the service resolves them to `node_id`s.
+    `warnings` explain *why* nodes / edges were dropped when the drop
+    was not the model's choice (unknown Tool names, catalog
+    truncation, malformed edges, cycles).
     """
 
     nodes: list[PlannedNode]
+    edges: list[PlannedEdge] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -197,7 +229,7 @@ def render_tool_catalog(tools: Sequence[Tool]) -> str:
 
 
 def parse_planner_output(content: str, tools: Sequence[Tool]) -> PlanIntent:
-    """Parse the `{"nodes": [...]}` contract and bind names to Tools.
+    """Parse the `{"nodes": [...], "edges": [...]}` contract (T25 / #22).
 
     Binding is exact-match against the catalog (the active set):
     unknown names are dropped with a warning listing them, so a
@@ -206,10 +238,21 @@ def parse_planner_output(content: str, tools: Sequence[Tool]) -> PlanIntent:
     else degrades that node's parameters to `{}` with a warning
     rather than rejecting the whole Plan.
 
+    Edges are positional (`{"source": i, "target": j}` 1-based
+    indices into the LLM's `nodes` array). The validation ladder is
+    "drop-with-warning, never bind to a guessed row": self-loops,
+    unknown indices, duplicate pairs, and cycle-closing edges are
+    silently removed from the Plan and surfaced as warnings — one
+    bad edge cannot reject an otherwise valid Plan. `PlanBase`'s
+    validator still re-checks the surviving edges at persistence
+    time as a defence-in-depth guard (ADR-0012: a cycle would hang
+    the executor).
+
     Raises:
         LLMGenerationError: output is not JSON, or `nodes` is missing
             / not a list, or an entry is not an object with a string
-            `tool`.
+            `tool`, or `edges` is present but not a list, or an edge
+            entry lacks an integer `source` / `target`.
     """
     by_name: dict[str, Tool] = {tool.name: tool for tool in tools}
     payload = extract_json_object(content)
@@ -235,8 +278,20 @@ def parse_planner_output(content: str, tools: Sequence[Tool]) -> PlanIntent:
             details={"reason": "'nodes' is not a list"},
         )
 
-    nodes: list[PlannedNode] = []
     warnings: list[str] = []
+
+    # Same "no silent caps" rule as `MAX_TOOLS_IN_CATALOG`: a runaway
+    # LLM that returns thousands of nodes would turn one user Turn
+    # into a Plan the executor hangs on. Truncate + announce.
+    if len(raw_nodes) > MAX_NODES_PER_PLAN:
+        warnings.append(
+            f"Planner 返回的节点数({len(raw_nodes)})超过上限 {MAX_NODES_PER_PLAN}, "
+            "已截断到前 "
+            f"{MAX_NODES_PER_PLAN} 个节点。"
+        )
+        raw_nodes = raw_nodes[:MAX_NODES_PER_PLAN]
+
+    nodes: list[PlannedNode] = []
     unknown: list[str] = []
     for entry in raw_nodes:
         if not isinstance(entry, dict) or not isinstance(entry.get("tool"), str):
@@ -273,12 +328,149 @@ def parse_planner_output(content: str, tools: Sequence[Tool]) -> PlanIntent:
             + ", ".join(unknown)
             + "。"
         )
-    return PlanIntent(nodes=nodes, warnings=warnings)
+
+    edges = _parse_edges(payload.get("edges"), node_count=len(nodes), warnings=warnings)
+
+    return PlanIntent(nodes=nodes, edges=edges, warnings=warnings)
+
+
+def _parse_edges(
+    raw_edges: object,
+    *,
+    node_count: int,
+    warnings: list[str],
+) -> list[PlannedEdge]:
+    """Parse the LLM-side `edges` array into validated `PlannedEdge`s.
+
+    Runs the same drop-with-warning ladder as `parse_planner_output`
+    for nodes: unknown indices, self-loops, duplicates, and cycle-
+    closing edges are silently dropped (each with a warning) so one
+    bad edge never rejects an otherwise valid Plan. A missing /
+    `None` `edges` key is treated as `[]` — the T18 contract never
+    had one, so a model still on the old prompt is not penalised.
+    """
+    if raw_edges is None:
+        return []
+    if not isinstance(raw_edges, list):
+        raise LLMGenerationError(
+            message_en="Planner output is not the JSON contract",
+            details={"reason": "'edges' is not a list"},
+        )
+    # Per-reason drop bucket — warnings are batched at the end so a
+    # batch of self-loops produces one message, not N. Keys match the
+    # human-readable reason emitted below; values are the dropped
+    # `source -> target` pair labels.
+    drops: dict[str, list[str]] = {
+        "self_loop": [],
+        "unknown_index": [],
+        "duplicate": [],
+        "cycle_closer": [],
+    }
+
+    accepted: list[PlannedEdge] = []
+    seen: set[tuple[int, int]] = set()
+    # Forward adjacency of already-accepted edges, fed to the per-edge
+    # cycle check. Stays small: capped by `MAX_NODES_PER_PLAN`, and
+    # only surviving edges land here.
+    outgoing: dict[int, list[int]] = {}
+
+    for entry in raw_edges:
+        if not isinstance(entry, dict):
+            raise LLMGenerationError(
+                message_en="Planner output is not the JSON contract",
+                details={"reason": "an edge is not an object"},
+            )
+        raw_source = entry.get("source")
+        raw_target = entry.get("target")
+        if (
+            not isinstance(raw_source, int)
+            or isinstance(raw_source, bool)
+            or not isinstance(raw_target, int)
+            or isinstance(raw_target, bool)
+        ):
+            raise LLMGenerationError(
+                message_en="Planner output is not the JSON contract",
+                details={"reason": "an edge lacks integer source/target"},
+            )
+        pair_label = f"{raw_source} -> {raw_target}"
+
+        if raw_source == raw_target:
+            drops["self_loop"].append(pair_label)
+            continue
+        if not (1 <= raw_source <= node_count) or not (1 <= raw_target <= node_count):
+            drops["unknown_index"].append(pair_label)
+            continue
+        key = (raw_source, raw_target)
+        if key in seen:
+            drops["duplicate"].append(pair_label)
+            continue
+
+        # Cycle check: would adding this edge close a cycle in the
+        # graph of already-accepted edges? Reach forward from target
+        # — if source is reachable from target, the new edge closes
+        # the loop. A per-edge forward-DFS is O(N) per insertion,
+        # cheap at the `MAX_NODES_PER_PLAN` bound.
+        if _closes_cycle(outgoing, raw_source, raw_target):
+            drops["cycle_closer"].append(pair_label)
+            continue
+
+        seen.add(key)
+        outgoing.setdefault(raw_source, []).append(raw_target)
+        accepted.append(PlannedEdge(source=raw_source, target=raw_target))
+
+    # Emit one warning per non-empty bucket — same batched-shape rule
+    # as the nodes ladder. Keys here are bucket IDs; values are the
+    # Chinese-rendered reason the parser uses for that drop class.
+    _DROP_REASONS: dict[str, str] = {
+        "unknown_index": "引用未知节点",
+        "self_loop": "自环边",
+        "duplicate": "重复的边",
+        "cycle_closer": "会产生环路的边",
+    }
+    for reason_key, dropped in drops.items():
+        if dropped:
+            warnings.append(
+                f"Planner 返回了{_DROP_REASONS[reason_key]}, 已忽略: "
+                + ", ".join(dropped)
+                + "。"
+            )
+    return accepted
+
+
+def _closes_cycle(
+    outgoing: dict[int, list[int]],
+    source: int,
+    target: int,
+) -> bool:
+    """True iff adding `source -> target` would close a cycle.
+
+    Walks the existing forward adjacency from `target`; if `source`
+    is reachable, the new edge closes a loop. Stack-based DFS keeps
+    the implementation allocation-light for the small N a Planner
+    Plan ever sees.
+    """
+    if source == target:
+        return True
+    stack: list[int] = [target]
+    visited: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if current == source:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        for nxt in outgoing.get(current, ()):
+            if nxt not in visited:
+                stack.append(nxt)
+    return False
 
 
 __all__ = [
+    "MAX_NODES_PER_PLAN",
     "MAX_TOOLS_IN_CATALOG",
     "PlanIntent",
+    "PlannedEdge",
     "PlannedNode",
     "ToolPlanner",
     "parse_planner_output",

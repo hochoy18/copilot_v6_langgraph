@@ -27,7 +27,7 @@ from app.conversations.errors import (
     ConversationArchivedError,
 )
 from app.db.errors import NotFoundError
-from app.db.schemas import ConversationCreate, ToolCreate, TurnCreate
+from app.db.schemas import ConversationCreate, PlanEdge, ToolCreate, TurnCreate
 from app.llm.prompts import PromptProvider
 from app.planner.planner import ToolPlanner
 from app.planner.service import PlannerService
@@ -324,6 +324,133 @@ class TestSubmitTurnHappyPath:
         assert outcome.plan is not None
         assert [n.node_id for n in outcome.plan.nodes] == ["n1", "n2"]
         assert len(outcome.plan.tool_snapshots) == 1
+
+    async def test_echo_a_then_echo_b_persists_two_nodes_with_edge(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """T25 AC #1 + #2: echo A 然后 echo B → 2 nodes with 1 data-dependency edge.
+
+        The LLM returns 1-based indices (1→2); the service maps these
+        onto the assigned `n{index}` `node_id`s so the persisted Plan
+        is the ADR-0012 DAG the executor and React Flow renderer expect.
+        """
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, _ = _planner(
+            '{"nodes": ['
+            '{"tool": "echo", "parameters": {"text": "A"}, "notes": "先回显 A"}, '
+            '{"tool": "echo", "parameters": {"text": "B"}, "notes": "再回显 B"}'
+            '], '
+            '"edges": [{"source": 1, "target": 2}]}'
+        )
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+        )
+        outcome = await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="先 echo A 再 echo B",
+        )
+        assert outcome.plan is not None
+        assert len(outcome.plan.nodes) == 2
+        assert [n.node_id for n in outcome.plan.nodes] == ["n1", "n2"]
+        assert outcome.plan.edges == [
+            PlanEdge(source="n1", target="n2")
+        ]
+        # Edges survive a re-read (they're persisted, not just returned).
+        stored = await plan_repo.get(outcome.plan.id)
+        assert stored.edges == [PlanEdge(source="n1", target="n2")]
+
+    async def test_independent_parallel_nodes_have_no_edges(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """Two unrelated lookups → 2 nodes, no edges — ADR-0012 parallel branch."""
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, _ = _planner(
+            '{"nodes": ['
+            '{"tool": "echo", "parameters": {"text": "x"}}, '
+            '{"tool": "echo", "parameters": {"text": "y"}}'
+            '], '
+            '"edges": []}'
+        )
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+        )
+        outcome = await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="并行查两件事",
+        )
+        assert outcome.plan is not None
+        assert len(outcome.plan.nodes) == 2
+        assert outcome.plan.edges == []
+
+    async def test_three_node_chain_persists_two_edges(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """A → B → C chain: 3 nodes, 2 edges."""
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, _ = _planner(
+            '{"nodes": ['
+            '{"tool": "echo", "parameters": {"text": "a"}}, '
+            '{"tool": "echo", "parameters": {"text": "b"}}, '
+            '{"tool": "echo", "parameters": {"text": "c"}}'
+            '], '
+            '"edges": [{"source": 1, "target": 2}, {"source": 2, "target": 3}]}'
+        )
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+        )
+        outcome = await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="链式三步",
+        )
+        assert outcome.plan is not None
+        assert len(outcome.plan.nodes) == 3
+        assert outcome.plan.edges == [
+            PlanEdge(source="n1", target="n2"),
+            PlanEdge(source="n2", target="n3"),
+        ]
+
+    async def test_cyclic_edges_from_planner_are_dropped_before_persist(
+        self,
+        conversation_repo: ConversationRepository,
+        turn_repo: TurnRepository,
+        plan_repo: PlanRepository,
+        tool_repo: ToolRepository,
+    ) -> None:
+        """The parser drops cycle-closing edges; only acyclic ones reach MongoDB."""
+        conv_id = await _seed_conversation(conversation_repo)
+        await _seed_active_tool(tool_repo)
+        planner, _ = _planner(
+            '{"nodes": ['
+            '{"tool": "echo"}, '
+            '{"tool": "echo"}'
+            '], '
+            '"edges": [{"source": 1, "target": 2}, {"source": 2, "target": 1}]}'
+        )
+        svc = _service(
+            conversation_repo=conversation_repo, turn_repo=turn_repo,
+            plan_repo=plan_repo, tool_repo=tool_repo, planner=planner,
+        )
+        outcome = await svc.submit_turn(
+            conversation_id=conv_id, user_id=_USER_ID, content="bad plan",
+        )
+        assert outcome.plan is not None
+        assert outcome.plan.edges == [PlanEdge(source="n1", target="n2")]
+        assert any("环" in w or "cycle" in w for w in outcome.warnings)
 
     async def test_turn_keeps_conversation_active(
         self,

@@ -1,4 +1,4 @@
-"""`PlannerService` — user Turn → Plan orchestration (T18 / #16).
+"""`PlannerService` — user Turn → Plan orchestration (T18 / #16, T25 / #22).
 
 One `POST /api/v1/conversations/{id}/turns` (ADR-0031 "发起用户轮次")
 is one call into this module. It owns the write order and the
@@ -22,6 +22,12 @@ The order is deliberate:
    `active` Tool rows at generation time (ADR-0027) — from here on
    the Plan is self-contained: the HITL preview (T20), the Worker
    (T21), and audit replay never read the mutable `tools` row.
+4. **T25: map positional edges onto `node_id`s.** The LLM returns
+   edges as 1-based indices into its own `nodes` array (see
+   `PlannedEdge`); the service translates them onto the assigned
+   `n{index}` `node_id`s before insert. The translation is the one
+   place that knows both representations — keeping `PlannedEdge`
+   positional preserves the LLM-side contract's brevity.
 
 The Plan lands with status `pending`: no Tool ever executes from
 this path (ADR-0004's mandatory preview). Approval is T20's endpoint.
@@ -44,6 +50,7 @@ from app.conversations.errors import (
 from app.db.schemas import (
     Plan,
     PlanCreate,
+    PlanEdge,
     PlanNode,
     Tool,
     ToolSnapshot,
@@ -55,7 +62,7 @@ from app.llm.errors import (
     LLMGenerationError,
     PromptUnavailableError,
 )
-from app.planner.planner import PlannedNode, ToolPlanner
+from app.planner.planner import PlannedEdge, PlannedNode, ToolPlanner
 from app.repositories.conversations import ConversationRepository
 from app.repositories.plans import PlanRepository
 from app.repositories.tools import ToolRepository
@@ -171,6 +178,7 @@ class PlannerService:
                         conversation_id=conversation_id,
                         turn=turn,
                         nodes=intent.nodes,
+                        edges=intent.edges,
                     )
                     if plan is not None:
                         turn = await self._turns.set_plan_id(turn.id, plan.id)
@@ -187,12 +195,20 @@ class PlannerService:
         conversation_id: str,
         turn: Turn,
         nodes: list[PlannedNode],
+        edges: list[PlannedEdge],
     ) -> Plan | None:
         """Freeze snapshots and insert the Plan; `None` for no nodes.
 
         Snapshot set is one entry per *distinct* Tool (name-uniqueness
         is a `PlanBase` invariant), assigned in first-appearance order
         so re-planning the same instruction yields the same doc shape.
+
+        Edges (T25 / #22) arrive as 1-based positional indices into
+        the LLM's `nodes` array; this method translates them onto the
+        assigned `n{index}` `node_id`s so the persisted Plan uses the
+        ADR-0012 string-endpoint contract the executor and the React
+        Flow renderer expect. `PlanBase`'s validator re-checks the
+        edges at insert time as a defence-in-depth guard.
         """
         if not nodes:
             return None
@@ -202,20 +218,29 @@ class PlannerService:
             if node.tool.name not in snapshots:
                 snapshots[node.tool.name] = _snapshot_of(node.tool)
 
+        # Stable per-Plan id assignment mirrors the LLM-side positional
+        # convention (`n1` = first node, …), so the index → id mapping
+        # is purely positional and needs no lookup table.
+        node_ids = [f"n{index}" for index in range(1, len(nodes) + 1)]
+        plan_edges = [
+            PlanEdge(source=node_ids[edge.source - 1], target=node_ids[edge.target - 1])
+            for edge in edges
+        ]
+
         create = PlanCreate(
             conversation_id=conversation_id,
             turn_id=turn.id,
             status="pending",
             nodes=[
                 PlanNode(
-                    node_id=f"n{index}",
+                    node_id=node_ids[index - 1],
                     tool=node.tool.name,
                     parameters=node.parameters,
                     notes=node.notes[:_MAX_NOTES_LENGTH],
                 )
                 for index, node in enumerate(nodes, start=1)
             ],
-            edges=[],
+            edges=plan_edges,
             tool_snapshots=list(snapshots.values()),
         )
         return await self._plans.create(create)

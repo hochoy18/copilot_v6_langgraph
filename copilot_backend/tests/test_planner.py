@@ -36,6 +36,7 @@ from app.llm.prompts import (
     render_template,
 )
 from app.planner.planner import (
+    MAX_NODES_PER_PLAN,
     MAX_TOOLS_IN_CATALOG,
     PlanIntent,
     ToolPlanner,
@@ -168,7 +169,8 @@ async def test_planner_bootstrap_ladder_floor() -> None:
 
     AC "用 Langfuse planner prompt" — the ladder's floor keeps the
     Planner working offline; the bootstrap must carry the same
-    `{{tools}}` / `{{input}}` placeholders and the `nodes` contract.
+    `{{tools}}` / `{{input}}` placeholders and the T25 `nodes` /
+    `edges` contract.
     """
     provider = PromptProvider(
         settings=Settings(),  # no langfuse keys → fetch off
@@ -179,6 +181,10 @@ async def test_planner_bootstrap_ladder_floor() -> None:
     assert "{{tools}}" in template.text
     assert "{{input}}" in template.text
     assert '"nodes"' in template.text
+    # T25 multi-node contract: the bootstrap must allow N nodes and
+    # expose the `edges` key so a model reading the floor stays
+    # consistent with Langfuse copy.
+    assert '"edges"' in template.text
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +315,151 @@ class TestParsePlannerOutput:
             [_tool()],
         )
         assert len(intent.nodes) == 2
+
+
+# ---------------------------------------------------------------------------
+# parse_planner_output — multi-node + edges (T25 / #22)
+#
+# T25 extends the LLM contract with an `edges` array. Each edge is a
+# `{source, target}` pair of 1-based indices into the `nodes` array,
+# which the service maps to the assigned `n{index}` `node_id`s. The
+# same "drop-with-warning, never bind to guessed row" rule applies:
+# a malformed edge can never become an executable Plan, and a cycle
+# can never hang the executor (ADR-0012).
+# ---------------------------------------------------------------------------
+
+
+class TestParsePlannerOutputEdges:
+    def test_dependent_two_node_plan_parses_edges(self) -> None:
+        """AC #1 (T25): echo A 然后 echo B returns 2 nodes + 1 edge."""
+        tools = [_tool(name="echo"), _tool(name="lookup")]
+        intent = parse_planner_output(
+            '{"nodes": ['
+            '{"tool": "echo", "parameters": {"text": "A"}}, '
+            '{"tool": "echo", "parameters": {"text": "B"}}'
+            '], '
+            '"edges": [{"source": 1, "target": 2}]}',
+            tools,
+        )
+        assert len(intent.nodes) == 2
+        assert len(intent.edges) == 1
+        assert (intent.edges[0].source, intent.edges[0].target) == (1, 2)
+        assert intent.warnings == []
+
+    def test_parallel_nodes_have_no_edges(self) -> None:
+        """Two independent lookups → 2 nodes, no edges (ADR-0012 parallel)."""
+        tools = [_tool(name="echo"), _tool(name="lookup")]
+        intent = parse_planner_output(
+            '{"nodes": ['
+            '{"tool": "echo"}, '
+            '{"tool": "lookup"}'
+            '], '
+            '"edges": []}',
+            tools,
+        )
+        assert len(intent.nodes) == 2
+        assert intent.edges == []
+        assert intent.warnings == []
+
+    def test_edges_omitted_defaults_to_empty(self) -> None:
+        """The T18 contract never had `edges`; a model still on the old
+        prompt must not be rejected."""
+        intent = parse_planner_output(
+            '{"nodes": [{"tool": "echo"}]}',
+            [_tool()],
+        )
+        assert intent.edges == []
+
+    def test_three_node_chain(self) -> None:
+        """A → B → C data-dependency chain."""
+        tools = [_tool(name="a"), _tool(name="b"), _tool(name="c")]
+        intent = parse_planner_output(
+            '{"nodes": ['
+            '{"tool": "a"}, {"tool": "b"}, {"tool": "c"}'
+            '], '
+            '"edges": [{"source": 1, "target": 2}, {"source": 2, "target": 3}]}',
+            tools,
+        )
+        assert len(intent.edges) == 2
+        assert [(e.source, e.target) for e in intent.edges] == [(1, 2), (2, 3)]
+
+    def test_edge_with_unknown_index_dropped_with_warning(self) -> None:
+        """A typo'd source index must not crash the Plan."""
+        tools = [_tool(name="echo")]
+        intent = parse_planner_output(
+            '{"nodes": [{"tool": "echo"}], "edges": [{"source": 5, "target": 1}]}',
+            tools,
+        )
+        assert intent.edges == []
+        assert any("5" in w or "未知" in w for w in intent.warnings)
+
+    def test_edge_self_loop_dropped_with_warning(self) -> None:
+        tools = [_tool(name="echo")]
+        intent = parse_planner_output(
+            '{"nodes": [{"tool": "echo"}], "edges": [{"source": 1, "target": 1}]}',
+            tools,
+        )
+        assert intent.edges == []
+        assert any("自环" in w or "1 -> 1" in w for w in intent.warnings)
+
+    def test_cycle_is_dropped_with_warning(self) -> None:
+        """An edge that would close a cycle must be dropped — `PlanBase`
+        would otherwise raise on insert (ADR-0012: executor hangs)."""
+        tools = [_tool(name="a"), _tool(name="b")]
+        intent = parse_planner_output(
+            '{"nodes": [{"tool": "a"}, {"tool": "b"}], '
+            '"edges": [{"source": 1, "target": 2}, {"source": 2, "target": 1}]}',
+            tools,
+        )
+        # First edge (1→2) survives; second (2→1) closes a cycle and is dropped.
+        assert len(intent.edges) == 1
+        assert any("环" in w or "cycle" in w for w in intent.warnings)
+
+    def test_duplicate_edge_is_dropped(self) -> None:
+        tools = [_tool(name="a"), _tool(name="b")]
+        intent = parse_planner_output(
+            '{"nodes": [{"tool": "a"}, {"tool": "b"}], '
+            '"edges": [{"source": 1, "target": 2}, {"source": 1, "target": 2}]}',
+            tools,
+        )
+        assert len(intent.edges) == 1
+        assert any("重复" in w for w in intent.warnings)
+
+    def test_non_list_edges_raises(self) -> None:
+        """Edges must be a list — the same strictness as `nodes`."""
+        with pytest.raises(LLMGenerationError):
+            parse_planner_output(
+                '{"nodes": [{"tool": "echo"}], "edges": "echo->echo"}',
+                [_tool()],
+            )
+
+    def test_edge_missing_source_or_target_raises(self) -> None:
+        """An edge entry that lacks `source` or `target` is malformed."""
+        with pytest.raises(LLMGenerationError):
+            parse_planner_output(
+                '{"nodes": [{"tool": "echo"}], "edges": [{"source": 1}]}',
+                [_tool()],
+            )
+        with pytest.raises(LLMGenerationError):
+            parse_planner_output(
+                '{"nodes": [{"tool": "echo"}], "edges": [{"target": 1}]}',
+                [_tool()],
+            )
+
+    def test_node_count_above_cap_truncates_with_warning(self) -> None:
+        """`MAX_NODES_PER_PLAN` is the no-silent-caps guard rail — a runaway
+        model returning thousands of nodes must be truncated, not hung on
+        (same rule as `MAX_TOOLS_IN_CATALOG`)."""
+        tool = _tool(name="echo")
+        tools = [tool] * (MAX_NODES_PER_PLAN + 5)
+        payload = (
+            '{"nodes": ['
+            + ",".join(['{"tool": "echo"}'] * (MAX_NODES_PER_PLAN + 5))
+            + "]}"
+        )
+        intent = parse_planner_output(payload, tools)
+        assert len(intent.nodes) == MAX_NODES_PER_PLAN
+        assert any("上限" in w and str(MAX_NODES_PER_PLAN) in w for w in intent.warnings)
 
 
 # ---------------------------------------------------------------------------

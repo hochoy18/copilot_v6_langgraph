@@ -101,13 +101,14 @@ HTTP 方法与路径: {{method}} {{path}}
 其中 typical_use_cases 为 2-4 条中文短句。
 """
 
-# Bootstrap fallback for `planner` (T18 / #16). Same contract the
-# Langfuse copy must keep: strict-JSON output, `nodes` array, Tool
-# names drawn from the rendered catalog. T18's single-node scope is
-# enforced by rule 2 — T25 lifts it in Langfuse (plus edges) without
-# a code change; the parser already accepts N nodes.
+# Bootstrap fallback for `planner` (T18 / #16, T25 / #22). Same
+# contract the Langfuse copy must keep: strict-JSON output, `nodes`
+# array, Tool names drawn from the rendered catalog, plus (T25)
+# `edges` for data-dependency DAGs. `edges` is optional: omit it
+# (or send `[]`) when the nodes are independent — the executor
+# schedules them as a parallel branch (ADR-0012).
 _BOOTSTRAP_PLANNER = """\
-你是企业 API Copilot 的 Planner。请把业务人员的自然语言指令翻译成 Tool 调用计划。
+你是企业 API Copilot 的 Planner。请把业务人员的自然语言指令翻译成 Tool 调用计划(可以有多个节点)。
 
 可用 Tool 目录(每行一个 Tool):
 {{tools}}
@@ -117,13 +118,20 @@ _BOOTSTRAP_PLANNER = """\
 规则:
 1. 只能选择目录中出现的 Tool, `tool` 必须与目录中的 name 完全一致; \
 目录中没有合适的 Tool 时输出空节点列表, 不要臆造 Tool。
-2. 当前版本一次最多规划 1 个 Tool 调用(单节点计划)。
-3. `parameters` 是 JSON 对象, 键必须来自所选 Tool 的参数说明; \
+2. 可以规划多个 Tool 节点; 节点之间如果有依赖关系(后者在前者完成之后才能跑) \
+用 `edges` 声明, 节点之间没有依赖(可并行)时不输出 edges。
+3. `edges` 是可选的数组, 每条形如 {"source": <1-based 序号>, \
+"target": <1-based 序号>}, 序号对应上面 `nodes` 数组的位置; \
+不可出现自环、重复、或会形成环路的依赖。edge 只表达"谁先谁后"的顺序, \
+不携带数据传递信息(具体字段到参数的绑定由 Worker 在执行时完成), \
+不要在 edge 里写字段名。
+4. `parameters` 是 JSON 对象, 键必须来自所选 Tool 的参数说明; \
 指令未给出的可选参数直接省略, 必填参数无法确定时也输出空节点列表。
-4. `notes` 用一句中文向业务人员解释这个计划要做什么。
-5. 只输出一个 JSON 对象, 不要输出其它任何内容(包括代码围栏之外的文字):
-{"nodes": [{"tool": "<目录中的 name>", "parameters": {...}, "notes": "<一句话说明>"}]}
-不需要调用任何 Tool(闲聊 / 无法匹配)时输出 {"nodes": []}。
+5. `notes` 用一句中文向业务人员解释这个计划要做什么。
+6. 只输出一个 JSON 对象, 不要输出其它任何内容(包括代码围栏之外的文字):
+{"nodes": [{"tool": "<目录中的 name>", "parameters": {...}, "notes": "<一句话说明>"}], \
+"edges": [{"source": 1, "target": 2}]}
+edges 可省略或为空数组; 不需要调用任何 Tool(闲聊 / 无法匹配)时输出 {"nodes": []}。
 """
 
 # Bootstrap fallback for `result-summarizer` (T22 / #19). The Prompt
