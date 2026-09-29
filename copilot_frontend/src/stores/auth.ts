@@ -1,17 +1,20 @@
 /**
- * Auth token store — T24 / #21 (preliminary seam), ADR-0032.
+ * Auth token store — T08 / #9 + T08b / #49, ADR-0032.
  *
- * T08 / #9 (OIDC frontend flow) hasn't landed yet, so production
- * values here start null and the refresh helper is a thin POST to
- * the already-shipped T08b backend (`/auth/refresh`, #49). The
- * contract is what T24 needs — an in-memory Access Token the SSE
- * hook subscribes to, plus a `refreshAccessToken` the hook awaits
- * on `auth.expired`. T08 fills in the `setTokens` call after the
- * OIDC callback without touching the consumer-side hook.
+ * Owns the in-memory Access Token + persisted Refresh Token + the
+ * canonical `User` shape that the SSO callback and refresh responses
+ * both carry (ADR-0009). The SSE hook reads the token off the store
+ * on every reconnect; the `/chat` header reads the user for the
+ * "显示用户名" acceptance line; the auto-refresh hook reads `expiresAt`
+ * to decide when to rotate.
  *
  * Storage policy (ADR-0032):
  * - Access Token → in-memory only (refresh page = re-auth).
  * - Refresh Token → localStorage (7-day TTL, accepted XSS risk).
+ * - User → in-memory only; `display_name`/`email` are the chat-shell
+ *   identity. Not persisted: a page reload still has the refresh
+ *   token, so a quick `/auth/refresh` rehydrates the user from the
+ *   backend response (refresh responses carry the same `user` shape).
  *
  * Why a Zustand store (not React Context)
  * ---------------------------------------
@@ -27,36 +30,73 @@ import { create } from 'zustand'
 import { apiFetch, ApiError } from '@/lib/api-client'
 
 /**
- * Wire shape of `POST /api/v1/auth/refresh` (T08b / #49).
+ * The subset of `User` the front-end needs to render the chat shell
+ * (T08 AC: "回调 /chat 显示用户名") and decide where the user can go.
  *
- * Mirrors backend `LoginCompleteResult`: same envelope as the
- * login response so the Frontend uses one parser for both. T08
- * will move this into a shared `lib/auth-api.ts` once that ticket
- * lands; until then T24 owns the seam.
+ * Mirrors `app.db.schemas.User` (`UserBase + id + role_ids`); the
+ * backend strips `password_hash` before serialising (`User.from_db`),
+ * so the wire is safe to land in `localStorage` if a future ticket
+ * wants persistence — for T08 we keep it memory-only.
  */
-interface RefreshResponse {
+export interface AuthUser {
+  id: string
+  email: string
+  display_name: string
+  source: 'sso' | 'local'
+  /** `local_username` for admins, `null` for SSO users (mirrors the backend). */
+  username: string | null
+  role_ids: string[]
+}
+
+/**
+ * Wire shape of `POST /api/v1/auth/refresh` (T08b / #49) and the SSO
+ * callback (T08 / #46) — deliberately identical so a single parser
+ * feeds both paths (ADR-0032).
+ */
+interface TokenResponse {
   access_token: string
   refresh_token: string
   token_type: string
   expires_in: number
+  user: AuthUser
 }
+
+/**
+ * Wall-clock instant (ms since epoch) when the Access Token stops
+ * being trustworthy. Refresh window per ADR-0009: when the remaining
+ * lifetime is ≤ 2 minutes, the auto-refresh hook (`useAuthRefresh`)
+ * calls `/auth/refresh`. `null` when no token is held.
+ */
+const REFRESH_TOKEN_STORAGE_KEY = 'copilot.refresh_token'
 
 interface AuthState {
   /** In-memory Access Token (ADR-0032). */
   accessToken: string | null
   /** Refresh Token persisted to localStorage (ADR-0032). */
   refreshToken: string | null
+  /** Canonical user from the SSO callback / refresh response. */
+  user: AuthUser | null
+  /** Wall-clock ms when the Access Token expires (ADR-0009). */
+  expiresAt: number | null
   /** Set on `/auth/refresh` failure — drives the re-login banner. */
   refreshFailed: boolean
-  /** Replace both tokens (called by T08 login + `refreshAccessToken`). */
-  setTokens(accessToken: string, refreshToken: string): void
+  /**
+   * Replace every credential in one shot — called by T08's SSO
+   * callback handler and by `refreshAccessToken`. Computes
+   * `expiresAt` from `Date.now() + expires_in * 1000` so the
+   * auto-refresh hook never has to read time itself.
+   */
+  setTokens(
+    accessToken: string,
+    refreshToken: string,
+    user: AuthUser,
+    expiresIn: number,
+  ): void
   /** Wipe every credential — drives the re-login redirect. */
   clearTokens(): void
   /** Mark the most recent refresh as failed (drives re-login). */
   markRefreshFailed(): void
 }
-
-const REFRESH_TOKEN_STORAGE_KEY = 'copilot.refresh_token'
 
 /**
  * Resolve the browser's localStorage, or `null` outside a real
@@ -98,23 +138,37 @@ function writePersistedRefreshToken(value: string | null): void {
 export const useAuthStore = create<AuthState>((set) => ({
   accessToken: null,
   refreshToken: readPersistedRefreshToken(),
+  user: null,
+  expiresAt: null,
   refreshFailed: false,
 
-  setTokens: (accessToken, refreshToken) => {
+  setTokens: (accessToken, refreshToken, user, expiresIn) => {
     writePersistedRefreshToken(refreshToken)
-    set({ accessToken, refreshToken, refreshFailed: false })
+    set({
+      accessToken,
+      refreshToken,
+      user,
+      expiresAt: Date.now() + expiresIn * 1000,
+      refreshFailed: false,
+    })
   },
 
   clearTokens: () => {
     writePersistedRefreshToken(null)
-    set({ accessToken: null, refreshToken: null, refreshFailed: true })
+    set({
+      accessToken: null,
+      refreshToken: null,
+      user: null,
+      expiresAt: null,
+      refreshFailed: true,
+    })
   },
 
   markRefreshFailed: () => set({ refreshFailed: true }),
 }))
 
 /**
- * Attempt a `/auth/refresh` round-trip and fold the new Access Token
+ * Attempt a `/auth/refresh` round-trip and fold the new credentials
  * into the store. Returns the new token on success, `null` on
  * failure — the caller (the SSE hook) treats every `null` as
  * terminal for the current stream: a 401/404 means the refresh
@@ -133,13 +187,15 @@ export async function refreshAccessToken(): Promise<string | null> {
   }
   try {
     // `apiFetch` sets `Content-Type: application/json` from the body.
-    const response = await apiFetch<RefreshResponse>('/auth/refresh', {
+    const response = await apiFetch<TokenResponse>('/auth/refresh', {
       method: 'POST',
       body: JSON.stringify({ refresh_token: refresh }),
     })
     useAuthStore.getState().setTokens(
       response.access_token,
       response.refresh_token,
+      response.user,
+      response.expires_in,
     )
     return response.access_token
   } catch (err) {

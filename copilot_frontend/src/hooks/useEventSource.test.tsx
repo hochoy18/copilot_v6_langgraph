@@ -190,7 +190,19 @@ describe('useEventSource connect', () => {
     // T08 will call `setTokens` after the OIDC callback; the hook
     // must react without any consumer-side plumbing.
     act(() => {
-      useAuthStore.getState().setTokens('jwt-late', 'rt-late')
+      useAuthStore.getState().setTokens(
+        'jwt-late',
+        'rt-late',
+        {
+          id: 'u1',
+          email: 'late@example.com',
+          display_name: 'Late Login',
+          source: 'sso',
+          username: null,
+          role_ids: [],
+        },
+        900,
+      )
     })
     expect(sockets).toHaveLength(1)
     expect(sockets[0].url).toContain('token=jwt-late')

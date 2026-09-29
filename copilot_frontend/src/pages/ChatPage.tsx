@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { useConversationStream } from '@/hooks/useConversationStream'
 import { ApiError } from '@/lib/api-client'
 import { createConversation, submitTurn } from '@/lib/conversations-api'
+import { useAuthStore } from '@/stores/auth'
 import { useConversationStreamStore } from '@/stores/conversation-stream'
 import { usePlanDrawerStore } from '@/stores/plan-drawer'
 import { cn } from '@/lib/utils'
@@ -49,6 +50,15 @@ export function ChatPage(): React.ReactElement {
   const drawerMode = usePlanDrawerStore((s) => s.mode)
   const showPlan = usePlanDrawerStore((s) => s.showPlan)
   const reopen = usePlanDrawerStore((s) => s.reopen)
+
+  /**
+   * T08 / #9 AC: "回调 /chat 显示用户名". The auth store populates
+   * `user` on the SSO callback (and on every refresh — the backend
+   * mirrors the canonical `User` in both responses, ADR-0009).
+   * Falls back to email so the header still renders when the IdP
+   * didn't return a `name` claim.
+   */
+  const user = useAuthStore((s) => s.user)
 
   // Declare the store sync *before* the stream hook so effects run
   // in that order: the store's `conversationId` + buffers reset
@@ -121,6 +131,14 @@ export function ChatPage(): React.ReactElement {
               <Wrench size={14} />
               查看 Plan
             </Button>
+          )}
+          {user !== null && (
+            <span
+              data-testid="chat-username"
+              className="ml-auto text-sm text-muted-foreground"
+            >
+              {user.display_name || user.email}
+            </span>
           )}
         </header>
 

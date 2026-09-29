@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 
 import { renderWithRouter } from '@/test-utils'
 import { ChatPage } from '@/pages/ChatPage'
+import { useAuthStore } from '@/stores/auth'
 import { usePlanDrawerStore } from '@/stores/plan-drawer'
 import type { Plan, TurnResponse } from '@/types/plan'
 
@@ -95,6 +96,13 @@ const conversationResponse = {
 
 beforeEach(() => {
   usePlanDrawerStore.setState({ plan: null, mode: 'collapsed', selectedNodeId: null })
+  useAuthStore.setState({
+    accessToken: null,
+    refreshToken: null,
+    user: null,
+    expiresAt: null,
+    refreshFailed: false,
+  })
 })
 
 afterEach(() => {
@@ -201,5 +209,48 @@ describe('ChatPage', () => {
 
     expect(await screen.findByRole('alert')).toBeInTheDocument()
     expect(screen.getByTestId('plan-drawer')).toHaveAttribute('data-mode', 'collapsed')
+  })
+
+  it('shows the authenticated user\'s display_name in the header (回调 /chat 显示用户名)', () => {
+    useAuthStore.setState({
+      accessToken: 'jwt',
+      refreshToken: 'rt',
+      expiresAt: Date.now() + 900_000,
+      refreshFailed: false,
+      user: {
+        id: 'u1',
+        email: 'alice@example.com',
+        display_name: 'Alice Liu',
+        source: 'sso',
+        username: null,
+        role_ids: [],
+      },
+    })
+    renderWithRouter(<ChatPage />)
+    expect(screen.getByTestId('chat-username')).toHaveTextContent('Alice Liu')
+  })
+
+  it('falls back to email when display_name is empty', () => {
+    useAuthStore.setState({
+      accessToken: 'jwt',
+      refreshToken: 'rt',
+      expiresAt: Date.now() + 900_000,
+      refreshFailed: false,
+      user: {
+        id: 'u1',
+        email: 'alice@example.com',
+        display_name: '',
+        source: 'sso',
+        username: null,
+        role_ids: [],
+      },
+    })
+    renderWithRouter(<ChatPage />)
+    expect(screen.getByTestId('chat-username')).toHaveTextContent('alice@example.com')
+  })
+
+  it('hides the username slot when no user is signed in', () => {
+    renderWithRouter(<ChatPage />)
+    expect(screen.queryByTestId('chat-username')).not.toBeInTheDocument()
   })
 })
