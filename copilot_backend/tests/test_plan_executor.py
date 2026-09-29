@@ -544,3 +544,110 @@ class TestStateMachineGuard:
                 conversation_id="conv-1",
                 turn_id="turn-1",
             )
+
+
+# ---------------------------------------------------------------------------
+# T34 / #30 — schema_violation feedback path (AC #3)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaViolationFeedback:
+    """`schema_violation` from the Worker lands in the audit log row.
+
+    AC #3 of T34 / #30 says "错误反馈给 Planner". The Planner reads
+    feedback through (a) the `plan_executions` node outcome and
+    (b) the `audit_logs` row's `error` envelope. This test pins
+    both: the Plan lands `failed`, the audit row carries the
+    `code=schema_violation` envelope with the field-level
+    violations, and the upstream HTTP client never sees the bad
+    payload (AC #1).
+    """
+
+    async def test_schema_violation_marks_plan_failed_and_records_audit(
+        self,
+        credential_repo: CredentialRepository,
+        tool_repo: ToolRepository,
+        plan_repo: PlanRepository,
+        plan_execution_repo: PlanExecutionRepository,
+        audit_repo: AuditLogRepository,
+    ) -> None:
+        tool_id = await _seed_tool(
+            tool_repo,
+            name="echo",
+            risk_level="read",
+            parameters_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        )
+        snapshot = ToolSnapshot(
+            tool_id=tool_id,
+            name="echo",
+            description="Echo",
+            risk_level="read",
+            parameters_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+            http_method="POST",
+            http_url_template="https://upstream.test/echo",
+            http_headers={"Content-Type": "application/json"},
+            http_body_template={"echo": "{text}"},
+        )
+        # The Planner hallucinated `text` as an int — fails the schema
+        # check before the Worker would ever issue the HTTP call.
+        node = PlanNode(
+            node_id="n1",
+            tool="echo",
+            parameters={"text": 12345},
+        )
+        plan = await _seed_approved_plan(
+            plan_repo,
+            conversation_id="conv-1",
+            turn_id="turn-1",
+            snapshot=snapshot,
+            node=node,
+        )
+
+        # The handler should NEVER be invoked: AC #1 says the
+        # Worker refuses to call upstream on a bad payload.
+        upstream_calls: list[httpx.Request] = []
+
+        def _tracking_handler(request: httpx.Request) -> httpx.Response:
+            upstream_calls.append(request)
+            return httpx.Response(200, json={"echo": "ok"})
+
+        _, executor = _make_worker_and_executor(
+            credential_repo=credential_repo,
+            tool_repo=tool_repo,
+            plan_repo=plan_repo,
+            plan_execution_repo=plan_execution_repo,
+            audit_repo=audit_repo,
+            handler=_tracking_handler,
+        )
+        outcome = await executor.execute_plan(
+            plan=plan,
+            actor_id="user-1",
+            conversation_id="conv-1",
+            turn_id="turn-1",
+        )
+        # AC #1 — upstream never saw the bad payload.
+        assert upstream_calls == []
+        # AC #3 — the Plan flips to `failed` and the audit row
+        # carries the structured violations envelope the Planner
+        # can read to regenerate correct parameters. The
+        # `schema_violation` code lives on the originating
+        # `SchemaViolationError`; the audit row stores the
+        # violations detail (mirroring the existing HITL path).
+        assert outcome.plan.status == "failed"
+        assert len(outcome.audit_log_ids) == 1
+        audit_row = await audit_repo.get(outcome.audit_log_ids[0])
+        assert audit_row.status == "failed"
+        assert audit_row.error is not None
+        assert audit_row.error["tool"] == "echo"
+        assert any(
+            v["validator"] == "type"
+            for v in audit_row.error["violations"]
+        )

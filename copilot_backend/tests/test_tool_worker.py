@@ -211,10 +211,18 @@ class TestSchemaValidation:
             for v in details["violations"]
         )
 
-    async def test_no_schema_declared_skips_validation(
+    async def test_no_schema_declared_raises_schema_violation(
         self, echo_client: httpx.AsyncClient, credential_repo: CredentialRepository
     ) -> None:
-        """A snapshot without a schema still runs — defensive choice (ADR-0027)."""
+        """T34 / #30 defense-in-depth — a snapshot without a schema is rejected.
+
+        ADR-0020 says registration rejects Tools without a schema,
+        so by the time a snapshot reaches the Worker the schema
+        should always be non-empty. If a legacy row or hand-built
+        snapshot somehow lacks one, the Worker surfaces
+        `SchemaViolationError` (rather than silently bypassing) so
+        the LLM never sees an unvalidated upstream call.
+        """
         snap = _echo_snapshot().model_copy(
             update={"parameters_schema": {}}
         )
@@ -222,14 +230,21 @@ class TestSchemaValidation:
             credential_repository=credential_repo,
             http_client=echo_client,
         )
-        result = await w.execute_with_credential(
-            plan_id="plan-1",
-            node=_echo_node({"text": "ok", "extra": "data"}),
-            snapshot=snap,
-            actor_id="user-1",
-            credential_ref=None,
-        )
-        assert result.status == "succeeded"
+        with pytest.raises(SchemaViolationError) as exc_info:
+            await w.execute_with_credential(
+                plan_id="plan-1",
+                node=_echo_node({"text": "ok"}),
+                snapshot=snap,
+                actor_id="user-1",
+                credential_ref=None,
+            )
+        details = exc_info.value.details
+        assert details is not None
+        assert details["tool"] == "echo"
+        assert details["reason"] == "missing_schema"
+        # Uniform envelope — even the missing-schema path carries
+        # `violations: []` so consumers can rely on the shape.
+        assert details["violations"] == []
 
 
 # ---------------------------------------------------------------------------

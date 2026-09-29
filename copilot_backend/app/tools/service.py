@@ -1,4 +1,4 @@
-"""`ToolService` — T12 / #11.
+"""`ToolService` — T12 / #11, T34 / #30.
 
 The admin Tool CRUD endpoints (ADR-0031) live in `app.api.admin_tools`;
 the repository is `app.repositories.tools`. This module sits between
@@ -14,6 +14,11 @@ them and owns the rules that aren't pure Mongo:
   `set_status` for the atomic write; this service treats every
   status change as an explicit event so the eventual audit-log hook
   (T42) has a single seam to subscribe to.
+* **Schema enforcement (T34 / #30, ADR-0020).** Tools must carry a
+  usable JSON Schema for their parameters. `ToolService.create` /
+  `update` reject empty / malformed `parameters_schema` values
+  *before* the row reaches Mongo so the Worker's snapshot-binding
+  can never be presented with a non-validatable schema.
 
 Design notes:
 
@@ -29,6 +34,8 @@ from __future__ import annotations
 
 import re
 
+from jsonschema import Draft202012Validator, SchemaError
+
 from app.db.schemas import (
     Tool,
     ToolCreate,
@@ -37,6 +44,7 @@ from app.db.schemas import (
     ToolUpdate,
 )
 from app.repositories.tools import ToolRepository
+from app.tools.errors import ToolSchemaInvalidError
 
 # Cap on list results per call. Matches the conversation list default
 # (T10 / #40) so the Frontend has a uniform pagination story; admin
@@ -67,7 +75,15 @@ class ToolService:
         cannot see it until an admin reviews and activates. The
         repository stamps `created_at` / `updated_at` and surfaces a
         `DuplicateKeyError` if `name` collides.
+
+        Per ADR-0020 the `parameters_schema` is enforced *here*, not
+        in the repository — once a row lands in Mongo the schema is
+        frozen and the Worker's snapshot-binding makes the
+        missing-schema condition sticky for every Plan that captures
+        it. Rejecting at the seam keeps the registry's invariants in
+        one place.
         """
+        _enforce_parameters_schema(data.parameters_schema)
         return await self._tools.create(data)
 
     # ------------------------------------------------------------------
@@ -129,7 +145,13 @@ class ToolService:
         description, status, and risk_level. The repository method
         bumps `updated_at` on every call so an "empty" PATCH still
         tells the audit log "someone touched this Tool".
+
+        Schema enforcement (T34 / #30) only fires when the PATCH
+        actually carries `parameters_schema` — a `None` value (field
+        not touched) keeps the existing schema intact.
         """
+        if patch.parameters_schema is not None:
+            _enforce_parameters_schema(patch.parameters_schema)
         return await self._tools.update(tool_id, patch)
 
     async def set_status(self, *, tool_id: str, status: ToolStatus) -> Tool:
@@ -191,6 +213,44 @@ def _escape_regex(value: str) -> re.Pattern[str]:
     `report.v2`'s dot". Case folding keeps the search forgiving.
     """
     return re.compile(re.escape(value), re.IGNORECASE)
+
+
+def _enforce_parameters_schema(schema: object) -> None:
+    """Reject `schema` shapes that can't drive JSON Schema validation — T34 / #30.
+
+    Two failure modes are caught here:
+
+    1. **Empty schema.** An admin who forgets to declare a schema
+       passes `{}`. The Worker's `_validate_parameters` would then
+       fall back to a no-op (no rules → nothing to fail), letting
+       LLM hallucinations slip through unchecked. ADR-0020 says the
+       registration must reject this case so every Tool that reaches
+       the runtime has *some* declared shape.
+    2. **Malformed schema.** `Draft202012Validator.check_schema`
+       raises on a schema whose own keywords contradict themselves
+       (e.g. `{"type": 1234}`). We surface this here too so the
+       Worker's runtime `Draft202012Validator(...)` constructor
+       stays a no-op-success path.
+
+    The helper is intentionally narrow: anything that looks like a
+    JSON Schema document passes — including `{"type": "object"}`
+    for the no-parameter Tool case. The richer shape is the admin's
+    responsibility, not ours.
+    """
+    if not isinstance(schema, dict) or not schema:
+        raise ToolSchemaInvalidError(
+            details={"reason": "empty_schema"},
+        )
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        raise ToolSchemaInvalidError(
+            details={
+                "reason": "invalid_schema",
+                "schema_error": exc.message,
+                "violations": [],
+            },
+        ) from exc
 
 
 __all__ = ["ToolService", "DEFAULT_LIST_LIMIT", "MAX_LIST_LIMIT"]

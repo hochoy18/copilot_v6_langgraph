@@ -248,13 +248,20 @@ class ToolWorker:
     ) -> None:
         """Reject parameters that don't match the snapshot's JSON Schema.
 
-        Acceptance criterion (ADR-0020): "对没声明 schema 的 Tool,后端
-        拒绝注册 (强制 schema 完整性)" — so by the time we reach
-        execution the snapshot *should* carry a schema. A missing /
-        empty schema is treated as a defensive no-op rather than a
-        silent bypass: the Worker still attempts the upstream call,
-        but the lack of a schema is recorded in the request envelope
-        so audit reviewers can see "this Tool ran without a schema".
+        Two guard rails (ADR-0020, T34 / #30):
+
+        1. **Defense-in-depth check.** `ToolService.create` /
+           `update` rejects an empty `parameters_schema` at
+           registration, so by the time a snapshot reaches execution
+           the schema should be non-empty. If a legacy row or a
+           hand-built snapshot bypassed the service (e.g. seeded in
+           tests, imported via a future migration), the Worker
+           raises `SchemaViolationError` rather than silently letting
+           the call through unvalidated.
+        2. **Runtime validation.** `Draft202012Validator` walks the
+           LLM-supplied `parameters` against the schema. Violations
+           are sorted by JSON-pointer path so the Planner can show
+           a deterministic error list to the LLM on retry.
 
         The validator is `Draft202012Validator` — the latest stable
         draft in `jsonschema`'s lineage and the most permissive
@@ -262,11 +269,19 @@ class ToolWorker:
         """
         schema = snapshot.parameters_schema or {}
         if not schema:
-            # No schema declared — let the call through; the executor
-            # may still flag this in the audit row. Defensive choice:
-            # the snapshot path is authoritative (ADR-0027) so we
-            # trust the admin who wrote the Tool.
-            return
+            # The service should have rejected this at registration.
+            # We re-check at runtime so a bypassed / legacy Tool can
+            # never reach the upstream API unvalidated. `violations`
+            # is left as an empty list so consumers can rely on the
+            # uniform `details["violations"]` shape across every
+            # `schema_violation` path.
+            raise SchemaViolationError(
+                details={
+                    "tool": snapshot.name,
+                    "reason": "missing_schema",
+                    "violations": [],
+                },
+            )
 
         try:
             validator = Draft202012Validator(schema)
@@ -274,7 +289,9 @@ class ToolWorker:
             raise SchemaViolationError(
                 details={
                     "tool": snapshot.name,
+                    "reason": "schema_unparseable",
                     "schema_error": str(exc),
+                    "violations": [],
                 },
             ) from exc
 

@@ -314,6 +314,37 @@ class TestCreateTool:
         )
         assert resp.status_code == 422
 
+    async def test_create_rejects_empty_parameters_schema(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        user_repo: UserRepository,
+        role_repo: RoleRepository,
+        settings: Settings,
+    ) -> None:
+        """T34 / #30 AC #4 — Tools without a schema are rejected.
+
+        ADR-0020: "对没声明 schema 的 Tool,后端拒绝注册". The wire
+        envelope carries `code='tool_schema_invalid'` so the admin
+        UI can render a focused message; this is a separate code
+        from the runtime `schema_violation` (which fires when the
+        LLM-supplied parameters violate a registered schema).
+        """
+        headers = await _admin_bearer(
+            user_repo=user_repo,
+            role_repo=role_repo,
+            settings=settings,
+        )
+        resp = await client.post(
+            "/api/v1/admin/tools",
+            json=_valid_create_body(parameters_schema={}),
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        body = resp.json()
+        assert body["code"] == "tool_schema_invalid"
+        assert body["details"]["reason"] == "empty_schema"
+
     async def test_create_unauthenticated_returns_401(
         self,
         app: FastAPI,
@@ -963,6 +994,39 @@ class TestPatchTool:
             headers=headers,
         )
         assert resp.status_code == 422
+
+    async def test_patch_rejects_empty_parameters_schema(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        user_repo: UserRepository,
+        role_repo: RoleRepository,
+        settings: Settings,
+    ) -> None:
+        """T34 / #30 AC #4 — PATCH that empties `parameters_schema` is rejected.
+
+        Mirrors the create-side rule: any PATCH that carries
+        `parameters_schema` must leave it in a usable state. The
+        `tool_schema_invalid` envelope keeps the admin UI messaging
+        consistent with the create endpoint.
+        """
+        headers = await _admin_bearer(
+            user_repo=user_repo,
+            role_repo=role_repo,
+            settings=settings,
+        )
+        created = await _seed_tool_via_api(
+            client, headers, name="clear_schema", description="x",
+        )
+        resp = await client.patch(
+            f"/api/v1/admin/tools/{created['id']}",
+            json={"parameters_schema": {}},
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        body = resp.json()
+        assert body["code"] == "tool_schema_invalid"
+        assert body["details"]["reason"] == "empty_schema"
 
 
 # ---------------------------------------------------------------------------
