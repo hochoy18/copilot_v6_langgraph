@@ -1,7 +1,8 @@
-"""`/api/v1/conversations` router — T10 / #40, T18 / #16, T20 / #43, T22 / #19.
+"""`/api/v1/conversations` router — T10 / #40, T18 / #16, T20 / #43, T22 / #19, T26 / #44.
 
 The thin HTTP seam for conversation CRUD, turn submission, and the
-HITL Plan approve / reject endpoints. Seven endpoints per ADR-0031:
+HITL Plan approve / reject / edit endpoints. Eight endpoints per
+ADR-0031:
 
 * `POST /api/v1/conversations` — create.
 * `GET  /api/v1/conversations` — list (with optional `status` filter).
@@ -16,6 +17,11 @@ HITL Plan approve / reject endpoints. Seven endpoints per ADR-0031:
 * `POST /api/v1/conversations/{id}/plan/reject` — HITL rejection
   (T20 / #43 / ADR-0004). Flips the latest Plan to `rejected`; the
   Turn stays so the conversation can be re-decided.
+* `PATCH /api/v1/conversations/{id}/plan` — HITL edit
+  (T26 / #44 / ADR-0019). Mutates per-node `parameters` / `notes`
+  only; the diff lands in `audit_logs`. Returns 200 + status
+  `modified` so the React Flow drawer refreshes without a follow-up
+  fetch.
 * `POST /api/v1/conversations/{id}/archive` — manual archive
   (transitions `active` / `idle` → `idle`, ADR-0011).
 
@@ -53,6 +59,7 @@ from app.db.schemas import (
     Conversation,
     ConversationStatus,
     Plan,
+    PlanNode,
     Turn,
     User,
 )
@@ -447,6 +454,71 @@ async def reject_plan(
     plan = await svc.reject_plan(
         conversation_id=conversation_id,
         user_id=user.id,
+    )
+    return _plan_to_dict(plan)
+
+
+class EditPlanRequest(BaseModel):
+    """Body of `PATCH /api/v1/conversations/{id}/plan` — T26 / #44 / ADR-0019.
+
+    Carries the post-edit node list. Only `parameters` and `notes`
+    fields are mutable; the repository's `record_edit` enforces
+    "same node-ids, same `tool` per node" so a PATCH that tries to
+    add / remove / repoint surfaces as 400 — the wire envelope
+    stays minimal (the Frontend ships the full edited Plan) and
+    structural invariants stay at the seam.
+    """
+
+    nodes: list[PlanNode] = Field(
+        description=(
+            "Edited node set. `node_id`s and `tool` slugs must match "
+            "the persisted Plan exactly — only `parameters` and "
+            "`notes` are mutable (ADR-0019)."
+        ),
+    )
+
+
+@router.patch(
+    "/{conversation_id}/plan",
+    response_model=dict[str, Any],
+    summary="HITL edit the conversation's pending / modified Plan (T26 / #44)",
+)
+async def edit_plan(
+    conversation_id: str,
+    body: EditPlanRequest,
+    user: User = Depends(get_current_user),  # noqa: B008
+    svc: ConversationService = Depends(get_conversation_service),  # noqa: B008
+) -> dict[str, Any]:
+    """`PATCH /api/v1/conversations/{id}/plan` — HITL Plan edit.
+
+    Per ADR-0019 the business user can tweak a Plan's per-node
+    `parameters` / `notes` before approving. The endpoint is the
+    sibling of `approve_plan` / `reject_plan`: same conversation-
+    scoped path, same ownership guard, same status-guard surface
+    (`pending` or `modified` are editable; already-approved /
+    executing / rejected raise `PlanNotPendingError`, 409).
+
+    The diff is computed at the service seam and lands in
+    `audit_logs` (T26 acceptance criterion: 审计含 diff) — a future
+    audit UI replays "what changed" without re-reading the Plan
+    row. The Plan comes back as `modified` so the React Flow drawer
+    can refresh without re-fetching.
+
+    Acceptance criteria:
+
+    * PATCH 改 param 接受 — happy path returns 200 + status
+      `modified` with the new parameter values persisted.
+    * 不可增删节点 — added / removed / repointed nodes surface as
+      `validation_error` (400) from `PlanRepository.record_edit`,
+      and the persisted Plan is untouched.
+    * 审计含 diff — one `audit_logs` row is appended per edit,
+      with the diff in `response` and a `plan.edit` `tool_name`
+      sentinel.
+    """
+    plan = await svc.edit_plan(
+        conversation_id=conversation_id,
+        user_id=user.id,
+        edited_nodes=body.nodes,
     )
     return _plan_to_dict(plan)
 

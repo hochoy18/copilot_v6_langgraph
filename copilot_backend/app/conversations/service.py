@@ -27,19 +27,25 @@ Design notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from app.conversations.errors import (
     ConversationAccessDeniedError,
     PlanNotPendingError,
 )
+from app.db.errors import ValidationError
 from app.db.schemas import (
+    AuditLogCreate,
     Conversation,
     ConversationCreate,
     ConversationStatus,
     Plan,
+    PlanNode,
     PlanStatus,
+    ToolSnapshot,
     Turn,
 )
+from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
 from app.repositories.plans import PlanRepository
 from app.repositories.turns import TurnRepository
@@ -86,10 +92,12 @@ class ConversationService:
         conversation_repository: ConversationRepository,
         turn_repository: TurnRepository,
         plan_repository: PlanRepository,
+        audit_log_repository: AuditLogRepository,
     ) -> None:
         self._conversations = conversation_repository
         self._turns = turn_repository
         self._plans = plan_repository
+        self._audit = audit_log_repository
 
     # ------------------------------------------------------------------
     # Create
@@ -275,6 +283,70 @@ class ConversationService:
         )
 
     # ------------------------------------------------------------------
+    # Plan edit (T26 / #44 / ADR-0019)
+    # ------------------------------------------------------------------
+
+    async def edit_plan(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        edited_nodes: list[PlanNode],
+    ) -> Plan:
+        """HITL edit: apply `edited_nodes` to the conversation's latest
+        pending / modified Plan and audit the diff.
+
+        Per ADR-0019 the edit is **parameters / notes only** — the
+        node set, the `tool` ↔ node binding, the edges, and the
+        frozen tool_snapshots (ADR-0027) are immutable. The wire
+        shape (`EditPlanRequest.nodes`) deliberately omits `edges`,
+        so the edit endpoint cannot mutate the DAG topology; the
+        repository's `record_edit` additionally re-validates the
+        invariants on write as a defensive guard.
+
+        Re-editing a `modified` Plan is allowed — the user may
+        iterate parameters before approving. The endpoint is
+        conversation-scoped (no `plan_id`) per ADR-0005.
+
+        Order of operations: we **pre-validate** the structural
+        invariants (set equality, tool binding) at the service
+        seam so we can compute the diff against the same node-id
+        set without a KeyError on a freshly-added id, then make a
+        single `record_edit` write that persists the new nodes,
+        the diff, and the `modified` status flag atomically.
+        `record_edit` re-validates the same invariants defensively;
+        a future repository change that loosens those checks won't
+        silently let an invalid edit through.
+        """
+        conversation = await self._conversations.get(conversation_id)
+        _assert_owner(conversation, user_id)
+
+        current_plan = await self._plans.get_latest_for_conversation(conversation_id)
+        if current_plan.status not in ("pending", "modified"):
+            raise PlanNotPendingError(
+                details={
+                    "plan_id": current_plan.id,
+                    "current_status": current_plan.status,
+                    "expected": ["pending", "modified"],
+                },
+            )
+
+        diff = _compute_edit_diff_safe(
+            original_nodes=current_plan.nodes,
+            edited_nodes=edited_nodes,
+        )
+
+        edited_plan = await self._plans.record_edit(
+            current_plan.id,
+            edited_nodes=edited_nodes,
+            diff=diff,
+        )
+
+        await self._audit.create(_plan_edit_audit_row(plan=edited_plan, actor_id=user_id))
+
+        return edited_plan
+
+    # ------------------------------------------------------------------
     # Plan execution (T21 / #18)
     # ------------------------------------------------------------------
 
@@ -397,6 +469,119 @@ def _assert_owner(conversation: Conversation, user_id: str) -> None:
         raise ConversationAccessDeniedError(
             details={"user_id": user_id},
         )
+
+
+def _compute_edit_diff_safe(
+    *,
+    original_nodes: list[PlanNode],
+    edited_nodes: list[PlanNode],
+) -> dict[str, Any]:
+    """Pre-validate the edit invariants + build the `by_node_id` diff.
+
+    Two responsibilities stacked together because they share the
+    same pre-condition (the node-id sets must match):
+
+    1. **Reject set-shape / tool-binding violations** with the same
+       `ValidationError` envelope `PlanRepository.record_edit` would
+       raise on write. Surfacing them at the service seam keeps the
+       diff computation safe (no KeyError on a freshly-added id)
+       and lets us make a single write below instead of
+       write-then-update.
+    2. **Build the diff** for every changed `parameters.<key>` /
+       `notes` field. Per-node removal of a parameter (the key was
+       on the original but absent from the edit) is recorded as a
+       change with `after=None` so a downstream auditor can see
+       "this argument was dropped" rather than missing it entirely.
+
+    The output schema (`{"by_node_id": {"<path>": {"before",
+    "after"}}}`) is dictated by ADR-0019.
+    """
+    original_by_id = {node.node_id: node for node in original_nodes}
+    edited_by_id = {node.node_id: node for node in edited_nodes}
+
+    added = sorted(set(edited_by_id) - set(original_by_id))
+    removed = sorted(set(original_by_id) - set(edited_by_id))
+    if added or removed:
+        raise ValidationError(
+            message_en="Plan edits cannot add or remove nodes (ADR-0019)",
+            details={"added": added, "removed": removed},
+        )
+
+    repointed = {
+        node_id: {"before": original_by_id[node_id].tool, "after": edited.tool}
+        for node_id, edited in edited_by_id.items()
+        if edited.tool != original_by_id[node_id].tool
+    }
+    if repointed:
+        raise ValidationError(
+            message_en="Plan edits cannot change which Tool a node invokes (ADR-0027)",
+            details={"repointed": repointed},
+        )
+
+    by_node_id: dict[str, dict[str, dict[str, Any]]] = {}
+    for node_id, edited in edited_by_id.items():
+        original = original_by_id[node_id]
+        per_node: dict[str, dict[str, Any]] = {}
+        all_param_keys = set(original.parameters) | set(edited.parameters)
+        for key in sorted(all_param_keys):
+            before_value = original.parameters.get(key)
+            after_value = edited.parameters.get(key)
+            if before_value != after_value:
+                per_node[f"parameters.{key}"] = {
+                    "before": before_value,
+                    "after": after_value,
+                }
+        if edited.notes != original.notes:
+            per_node["notes"] = {"before": original.notes, "after": edited.notes}
+        if per_node:
+            by_node_id[node_id] = per_node
+    return {"by_node_id": by_node_id}
+
+
+def _plan_edit_audit_row(*, plan: Plan, actor_id: str) -> AuditLogCreate:
+    """Build the `audit_logs` row for a Plan edit (T26 / ADR-0019).
+
+    A Plan edit isn't a Tool call — there's no `tool_snapshot`,
+    no `parameters`, no `response` from an upstream API. The audit
+    row carries the diff (already computed by
+    `_compute_edit_diff_safe` and persisted on `plan.edited_diff`)
+    inside the `response` field so a single read of `audit_logs`
+    answers "what changed for this Plan?" without joining the Plan
+    row. `tool_name` is the sentinel `plan.edit` so the audit UI
+    (T43) can render the row under a "user edits" section rather
+    than the Tool-call table.
+
+    `tool_snapshot` uses the same empty-string stub the executor's
+    snapshot-missing fallback uses (`tools.executor._write_audit_log`):
+    a Plan-edit isn't a Tool call, so no method/URL really apply.
+    Reusing that fallback keeps a single shape for "non-Tool"
+    audit rows so a future reader doesn't need to special-case
+    plan.edit vs snapshot-missing.
+    """
+    return AuditLogCreate(
+        actor_id=actor_id,
+        conversation_id=plan.conversation_id,
+        turn_id=plan.turn_id,
+        plan_id=plan.id,
+        plan_execution_id=None,
+        tool_name="plan.edit",
+        tool_snapshot=ToolSnapshot(
+            name="plan.edit",
+            description="Business-user edit of a Plan's node parameters (ADR-0019).",
+            risk_level="read",
+            parameters_schema={},
+            http_method="",
+            http_url_template="",
+            http_headers={},
+            http_body_template=None,
+        ),
+        parameters={},
+        response=plan.edited_diff,
+        status="succeeded",
+        error=None,
+        risk_level="read",
+        retry_count=0,
+    )
 
 
 __all__ = [

@@ -1417,8 +1417,15 @@ class AuditLogBase(BaseModel):
     plan_id: str = Field(
         description="ObjectId of `plans._id`. Indexed.",
     )
-    plan_execution_id: str = Field(
-        description="ObjectId of `plan_executions._id`. Indexed.",
+    plan_execution_id: str | None = Field(
+        default=None,
+        description=(
+            "ObjectId of `plan_executions._id`. Indexed. `None` for "
+            "audit rows that don't belong to a single execution — "
+            "Plan-edit events (T26 / ADR-0019) record the diff here "
+            "in `response` and leave `plan_execution_id` empty until "
+            "the (post-edit) Worker lands one."
+        ),
     )
     tool_name: str = Field(
         description="Slug of the Tool that was invoked. Indexed for filter UIs.",
