@@ -1,12 +1,13 @@
-"""`PlanExecutor` — T21 / #18.
+"""`PlanExecutor` — T21 / #18, T28 / #24.
 
 The orchestrator that ties a Plan's approval to its execution. The
 HITL "approve" endpoint (T20 / #43, `ConversationService.approve_plan`)
 flips the Plan to `approved`; the Executor picks it up from there,
-walks the DAG node by node through the `ToolWorker`, and writes
-`plan_executions` + `audit_logs` rows along the way.
+walks the DAG through the `ToolWorker` (concurrently where ADR-0012
+permits), and writes `plan_executions` + `audit_logs` rows along
+the way.
 
-Acceptance criteria (issue #18):
+Acceptance criteria (issue #18, then #24 for the parallel layer):
 
 1. **批准后 echo 跑通** — `execute_plan(plan)` flips the Plan to
    `executing`, runs every node, and on the happy path flips it to
@@ -23,10 +24,10 @@ Acceptance criteria (issue #18):
 5. **凭证调用瞬间注入** — the executor passes `credential_ref` into
    `ToolWorker.execute_with_credential`; the Worker decrypts inside
    its own call frame.
-
-The MVP executor walks the DAG sequentially. Parallel branches land
-in T25 / T28 — they read the same Worker seam, so swapping in a
-topological scheduler here is a no-op for downstream consumers.
+6. **并行分支同时执行** (T28) — sibling nodes run concurrently via
+   `PlanDagRunner`; a downstream node only fires after every
+   predecessor finishes, and a sibling's failure does not stop the
+   other sibling.
 
 Why a separate module from the Worker: the Worker is a pure async
 function over its inputs (test seam). The Executor is the
@@ -45,6 +46,7 @@ from app.db.schemas import (
     AuditLogCreate,
     Plan,
     PlanExecutionCreate,
+    PlanNode,
     PlanNodeResult,
     PlanStatus,
     ToolRiskLevel,
@@ -54,6 +56,7 @@ from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.plan_executions import PlanExecutionRepository
 from app.repositories.plans import PlanRepository
 from app.repositories.tools import ToolRepository
+from app.tools.dag import NodeRunOutcome, PlanDagRunner
 from app.tools.worker import ToolCallResult, ToolWorker
 from app.tools.worker_errors import (
     HITLRequiredError,
@@ -161,126 +164,51 @@ class PlanExecutor:
 
         audit_log_ids: list[str] = []
         had_failure = False
-        final_status: PlanStatus = "succeeded"
+
+        # T28 / #24 — drive the DAG with concurrent siblings via
+        # `PlanDagRunner`. The runner decides the dispatch order
+        # (topological, parallel where independent) and short-circuits
+        # downstream nodes whose upstream failed; this method just
+        # feeds it the per-node side-effect closure and persists the
+        # outcomes it gets back.
+        runner = PlanDagRunner(
+            run_node=self._build_run_one_node(
+                plan=executing_plan,
+                snapshots_by_name=snapshots_by_name,
+                execution_id=execution.id,
+                actor_id=actor_id,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                audit_log_ids=audit_log_ids,
+            ),
+        )
+
+        outcomes = await runner.run(executing_plan)
 
         for node in executing_plan.nodes:
-            snapshot = snapshots_by_name.get(node.tool)
-            if snapshot is None:
-                # Defensive — `PlanBase._validate_structure` already
-                # enforces this, but a future schema loosening
-                # shouldn't take down execution silently.
+            outcome = outcomes.get(node.node_id)
+            if outcome is None:
+                # The runner should have produced an outcome for
+                # every node; missing entries are a bug we want to
+                # surface, not paper over.
+                raise RuntimeError(
+                    f"PlanDagRunner produced no outcome for node "
+                    f"'{node.node_id}' (plan {executing_plan.id})"
+                )
+            if outcome.status == "failed":
                 had_failure = True
-                final_status = "failed"
-                error_envelope = self._envelope(
-                    code="snapshot_missing",
-                    message_en=(
-                        f"Plan references Tool '{node.tool}' but no snapshot "
-                        "is bound to it — cannot execute (ADR-0027)."
-                    ),
-                )
-                await self._mark_node_failed(
+            elif outcome.status == "skipped":
+                # ADR-0012 — a downstream node whose upstream failed
+                # is marked `skipped`; the runner short-circuited the
+                # Worker call, so there's no audit row, only the
+                # `plan_executions` status flip.
+                await self._mark_node_skipped(
                     execution_id=execution.id,
                     node_id=node.node_id,
-                    error_envelope=error_envelope,
-                )
-                audit_log_ids.append(
-                    await self._write_audit_log(
-                        plan=executing_plan,
-                        snapshot_or_none=None,
-                        node=node,
-                        actor_id=actor_id,
-                        conversation_id=conversation_id,
-                        turn_id=turn_id,
-                        outcome=None,
-                        error_envelope=error_envelope,
-                    ),
-                )
-                break
-
-            try:
-                credential_ref = await self._resolve_credential_ref(
-                    snapshot=snapshot,
-                    node=node,
-                )
-                result = await self._worker.execute_with_credential(
-                    plan_id=executing_plan.id,
-                    node=node,
-                    snapshot=snapshot,
-                    actor_id=actor_id,
-                    credential_ref=credential_ref,
-                )
-            except HITLRequiredError as exc:
-                # Worker surfaced HITL — record the failure and stop
-                # the Plan. The conversation stays alive so the user
-                # can refine the instruction.
-                had_failure = True
-                final_status = "failed"
-                details = exc.details or {}
-                await self._mark_node_failed(
-                    execution_id=execution.id,
-                    node_id=node.node_id,
-                    error_envelope=details,
-                )
-                audit_log_ids.append(
-                    await self._write_audit_log(
-                        plan=executing_plan,
-                        snapshot_or_none=snapshot,
-                        node=node,
-                        actor_id=actor_id,
-                        conversation_id=conversation_id,
-                        turn_id=turn_id,
-                        outcome=None,
-                        error_envelope=details,
-                        retry_count=self._retry_count_from_details(details),
-                    ),
-                )
-                break
-            except (SchemaViolationError, ToolWorkerError) as exc:
-                # Non-retriable from the executor's POV. Same
-                # bookkeeping as HITL but the Plan status is `failed`
-                # rather than awaiting further decision.
-                had_failure = True
-                final_status = "failed"
-                details = exc.details or {}
-                await self._mark_node_failed(
-                    execution_id=execution.id,
-                    node_id=node.node_id,
-                    error_envelope=details,
-                )
-                audit_log_ids.append(
-                    await self._write_audit_log(
-                        plan=executing_plan,
-                        snapshot_or_none=snapshot,
-                        node=node,
-                        actor_id=actor_id,
-                        conversation_id=conversation_id,
-                        turn_id=turn_id,
-                        outcome=None,
-                        error_envelope=details,
-                        retry_count=self._retry_count_from_details(details),
-                    ),
-                )
-                break
-            else:
-                await self._mark_node_succeeded(
-                    execution_id=execution.id,
-                    node_id=node.node_id,
-                    outcome=result,
-                )
-                audit_log_ids.append(
-                    await self._write_audit_log(
-                        plan=executing_plan,
-                        snapshot_or_none=snapshot,
-                        node=node,
-                        actor_id=actor_id,
-                        conversation_id=conversation_id,
-                        turn_id=turn_id,
-                        outcome=result,
-                        error_envelope=None,
-                    ),
                 )
 
         # Aggregate terminal: failed > succeeded.
+        final_status: PlanStatus = "failed" if had_failure else "succeeded"
         aggregate: Literal["running", "completed", "failed", "aborted"] = (
             "failed" if had_failure else "completed"
         )
@@ -295,6 +223,213 @@ class PlanExecutor:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _build_run_one_node(
+        self,
+        *,
+        plan: Plan,
+        snapshots_by_name: dict[str, ToolSnapshot],
+        execution_id: str,
+        actor_id: str,
+        conversation_id: str,
+        turn_id: str,
+        audit_log_ids: list[str],
+    ) -> Any:
+        """Build the per-node async callback the DAG runner invokes.
+
+        The returned coroutine performs the same side-effects the
+        pre-T28 executor did inline — Worker call, audit log write,
+        `PlanExecution` row update — but returns a `NodeRunOutcome`
+        instead of writing to the Plan status (the runner aggregates
+        the terminal status across all nodes).
+
+        `audit_log_ids` is mutated in-place as a side effect of the
+        closure — keeping the executor's outcome shape stable across
+        the T21 → T28 refactor. The DAG runner doesn't see the list;
+        it just gets the closure back.
+        """
+
+        async def _run_one_node(node: PlanNode) -> NodeRunOutcome:
+            snapshot = snapshots_by_name.get(node.tool)
+            if snapshot is None:
+                # Defensive — `PlanBase._validate_structure` already
+                # enforces this, but a future schema loosening
+                # shouldn't take down execution silently.
+                error_envelope = self._envelope(
+                    code="snapshot_missing",
+                    message_en=(
+                        f"Plan references Tool '{node.tool}' but no snapshot "
+                        "is bound to it — cannot execute (ADR-0027)."
+                    ),
+                )
+                return await self._record_node_failure(
+                    plan=plan,
+                    node=node,
+                    snapshot_or_none=None,
+                    execution_id=execution_id,
+                    actor_id=actor_id,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    error_envelope=error_envelope,
+                    retry_count=0,
+                    audit_log_ids=audit_log_ids,
+                )
+
+            try:
+                credential_ref = await self._resolve_credential_ref(
+                    snapshot=snapshot,
+                    node=node,
+                )
+                result = await self._worker.execute_with_credential(
+                    plan_id=plan.id,
+                    node=node,
+                    snapshot=snapshot,
+                    actor_id=actor_id,
+                    credential_ref=credential_ref,
+                )
+            except HITLRequiredError as exc:
+                # Worker surfaced HITL (read retries exhausted / write-
+                # destructive first-failure per ADR-0017). Record the
+                # failure and let the DAG runner continue — parallel
+                # siblings still get a chance to finish. ADR-0012's
+                # "等待 HITL 决策" gate is the post-execution pause
+                # where the user decides retry / skip / abort for the
+                # whole Plan; that's a follow-up surface, not in this
+                # node's call frame.
+                details = exc.details or {}
+                return await self._record_node_failure(
+                    plan=plan,
+                    node=node,
+                    snapshot_or_none=snapshot,
+                    execution_id=execution_id,
+                    actor_id=actor_id,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    error_envelope=details,
+                    retry_count=self._retry_count_from_details(details),
+                    audit_log_ids=audit_log_ids,
+                )
+            except (SchemaViolationError, ToolWorkerError) as exc:
+                # Non-retriable from the executor's POV.
+                details = exc.details or {}
+                return await self._record_node_failure(
+                    plan=plan,
+                    node=node,
+                    snapshot_or_none=snapshot,
+                    execution_id=execution_id,
+                    actor_id=actor_id,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    error_envelope=details,
+                    retry_count=self._retry_count_from_details(details),
+                    audit_log_ids=audit_log_ids,
+                )
+
+            await self._mark_node_succeeded(
+                execution_id=execution_id,
+                node_id=node.node_id,
+                outcome=result,
+            )
+            audit_log_ids.append(
+                await self._write_audit_log(
+                    plan=plan,
+                    snapshot_or_none=snapshot,
+                    node=node,
+                    actor_id=actor_id,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    outcome=result,
+                    error_envelope=None,
+                ),
+            )
+            return NodeRunOutcome(
+                status="succeeded",
+                request=result.request,
+                response=result.response,
+                started_at=result.started_at,
+                finished_at=result.finished_at,
+                retry_count=result.retry_count,
+            )
+
+        return _run_one_node
+
+    async def _record_node_failure(
+        self,
+        *,
+        plan: Plan,
+        node: PlanNode,
+        snapshot_or_none: ToolSnapshot | None,
+        execution_id: str,
+        actor_id: str,
+        conversation_id: str,
+        turn_id: str,
+        error_envelope: dict[str, Any],
+        retry_count: int,
+        audit_log_ids: list[str],
+    ) -> NodeRunOutcome:
+        """Persist a failed node outcome and return the runner outcome.
+
+        Centralises the four-step ritual the failure branches share:
+        mark the `plan_executions` row `failed`, append an
+        `audit_logs` row, and return a `NodeRunOutcome` carrying the
+        envelope so the DAG runner can aggregate the Plan-level
+        status. Extracted from `_run_one_node` so the three failure
+        paths (`snapshot_missing`, `HITLRequiredError`,
+        `SchemaViolationError | ToolWorkerError`) read uniformly
+        and the audit / execution side-effects stay in one place.
+        """
+        await self._mark_node_failed(
+            execution_id=execution_id,
+            node_id=node.node_id,
+            error_envelope=error_envelope,
+        )
+        audit_log_ids.append(
+            await self._write_audit_log(
+                plan=plan,
+                snapshot_or_none=snapshot_or_none,
+                node=node,
+                actor_id=actor_id,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                outcome=None,
+                error_envelope=error_envelope,
+                retry_count=retry_count,
+            ),
+        )
+        return NodeRunOutcome(
+            status="failed",
+            error_envelope=error_envelope,
+            retry_count=retry_count,
+        )
+
+    async def _mark_node_skipped(
+        self,
+        *,
+        execution_id: str,
+        node_id: str,
+    ) -> None:
+        """Record a `skipped` outcome on the `plan_executions` row.
+
+        Triggered by the DAG runner when a downstream node's upstream
+        failed (ADR-0012). Audit log rows are NOT written for skipped
+        nodes — the Worker never ran, so there's nothing to audit.
+        """
+        from datetime import datetime
+
+        now = datetime.utcnow()
+        await self._plan_executions.upsert_node_result(
+            execution_id,
+            PlanNodeResult(
+                node_id=node_id,
+                status="skipped",
+                started_at=None,
+                finished_at=now,
+                request=None,
+                response=None,
+                error=None,
+                retry_count=0,
+            ),
+        )
 
     async def _resolve_credential_ref(
         self,

@@ -35,6 +35,13 @@ dependencies = [
     # frozen `parameters_schema` before the upstream call so LLM
     # hallucinations never reach the API.
     "jsonschema>=4.23.0,<5.0",
+    # T28 / #24 — parallel-branch execution for the Plan DAG
+    # (ADR-0012). `langgraph` is the StateGraph runtime that drives
+    # concurrent siblings and gates downstream levels. Pinned to the
+    # 0.6.x line so it stays compatible with the pinned
+    # `langchain-core<1.0`; a 1.x bump is a deliberate decision because
+    # it lands a serde-reviver API change.
+    "langgraph>=0.6,<1.0",
 ]
 
 [project.optional-dependencies]
