@@ -1,5 +1,5 @@
 /**
- * Plan preview drawer — T19 / #17, T20 / #43, T24 / #21.
+ * Plan preview drawer — T19 / #17, T20 / #43, T24 / #21, T27 / #23.
  *
  * Right-side slide-out drawer rendering a Plan as a React Flow
  * node-edge graph (ADR-0029: "Plan 预览从右侧滑出为抽屉, 可全屏看图
@@ -19,6 +19,13 @@
  * (`POST /conversations/{id}/plan/{approve,reject}`) and fold the
  * returned Plan back into the store so the status badge updates
  * without a refetch.
+ *
+ * T27 / #23 (Plan node parameter edit) mounts `NodeEditDialog` over
+ * the drawer when `editingNodeId` is set; the entry button lives on
+ * `NodeInfoPanel`'s header and calls `openEdit`. On a successful
+ * PATCH, the dialog hands the post-edit Plan to `usePlanDrawerStore`
+ * via `replacePlan` — the same single write point (approve / reject /
+ * the SSE `plan.modified` event use.
  */
 import '@xyflow/react/dist/style.css'
 
@@ -33,6 +40,7 @@ import {
 import { Check, Maximize, Minimize, PanelRightClose, RefreshCw, WifiOff, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
+import { NodeEditDialog } from '@/components/plan/NodeEditDialog'
 import { NodeInfoPanel } from '@/components/plan/NodeInfoPanel'
 import { PlanAnswerPane } from '@/components/plan/PlanAnswerPane'
 import { PlanToolNode } from '@/components/plan/PlanToolNode'
@@ -64,10 +72,13 @@ export function PlanDrawer(): React.ReactElement {
   const plan = usePlanDrawerStore((s) => s.plan)
   const mode = usePlanDrawerStore((s) => s.mode)
   const selectedNodeId = usePlanDrawerStore((s) => s.selectedNodeId)
+  const editingNodeId = usePlanDrawerStore((s) => s.editingNodeId)
   const collapse = usePlanDrawerStore((s) => s.collapse)
   const toggleFullscreen = usePlanDrawerStore((s) => s.toggleFullscreen)
   const selectNode = usePlanDrawerStore((s) => s.selectNode)
-  const decidePlan = usePlanDrawerStore((s) => s.decidePlan)
+  const replacePlan = usePlanDrawerStore((s) => s.replacePlan)
+  const openEdit = usePlanDrawerStore((s) => s.openEdit)
+  const closeEdit = usePlanDrawerStore((s) => s.closeEdit)
 
   const nodes = useMemo(
     () => (plan ? buildFlowNodes(plan) : []),
@@ -107,7 +118,7 @@ export function PlanDrawer(): React.ReactElement {
         <ConnectionStatusPill />
         <div className="ml-auto flex items-center gap-1">
           {plan && plan.status === 'pending' && (
-            <PlanDecisionButtons plan={plan} onDecided={decidePlan} />
+            <PlanDecisionButtons plan={plan} onDecided={replacePlan} />
           )}
           <Button
             variant="ghost"
@@ -135,6 +146,7 @@ export function PlanDrawer(): React.ReactElement {
             nodes={nodes}
             edges={edges}
             onSelectNode={selectNode}
+            onEditNode={openEdit}
           />
         ) : (
           <p className="p-4 text-sm text-muted-foreground">
@@ -146,7 +158,23 @@ export function PlanDrawer(): React.ReactElement {
       <PlanAnswerPane />
 
       {plan && selectedNodeId && (
-        <NodeInfoPanel plan={plan} nodeId={selectedNodeId} />
+        <NodeInfoPanel plan={plan} nodeId={selectedNodeId} onEdit={openEdit} />
+      )}
+
+      {/* T27 / #23: parameter-edit modal. Mounted alongside the
+          drawer (not a React Portal) so its `z-50` overlay still
+          stacks correctly above the drawer's `z-40`. Re-mounts on
+          `editingNodeId` change so the form's initial state picks up
+          the freshly-targeted node. */}
+      {plan && editingNodeId && (
+        <NodeEditDialog
+          key={editingNodeId}
+          plan={plan}
+          nodeId={editingNodeId}
+          open
+          onClose={closeEdit}
+          onSaved={replacePlan}
+        />
       )}
     </aside>
   )
@@ -242,12 +270,19 @@ function PlanCanvas({
   nodes,
   edges,
   onSelectNode,
+  onEditNode,
 }: {
   plan: Plan
   nodes: Node<PlanNodeData>[]
   edges: Edge[]
   onSelectNode: (nodeId: string | null) => void
+  /** T27 / #23 — double-clicking a node card opens the edit dialog. */
+  onEditNode: (nodeId: string) => void
 }): React.ReactElement {
+  // Mirror ADR-0019's editable set client-side: a double-click on a
+  // `succeeded` / `failed` / `executing` node would otherwise open a
+  // dialog that immediately 409s on submit.
+  const editable = plan.status === 'pending' || plan.status === 'modified'
   return (
     <ReactFlow
       key={plan.id}
@@ -257,6 +292,11 @@ function PlanCanvas({
       fitView
       proOptions={{ hideAttribution: true }}
       onNodeClick={(_event, node) => onSelectNode(node.id)}
+      onNodeDoubleClick={
+        editable
+          ? (_event, node) => onEditNode(node.id)
+          : undefined
+      }
     >
       <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
     </ReactFlow>

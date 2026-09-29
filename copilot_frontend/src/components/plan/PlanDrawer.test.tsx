@@ -181,6 +181,154 @@ describe('PlanDrawer', () => {
 })
 
 /**
+ * Node parameter edit — T27 / #23 acceptance criteria:
+ *  - [x] 点节点弹表单 (the dialog opens from NodeInfoPanel's button)
+ *  - [x] 改 hello→world 批准后 Tool 用新参数 (PATCH /plan swaps the
+ *        Plan to `status="modified"` with the new parameters)
+ *  - [x] 返回 world (post-PATCH the next approve triggers a Worker
+ *        call with the new parameters — see `test_plan_edit_routes`
+ *        on the backend; here we pin the wire layer)
+ *
+ * The dialog itself has its own unit tests in `NodeEditDialog.test.tsx`;
+ * here we exercise the PlanDrawer + NodeInfoPanel + dialog wiring that
+ *  the AC describes (click → edit → submit → store reflects the
+ * modified Plan).
+ */
+describe('PlanDrawer T27 / #23 (node parameter edit)', () => {
+  it('renders the 编辑参数 button on the info panel for a pending Plan', () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+    expect(screen.getByTestId('node-edit-button')).toBeInTheDocument()
+  })
+
+  it('hides the 编辑参数 button once the Plan is no longer editable', () => {
+    const plan = makePlan({ status: 'succeeded' })
+    usePlanDrawerStore.getState().showPlan(plan)
+    render(<PlanDrawer />)
+    expect(screen.queryByTestId('node-edit-button')).not.toBeInTheDocument()
+  })
+
+  it('opens the dialog via the "编辑参数" button, edits hello → world, and folds the modified Plan back', async () => {
+    const fetchMock = mockFetch([
+      jsonResponse({
+        ...makePlan({
+          nodes: [
+            {
+              node_id: 'n1',
+              tool: 'echo',
+              parameters: { text: 'world' },
+              notes: '查 EMEA 客户',
+            },
+          ],
+          tool_snapshots: [makeSnapshot({ name: 'echo' })],
+        }),
+        status: 'modified',
+      }),
+    ])
+    const plan = makePlan({
+      nodes: [
+        { node_id: 'n1', tool: 'echo', parameters: { text: 'hello' }, notes: '查 EMEA 客户' },
+      ],
+      tool_snapshots: [makeSnapshot({ name: 'echo' })],
+    })
+    usePlanDrawerStore.getState().showPlan(plan)
+    render(<PlanDrawer />)
+
+    const userEvt = userEvent.setup()
+    await userEvt.click(screen.getByTestId('node-edit-button'))
+    expect(screen.getByTestId('node-edit-dialog')).toBeInTheDocument()
+
+    const params = screen.getByTestId('node-edit-parameters') as HTMLTextAreaElement
+    fireEvent.change(params, { target: { value: '{"text":"world"}' } })
+    await userEvt.click(screen.getByTestId('node-edit-submit'))
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(path).toBe('/api/v1/conversations/c1/plan')
+    expect(init.method).toBe('PATCH')
+    expect(JSON.parse(init.body as string)).toEqual({
+      nodes: [
+        {
+          node_id: 'n1',
+          tool: 'echo',
+          parameters: { text: 'world' },
+          notes: '查 EMEA 客户',
+        },
+      ],
+    })
+
+    // Store now reflects the backend's `modified` Plan, and the
+    // dialog has closed itself — this is the single write point
+    // the issue #53 handoff pinned.
+    await waitFor(() =>
+      expect(usePlanDrawerStore.getState().plan?.status).toBe('modified'),
+    )
+    expect(usePlanDrawerStore.getState().plan?.nodes[0].parameters).toEqual({
+      text: 'world',
+    })
+    expect(usePlanDrawerStore.getState().editingNodeId).toBeNull()
+    expect(screen.queryByTestId('node-edit-dialog')).not.toBeInTheDocument()
+  })
+
+  it('double-clicking a node card on the canvas opens the edit dialog (点节点弹表单)', () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    expect(screen.queryByTestId('node-edit-dialog')).not.toBeInTheDocument()
+
+    // `fireEvent.doubleClick` over `userEvent.dblClick`: the latter
+    // dispatches mousedown / mouseup through d3-drag, which jsdom
+    // can't satisfy (no `document` on the d3 internals). The
+    // existing single-click tests already use `fireEvent.click` for
+    // the same reason.
+    fireEvent.doubleClick(screen.getByTestId('plan-node-n1'))
+    expect(screen.getByTestId('node-edit-dialog')).toBeInTheDocument()
+    expect(usePlanDrawerStore.getState().editingNodeId).toBe('n1')
+  })
+
+  it('double-clicking a node card does NOT open the dialog once the Plan is no longer editable', () => {
+    const plan = makePlan({ status: 'succeeded' })
+    usePlanDrawerStore.getState().showPlan(plan)
+    render(<PlanDrawer />)
+
+    fireEvent.doubleClick(screen.getByTestId('plan-node-n1'))
+    expect(screen.queryByTestId('node-edit-dialog')).not.toBeInTheDocument()
+    expect(usePlanDrawerStore.getState().editingNodeId).toBeNull()
+  })
+
+  it('closes the dialog on ESC without calling the API', async () => {
+    mockFetch([])
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    const userEvt = userEvent.setup()
+    await userEvt.click(screen.getByTestId('node-edit-button'))
+    expect(screen.getByTestId('node-edit-dialog')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByTestId('node-edit-dialog')).not.toBeInTheDocument()
+  })
+
+  it('switching Plans wipes any open edit so the next drawer never shows a stale dialog', () => {
+    usePlanDrawerStore.getState().showPlan(makePlan())
+    render(<PlanDrawer />)
+
+    act(() => {
+      usePlanDrawerStore.getState().openEdit('n1')
+    })
+    expect(usePlanDrawerStore.getState().editingNodeId).toBe('n1')
+
+    // A fresh Plan lands before the user finishes editing.
+    act(() => {
+      usePlanDrawerStore.getState().showPlan(
+        makePlan({ id: 'p2', status: 'pending' }),
+      )
+    })
+    expect(usePlanDrawerStore.getState().editingNodeId).toBeNull()
+  })
+})
+
+/**
  * HITL approve / reject — T20 / #43.
  *
  * Mirrors the `mockFetch` pattern from `ChatPage.test.tsx`: queue
@@ -411,5 +559,115 @@ describe('PlanDrawer SSE live state (T24 / #21)', () => {
       usePlanDrawerStore.getState().markExecutionOutcome('other-plan', 'failed')
     })
     expect(screen.getByTestId('plan-status')).toHaveAttribute('data-status', 'succeeded')
+  })
+})
+
+/**
+ * Parallel-node runtime status — T29 / #25 acceptance criteria:
+ *  - [x] 2 节点同时显示 running 动画
+ *  - [x] 完成切 success
+ *  - [x] 失败节点标红
+ *
+ * T28's StateGraph fans two independent siblings out concurrently;
+ * T29's job is to make both visible at once. The single-node
+ * happy-path lives in the block above; this block pins the
+ * *parallel* shape — two siblings, distinct statuses, never coupled.
+ */
+describe('PlanDrawer parallel-node runtime status (T29 / #25)', () => {
+  function twoNodePlan(): Plan {
+    return makePlan({
+      id: 'p-parallel',
+      // Two sibling nodes at depth 0 — the T28 DAG executor runs
+      // them concurrently (no edge between them).
+      nodes: [
+        { node_id: 'n1', tool: 'echo_a', parameters: { text: 'A' }, notes: '' },
+        { node_id: 'n2', tool: 'echo_b', parameters: { text: 'B' }, notes: '' },
+      ],
+      edges: [],
+      tool_snapshots: [
+        makeSnapshot({ name: 'echo_a' }),
+        makeSnapshot({ name: 'echo_b' }),
+      ],
+    })
+  }
+
+  it('shows both parallel nodes running simultaneously (2 节点同时显示 running 动画)', () => {
+    usePlanDrawerStore.getState().showPlan(twoNodePlan())
+    render(<PlanDrawer />)
+
+    // Fold the parallel `tool.started` events from the Worker.
+    act(() => {
+      useConversationStreamStore.getState().markNodeRunning('n1')
+      useConversationStreamStore.getState().markNodeRunning('n2')
+    })
+
+    const a = screen.getByTestId('plan-node-n1')
+    const b = screen.getByTestId('plan-node-n2')
+    expect(a).toHaveAttribute('data-runtime', 'running')
+    expect(b).toHaveAttribute('data-runtime', 'running')
+
+    // The card itself pulses, not just the badge spinner — without
+    // this both cards would be visually calm while the 12px icons
+    // spin, which fails the AC's "2 节点同时显示 running 动画".
+    expect(a.className).toMatch(/animate-pulse/)
+    expect(b.className).toMatch(/animate-pulse/)
+
+    expect(screen.getByTestId('plan-node-status-n1')).toHaveTextContent('执行中')
+    expect(screen.getByTestId('plan-node-status-n2')).toHaveTextContent('执行中')
+  })
+
+  it('flips both parallel nodes to success once both finish (完成切 success)', () => {
+    usePlanDrawerStore.getState().showPlan(twoNodePlan())
+    render(<PlanDrawer />)
+
+    act(() => {
+      useConversationStreamStore.getState().markNodeRunning('n1')
+      useConversationStreamStore.getState().markNodeRunning('n2')
+      useConversationStreamStore.getState().markNodeFinished('n1', 'succeeded')
+      useConversationStreamStore.getState().markNodeFinished('n2', 'succeeded')
+    })
+
+    const a = screen.getByTestId('plan-node-n1')
+    const b = screen.getByTestId('plan-node-n2')
+    expect(a).toHaveAttribute('data-runtime', 'succeeded')
+    expect(b).toHaveAttribute('data-runtime', 'succeeded')
+    // No more pulse once the execution settles.
+    expect(a.className).not.toMatch(/animate-pulse/)
+    expect(b.className).not.toMatch(/animate-pulse/)
+    // Success ring on the card so the green pill isn't the only cue.
+    expect(a.className).toMatch(/ring-emerald/)
+    expect(b.className).toMatch(/ring-emerald/)
+    expect(screen.getByTestId('plan-node-status-n1')).toHaveTextContent('成功')
+    expect(screen.getByTestId('plan-node-status-n2')).toHaveTextContent('成功')
+  })
+
+  it('marks only the failed sibling red when one parallel branch fails (失败节点标红)', () => {
+    usePlanDrawerStore.getState().showPlan(twoNodePlan())
+    render(<PlanDrawer />)
+
+    act(() => {
+      useConversationStreamStore.getState().markNodeRunning('n1')
+      useConversationStreamStore.getState().markNodeRunning('n2')
+      // n1 succeeded; n2 hit the Worker's unrecoverable path.
+      useConversationStreamStore.getState().markNodeFinished('n1', 'succeeded')
+      useConversationStreamStore.getState().markNodeFailed('n2')
+    })
+
+    const ok = screen.getByTestId('plan-node-n1')
+    const bad = screen.getByTestId('plan-node-n2')
+    expect(ok).toHaveAttribute('data-runtime', 'succeeded')
+    expect(bad).toHaveAttribute('data-runtime', 'failed')
+
+    // The AC wants the failed node clearly red — the card border
+    // and background flip, not just a tiny pill. The sibling's
+    // success ring stays emerald, so the user can see exactly which
+    // one broke.
+    expect(bad.className).toMatch(/border-red/)
+    expect(bad.className).toMatch(/bg-red/)
+    expect(ok.className).toMatch(/ring-emerald/)
+    expect(ok.className).not.toMatch(/border-red/)
+
+    expect(screen.getByTestId('plan-node-status-n1')).toHaveTextContent('成功')
+    expect(screen.getByTestId('plan-node-status-n2')).toHaveTextContent('失败')
   })
 })

@@ -9,7 +9,7 @@
  * Store split follows issue #53's handoff contract:
  *
  * - Plan *content* is written only through `usePlanDrawerStore`
- *   (`showPlan` on `plan.generated`, `decidePlan` on
+ *   (`showPlan` on `plan.generated`, `replacePlan` on
  *   `plan.modified`, `markExecutionOutcome` on
  *   `execution.completed`) — the drawer keeps being the single
  *   Plan write point.
@@ -57,7 +57,7 @@ export function useConversationStream(conversationId: string | null): void {
           stream.beginPlan()
           return
         case 'plan.modified':
-          drawer.decidePlan(event.payload.plan)
+          drawer.replacePlan(event.payload.plan)
           return
         case 'tool.started':
           stream.markNodeRunning(event.payload.node_id)

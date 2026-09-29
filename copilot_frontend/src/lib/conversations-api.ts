@@ -1,10 +1,11 @@
 /**
- * Conversation / Turn API client — T19 / #17, T20 / #43.
+ * Conversation / Turn API client — T19 / #17, T20 / #43, T27 / #23.
  *
  * Thin facade over `apiFetch` for the chat write path
  * (`POST /api/v1/conversations`, `POST /api/v1/conversations/{id}/turns`,
  * ADR-0031) plus the HITL Plan approve / reject endpoints (T20 / #43,
- * ADR-0004). The Turn response carries the generated Plan
+ * ADR-0004) and the Plan-edit endpoint (T27 / #23, T26 / #44,
+ * ADR-0019). The Turn response carries the generated Plan
  * synchronously — SSE (`plan.generated` events) lands with T23 / T24,
  * so T19's drawer hydrates straight from this call.
  *
@@ -13,7 +14,7 @@
  * ticket), same stance as `tools-api.ts`.
  */
 import { ApiError, apiFetch } from '@/lib/api-client'
-import type { Plan, TurnResponse } from '@/types/plan'
+import type { Plan, PlanNode, TurnResponse } from '@/types/plan'
 
 /** Lifecycle states — mirrors backend `ConversationStatus` (ADR-0011). */
 export type ConversationStatus = 'active' | 'idle' | 'archived'
@@ -95,6 +96,38 @@ export function formatPlanDecisionError(err: unknown): string {
     return '无法连接后端服务, 请确认服务已启动。'
   }
   return '发生未知错误, 请重试。'
+}
+
+/**
+ * HITL Plan edit — T27 / #23, T26 / #44, ADR-0019.
+ *
+ * PATCH /api/v1/conversations/{id}/plan. The wire shape is the full
+ * edited `nodes` list (the repository enforces "same node-ids, same
+ * `tool` per node", so any add / remove / repoint attempt surfaces as
+ * a 400 `validation_error` upstream — the Frontend only mutates
+ * `parameters` and `notes`). Returns the post-edit Plan with status
+ * `modified`, which the dialog folds back into the drawer store via
+ * `replacePlan`.
+ *
+ * Error envelope mirrors `approvePlan` / `rejectPlan`:
+ * - 401 `auth_missing_token` — JWT gone (refresh chain dies).
+ * - 404 `not_found` — wrong / cross-user / no pending Plan.
+ * - 409 `plan_not_pending` — Plan already approved / rejected /
+ *   executing; the user re-edits, the dialog keeps them on PATCH.
+ * - 400 `validation_error` — node-ids or `tool` bindings drifted.
+ */
+export async function editPlan(
+  conversationId: string,
+  editedNodes: PlanNode[],
+  signal?: AbortSignal,
+): Promise<Plan> {
+  const path = `/conversations/${encodeURIComponent(conversationId)}/plan`
+  const init: RequestInit = {
+    method: 'PATCH',
+    body: JSON.stringify({ nodes: editedNodes }),
+  }
+  if (signal) init.signal = signal
+  return apiFetch<Plan>(path, init)
 }
 
 /** Start a new conversation; the backend marks it `active` (ADR-0011). */
