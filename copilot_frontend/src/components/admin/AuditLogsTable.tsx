@@ -35,7 +35,9 @@ import type { ToolRiskLevel } from '@/types/tool'
  * - **Time range** — `time_from` / `time_to` bound the
  *   `occurred_at` window. Inclusive `from`, exclusive `to` so a
  *   calendar-day query maps cleanly onto the backend's
- *   `$gte` / `$lt` semantics (T42 / #37 repository).
+ *   `$gte` / `$lt` semantics (T42 / #37 repository). The
+ *   `datetime-local` values are normalized to UTC ISO-8601 by
+ *   `audit-logs-api.ts ::toUtcIso` before hitting the wire.
  *
  * Cursor pagination uses TanStack Query's `useInfiniteQuery` —
  * ADR-0031 chose cursor for forward-only scrolling. The "Load

@@ -14,7 +14,11 @@
  *
  * Filter values map 1:1 onto the query-param contract the backend
  * will expose (T42 / #37 lays the matching repository; the route
- * follows). Empty / `null` filters are stripped so the URL never
+ * follows), except the time bounds: `datetime-local` inputs are
+ * naive local strings, while the backend compares against
+ * `occurred_at` stored UTC-aware (`repositories/base.py ::_now`),
+ * so `toUtcIso` normalizes them to UTC ISO-8601 before they hit
+ * the wire. Empty / `null` filters are stripped so the URL never
  * carries `?actor_id=` noise, mirroring `tools-api.ts`.
  */
 import { apiFetch } from '@/lib/api-client'
@@ -38,6 +42,24 @@ export interface FetchAuditLogsParams {
 const DEFAULT_LIMIT = 50
 
 /**
+ * Normalize a time-filter value to a UTC ISO-8601 string.
+ *
+ * `datetime-local` yields naive local strings (`2026-09-01T00:00`)
+ * which JS `Date` parses as *local* time; the backend compares
+ * them against UTC-aware `occurred_at` values, so sending the
+ * naive string would silently mis-window the query for every
+ * non-UTC admin. Converting through `Date` pins the instant, and
+ * `toISOString()` emits the `...Z` form Mongo/pydantic round-trip
+ * unambiguously. Already-UTC strings round-trip unchanged;
+ * unparseable values pass through untouched so the backend — not
+ * the URL builder — rejects them.
+ */
+function toUtcIso(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toISOString()
+}
+
+/**
  * Build the query string for the audit-log list endpoint.
  * Pulled out so `fetchAuditLogsPage` and the test can both inspect
  * the exact URL contract — `URLSearchParams.toString()`'s encoding
@@ -52,8 +74,8 @@ function buildAuditLogsSearch(params: FetchAuditLogsParams): string {
   if (params.lifecycle_status) {
     search.set('lifecycle_status', params.lifecycle_status)
   }
-  if (params.time_from) search.set('time_from', params.time_from)
-  if (params.time_to) search.set('time_to', params.time_to)
+  if (params.time_from) search.set('time_from', toUtcIso(params.time_from))
+  if (params.time_to) search.set('time_to', toUtcIso(params.time_to))
   if (params.cursor) search.set('cursor', params.cursor)
   const limit = params.limit ?? DEFAULT_LIMIT
   search.set('limit', String(limit))

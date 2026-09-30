@@ -200,8 +200,16 @@ describe('AuditLogsTable', () => {
     await user.type(screen.getByLabelText(/结束时间/), '2026-09-30T00:00')
     await waitFor(() => {
       const lastCall = fetchMock.mock.calls[fetchMock.mock.calls.length - 1]
-      expect(lastCall[0]).toContain('time_from=2026-09-01T00%3A00')
-      expect(lastCall[0]).toContain('time_to=2026-09-30T00%3A00')
+      const sent = new URL(String(lastCall[0]), 'http://test.local')
+        .searchParams
+      // datetime-local values are naive local; the wire contract is
+      // UTC ISO-8601 (`...Z`) to match the backend's UTC-aware
+      // occurred_at. Building the expectation with the same Date
+      // semantics keeps the assertion TZ-independent while still
+      // proving the naive→UTC normalization happened.
+      expect(sent.get('time_from')).toBe(new Date('2026-09-01T00:00').toISOString())
+      expect(sent.get('time_to')).toBe(new Date('2026-09-30T00:00').toISOString())
+      expect(sent.get('time_from')).toMatch(/Z$/)
     })
   })
 
