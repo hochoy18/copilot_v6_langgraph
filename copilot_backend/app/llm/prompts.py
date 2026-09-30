@@ -79,26 +79,45 @@ class PromptTemplate:
 
 
 # Bootstrap fallback for `tool-description-generator`. Mirrors the
-# acceptance criteria of T16: LLM-friendly rewrite plus typical use
-# cases, strict-JSON output. Written for OpenAI-compatible chat models.
+# acceptance criteria of T16 + T16-followup / #50: LLM-friendly rewrite
+# plus typical use cases plus per-parameter notes, strict-JSON output.
+# Written for OpenAI-compatible chat models.
+#
+# **Langfuse sync (T16-followup / #50 AC #4).** The Langfuse copy of
+# this Prompt is the canonical asset (ADR-0013 / ADR-0033); the
+# bootstrap below is the availability floor. Whenever the contract
+# changes — for example when `parameter_notes` was added — the same
+# change MUST be published to the Langfuse Prompt of the same name,
+# or the bootstrap and the live prompt will drift apart and the
+# generator will silently emit the old shape. There is no automated
+# push from this module; the deploy checklist
+# (`docs/agents/issue-tracker.md` / ADR-0033 §后果) tracks it.
 _BOOTSTRAP_TOOL_DESCRIPTION_GENERATOR = """\
 你是企业 API Copilot 的 Tool 描述撰写助手。请把下面这个面向开发者的 \
-OpenAPI operation 改写成 LLM Planner 能语义匹配的业务化 Tool 描述。
+OpenAPI operation 改写成 LLM Planner 能语义匹配的业务化 Tool 描述, \
+并对每个参数补写业务化的说明。
 
 Tool 名称: {{name}}
 HTTP 方法与路径: {{method}} {{path}}
 原始描述(面向开发者): {{description}}
-参数摘要: {{parameters}}
+参数摘要(每个参数一行, 包含名称 / 类型 / 位置 / 是否必填 / 开发者原文): {{parameters}}
 
 要求:
 1. 用一两句业务语言说明这个 Tool 做什么, 覆盖"业务人员可能怎么称呼它", \
 不要复述 HTTP 细节, 也不要照抄原文。
 2. 给出 2-4 条典型用例: 业务人员可能用什么样的自然语言指令会需要调用它, \
 每条一句话。
-3. 原始描述缺失或含糊时, 基于路径与参数推断, 并在描述中注明这是推断。
+3. 对参数摘要中出现的每个参数, 在 `parameter_notes` 里给出一句业务化说明: \
+业务人员拿到这个参数后该怎么取值 / 不确定时该怎么处理 / 通常的取值范围是 \
+什么; 不要复述开发者原文, 也不要照抄 HTTP / 类型细节。每个 note 一句话即可, \
+不要超过 256 字(后端会按这个上限截断, 写得过长反而被丢掉)。原始描述缺失或 \
+含糊时, 基于路径与参数推断, 并在描述或 note 中注明这是推断。
 4. 只输出一个 JSON 对象, 不要输出其它任何内容(包括代码围栏之外的文字):
-{"description": "<业务化描述>", "typical_use_cases": ["<用例1>", "<用例2>"]}
-其中 typical_use_cases 为 2-4 条中文短句。
+{"description": "<业务化描述>", \
+ "typical_use_cases": ["<用例1>", "<用例2>"], \
+ "parameter_notes": {"<参数名>": "<业务化说明>", "<参数名2>": "<业务化说明>"}}
+其中 typical_use_cases 为 2-4 条中文短句; parameter_notes 的键必须 \
+严格匹配参数摘要里的参数名, 没有把握的键直接省略, 不要臆造。
 """
 
 # Bootstrap fallback for `planner` (T18 / #16, T25 / #22, T30 / #26, T32 / #28). Same

@@ -208,6 +208,7 @@ MINI_SPEC: dict[str, Any] = {
                         "name": "id",
                         "in": "path",
                         "required": True,
+                        "description": "Pet identifier",
                         "schema": {"type": "integer"},
                     }
                 ],
@@ -231,6 +232,15 @@ MINI_SPEC: dict[str, Any] = {
 _GENERATED_JSON = (
     '{"description": "按编号查询宠物资料", '
     '"typical_use_cases": ["查一下 7 号宠物的信息", "宠物 3 的档案是什么"]}'
+)
+
+# T16-followup / #50 — `parameter_notes` ride into the preview's
+# parameters_schema so admins can see and edit the LLM-rewritten
+# descriptions before activation.
+_GENERATED_JSON_WITH_PARAM_NOTES = (
+    '{"description": "按编号查询宠物资料", '
+    '"typical_use_cases": ["查一下 7 号宠物的信息"], '
+    '"parameter_notes": {"id": "宠物编号,从宠物列表接口拿到"}}'
 )
 
 
@@ -377,3 +387,70 @@ async def test_import_preview_degrades_per_draft_when_model_fails(
         assert draft["description_generated"] is False
         assert any("LLM" in w for w in draft["warnings"])
     assert payload["drafts"][0]["description"]  # raw text still present, reviewable
+
+
+# ---------------------------------------------------------------------------
+# T16-followup / #50 — `parameter_notes` rewrite (ADR-0018)
+# ---------------------------------------------------------------------------
+
+
+async def test_import_preview_carries_llm_generated_parameter_notes(
+    client: Any, app: FastAPI, settings: Settings
+) -> None:
+    """AC #1: rewritten parameter descriptions land on the preview draft,
+    alongside the original schema for review."""
+    _wire_generator(
+        app, settings, _FakeChatModel(response_text=_GENERATED_JSON_WITH_PARAM_NOTES)
+    )
+    headers = await _admin_headers(app, settings)
+
+    response = await client.post(
+        "/api/v1/admin/tools/import/openapi",
+        json={"spec": MINI_SPEC},
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    drafts = response.json()["drafts"]
+    get_pet = next(d for d in drafts if d["name"] == "getPetById")
+
+    # AC #1 — note replaced the original developer-facing description.
+    id_prop = get_pet["parameters_schema"]["properties"]["id"]
+    assert id_prop["description"] == "宠物编号,从宠物列表接口拿到"
+    # AC #2 — internal markers the Worker depends on survived.
+    assert id_prop["__location__"] == "path"
+    assert id_prop["type"] == "integer"
+    assert "id" in get_pet["parameters_schema"]["required"]
+
+    # Original schema preserved on the preview so the admin can compare.
+    assert get_pet["original_parameters_schema"] is not None
+    assert (
+        get_pet["original_parameters_schema"]["properties"]["id"]["description"]
+        == "Pet identifier"
+    )
+    assert get_pet["parameters_schema_generated"] is True
+
+
+async def test_import_preview_keeps_schema_unchanged_when_no_parameter_notes(
+    client: Any, app: FastAPI, settings: Settings
+) -> None:
+    """AC #3: an LLM that didn't return `parameter_notes` leaves the schema
+    alone — the preview still activates via POST /admin/tools without
+    parameter-rewrite artifacts."""
+    _wire_generator(app, settings, _FakeChatModel(response_text=_GENERATED_JSON))
+    headers = await _admin_headers(app, settings)
+
+    response = await client.post(
+        "/api/v1/admin/tools/import/openapi",
+        json={"spec": MINI_SPEC},
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    drafts = response.json()["drafts"]
+    for draft in drafts:
+        assert draft["parameters_schema_generated"] is False
+        assert draft["original_parameters_schema"] is None
+        # Description still uses the LLM-friendly version — only the schema
+        # is untouched.
+        assert draft["description_generated"] is True

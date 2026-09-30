@@ -24,6 +24,17 @@ Behavioural rules worth knowing before editing:
   typical-use-case hints to be part of the stored text because the
   Planner only ever sees `description`; the structured list also
   travels on `GeneratedDescription` for UI display.
+* **Parameter notes ride into `parameters_schema` (T16-followup /
+  #50).** The LLM contract grows to
+  `{description, typical_use_cases, parameter_notes: {param: note}}`;
+  the notes rewrite `parameters_schema.properties[*].description` so
+  the preview UI sees the business-facing wording for every argument.
+  Internal markers (`__location__`) and structural fields (`type`,
+  `required`) survive untouched — they are routing/validation signals,
+  not copy that the LLM is allowed to touch. Parameters the LLM
+  omits from `parameter_notes` keep their original OpenAPI
+  descriptions; the original schema is parked on
+  `draft.original_parameters_schema` for review.
 * **Bounded fan-out.** An import preview generates descriptions for at
   most `MAX_DESCRIPTIONS_PER_IMPORT` operations, running at most
   `_GENERATION_CONCURRENCY` LLM calls in flight, so a 200-operation
@@ -75,6 +86,13 @@ _MAX_DESCRIPTION_LENGTH = 4096
 # types, and locations.
 _MAX_PARAMETERS_SUMMARY = 1200
 
+# Per-parameter note cap (T16-followup / #50). Long enough for a real
+# business-facing sentence, short enough that one chatty model can't
+# bloat the persisted schema. `ToolBase.parameters_schema` itself has
+# no per-string cap, but anything close to the description limit would
+# indicate the LLM is regenerating the whole operation text.
+_MAX_PARAMETER_NOTE_LENGTH = 256
+
 _USE_CASE_HEADER = "\n\n典型用例:\n"
 
 
@@ -88,10 +106,21 @@ class GeneratedDescription:
     model output so callers can tell whether the hints actually made
     it into the text (an empty list triggers a review warning) without
     re-parsing.
+
+    T16-followup / #50 adds `parameter_notes` (the LLM's
+    `{param: note}` map) and `parameters_schema` (the rewritten schema
+    with notes applied to `properties[*].description`, keeping the
+    `__location__` marker and structural fields intact). When the LLM
+    omits `parameter_notes` both fields mirror the original draft —
+    `parameter_notes` is `{}` and `parameters_schema` is the unchanged
+    parser output. Tests assert on `parameters_schema` to keep the
+    preview-side contract (raw → rewritten) explicit.
     """
 
     description: str
     typical_use_cases: list[str]
+    parameter_notes: dict[str, str]
+    parameters_schema: dict[str, Any]
 
 
 class ToolDescriptionGenerator:
@@ -152,11 +181,16 @@ class ToolDescriptionGenerator:
             ) from exc
 
         content = content_to_text(response.content)
-        description, use_cases = _parse_model_output(content, draft.name)
+        description, use_cases, raw_notes = _parse_model_output(content, draft.name)
         composed = _compose_description(description, use_cases)
+        rewritten_schema, applied_notes = _apply_parameter_notes(
+            draft.parameters_schema, raw_notes
+        )
         return GeneratedDescription(
             description=composed,
             typical_use_cases=use_cases,
+            parameter_notes=applied_notes,
+            parameters_schema=rewritten_schema,
         )
 
     # ------------------------------------------------------------------
@@ -168,9 +202,14 @@ class ToolDescriptionGenerator:
 
         Mutations on success: `description` ← generated text,
         `original_description` ← the replaced raw text,
-        `description_generated` ← True. Per-draft failures append a
-        warning to that draft's `warnings` and leave its text untouched
-        — the raw OpenAPI description is still reviewable, which keeps
+        `description_generated` ← True. For T16-followup / #50 the
+        same pattern extends to `parameters_schema`: when the LLM
+        returned `parameter_notes`, `parameters_schema` carries the
+        rewritten per-property descriptions, the raw schema lands on
+        `original_parameters_schema`, and `parameters_schema_generated`
+        flips to True. Per-draft failures append a warning to that
+        draft's `warnings` and leave its text untouched — the raw
+        OpenAPI description is still reviewable, which keeps
         ADR-0018's admin-review step intact even with a broken model.
         """
         if not self.ready:
@@ -217,6 +256,21 @@ class ToolDescriptionGenerator:
                 draft.original_description = draft.description
                 draft.description = generated.description
                 draft.description_generated = True
+                # T16-followup / #50 — apply parameter notes onto the
+                # schema only when the LLM actually returned any; the
+                # empty-map case keeps the original schema verbatim so
+                # graceful degradation matches the description path.
+                if generated.parameter_notes:
+                    draft.original_parameters_schema = draft.parameters_schema
+                    draft.parameters_schema = generated.parameters_schema
+                    draft.parameters_schema_generated = True
+                else:
+                    # The description rewrite succeeded but the model
+                    # didn't supply parameter notes — surface that so
+                    # the admin can add them by hand during review.
+                    draft.warnings.append(
+                        "LLM 生成结果未包含参数说明，请 review 时补充。"
+                    )
                 if not generated.typical_use_cases:
                     # AC #2 guard: a rewrite without 典型用例 is still
                     # reviewable, but the admin must be told to add one.
@@ -289,15 +343,22 @@ def summarize_parameters(schema: dict[str, Any]) -> str:
     return summary[:_MAX_PARAMETERS_SUMMARY]
 
 
-def _parse_model_output(content: str, tool_name: str) -> tuple[str, list[str]]:
-    """Extract the `{description, typical_use_cases}` contract.
+def _parse_model_output(
+    content: str, tool_name: str
+) -> tuple[str, list[str], dict[str, str]]:
+    """Extract the `{description, typical_use_cases, parameter_notes}` contract.
 
     `app.llm.output.extract_json_object` handles the "fenced block /
     prose-wrapped JSON" mess; here we only police the contract: a
-    non-empty `description` string must survive, and use cases filter
-    down to non-empty strings. Anything else raises
-    `LLMGenerationError` so the batch degrades this draft rather than
-    storing junk.
+    non-empty `description` string must survive, use cases filter down
+    to non-empty strings, and `parameter_notes` (T16-followup / #50)
+    survives as a `{name: note}` map of non-empty trimmed strings.
+    Anything else raises `LLMGenerationError` so the batch degrades
+    this draft rather than storing junk.
+
+    `parameter_notes` is optional — older Langfuse copies or models
+    that decide not to produce notes yield an empty dict, which keeps
+    AC #3's graceful-degradation parity with the description rewrite.
     """
     parsed = extract_json_object(content)
 
@@ -318,7 +379,80 @@ def _parse_model_output(content: str, tool_name: str) -> tuple[str, list[str]]:
     cases: list[str] = []
     if isinstance(raw_cases, list):
         cases = [c.strip() for c in raw_cases if isinstance(c, str) and c.strip()]
-    return description.strip(), cases
+    return description.strip(), cases, _coerce_parameter_notes(parsed.get("parameter_notes"))
+
+
+def _coerce_parameter_notes(value: Any) -> dict[str, str]:
+    """Normalise the LLM's `parameter_notes` payload into a clean dict.
+
+    Anything that isn't a string→string map is dropped wholesale —
+    partial / typed-wrong values would otherwise corrupt the
+    schema rewrite with `TypeError` surprises downstream.
+    """
+    if not isinstance(value, dict):
+        return {}
+    notes: dict[str, str] = {}
+    for key, note in value.items():
+        if not isinstance(key, str) or not isinstance(note, str):
+            continue
+        cleaned = note.strip()
+        if not cleaned:
+            # An empty/whitespace note would clobber the original
+            # description with no signal — skip and let the original
+            # OpenAPI text stand.
+            continue
+        notes[key] = cleaned
+    return notes
+
+
+def _apply_parameter_notes(
+    schema: dict[str, Any], notes: dict[str, str]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Rewrite `parameters_schema` with the LLM's notes; return applied map.
+
+    Returns `(rewritten_schema, applied_notes)`:
+
+    * `rewritten_schema` is a shallow-cloned schema; the input is
+      never mutated so `draft.original_parameters_schema` can keep the
+      raw text intact. Internal markers (`__location__`) and
+      structural fields (`type`, `required`) survive untouched —
+      they're routing/validation signals, not copy the LLM is
+      allowed to touch.
+    * `applied_notes` is the subset of `notes` that landed on the
+      schema (keys present in `properties`, non-empty after
+      trimming, clamped to `_MAX_PARAMETER_NOTE_LENGTH`). Notes
+      that name a parameter absent from the schema are silently
+      dropped: validation is the schema's job (ADR-0020), and a
+      stray note must not manufacture a parameter that doesn't
+      exist. Surfacing only the applied map lets callers tell the
+      admin which notes actually made it onto the preview.
+    """
+    if not notes:
+        return schema, {}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return schema, {}
+    rewritten_properties: dict[str, Any] = {}
+    applied: dict[str, str] = {}
+    for name, spec in properties.items():
+        spec_dict = spec if isinstance(spec, dict) else {}
+        note = notes.get(name)
+        if note is None:
+            rewritten_properties[name] = spec_dict
+            continue
+        # Clamp the note so a chatty model can't bloat the persisted
+        # schema — see `_MAX_PARAMETER_NOTE_LENGTH` for the rationale.
+        clipped = note[:_MAX_PARAMETER_NOTE_LENGTH]
+        # Copy the spec dict so we never mutate the original; only
+        # `description` is replaced, every other key (including
+        # `__location__` and `type`) is preserved verbatim.
+        new_spec = dict(spec_dict)
+        new_spec["description"] = clipped
+        rewritten_properties[name] = new_spec
+        applied[name] = clipped
+    rewritten = dict(schema)
+    rewritten["properties"] = rewritten_properties
+    return rewritten, applied
 
 
 def _compose_description(description: str, use_cases: list[str]) -> str:

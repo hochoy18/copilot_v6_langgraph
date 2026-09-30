@@ -110,6 +110,14 @@ class ToolDraft:
     # what the model changed. `None` / `False` means "still raw".
     original_description: str | None = None
     description_generated: bool = False
+    # T16-followup / #50 — parameter description rewrite (ADR-0018).
+    # `parameter_notes` from the LLM ride into
+    # `parameters_schema.properties[*].description`; the raw schema
+    # stays on `original_parameters_schema` so the admin can compare.
+    # Both stay `None` / `False` when the LLM didn't return any notes,
+    # keeping graceful-degradation parity with `description` (AC #3).
+    original_parameters_schema: dict[str, Any] | None = None
+    parameters_schema_generated: bool = False
 
 
 @dataclass(slots=True)

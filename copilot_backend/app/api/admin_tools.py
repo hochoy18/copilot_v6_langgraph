@@ -503,6 +503,27 @@ class ToolDraftResponse(BaseModel):
         default=False,
         description="True when `description` is the LLM-generated draft awaiting review.",
     )
+    # T16-followup / #50 — parameter description rewrite (ADR-0018).
+    # `original_parameters_schema` is the raw OpenAPI schema the LLM
+    # notes were applied on top of; `None` when no notes were
+    # generated. `parameters_schema_generated` is the analogue of
+    # `description_generated` for the schema side.
+    original_parameters_schema: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Raw OpenAPI `parameters_schema` before the LLM's per-parameter "
+            "rewrites were applied. `None` when the model didn't return any "
+            "`parameter_notes` — the admin can still activate via "
+            "`POST /api/v1/admin/tools` and edit by hand."
+        ),
+    )
+    parameters_schema_generated: bool = Field(
+        default=False,
+        description=(
+            "True when `parameters_schema` carries the LLM-rewritten "
+            "per-parameter descriptions (T16-followup / #50)."
+        ),
+    )
     risk_level: ToolRiskLevel
     status: ToolStatus = Field(
         description="Always `draft` per ADR-0018 — preview rows are never active.",

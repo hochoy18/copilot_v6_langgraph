@@ -113,7 +113,8 @@ def _settings(**overrides: object) -> Settings:
 
 
 def _generator(
-    response_text: str = '{"description": "查宠物信息", "typical_use_cases": ["今天有哪些新宠物"]}',
+    response_text: str = '{"description": "查宠物信息", "typical_use_cases": ["今天有哪些新宠物"], '
+    '"parameter_notes": {"id": "宠物编号,从宠物列表接口拿到"}}',
     *,
     should_fail: bool = False,
     settings: Settings | None = None,
@@ -285,8 +286,9 @@ async def test_enrich_warns_when_generated_text_lacks_use_cases() -> None:
 
     assert drafts[0].description_generated is True
     assert drafts[0].description == "只有描述没有用例"
-    assert len(drafts[0].warnings) == 1
-    assert "用例" in drafts[0].warnings[0]
+    # Both the use-case and parameter-notes omissions get warned about;
+    # this test cares specifically about the use-case one.
+    assert any("用例" in w for w in drafts[0].warnings)
 
 
 async def test_enrich_caps_generation_and_warns_about_skipped_drafts() -> None:
@@ -322,3 +324,241 @@ async def test_enrich_clamps_generated_description_to_schema_max_length() -> Non
     await generator.enrich_drafts(drafts)
 
     assert len(drafts[0].description) <= 4096
+
+
+# ---------------------------------------------------------------------------
+# parameter_notes — T16-followup / #50 (ADR-0018)
+# ---------------------------------------------------------------------------
+#
+# The LLM contract grows to `{description, typical_use_cases,
+# parameter_notes: {param: note}}`. The notes ride onto
+# `parameters_schema.properties[*].description` so the admin preview
+# shows them and the eventual POST /admin/tools call carries the
+# rewritten schema verbatim. The internal markers the Worker depends on
+# (`__location__`) plus the structural fields (`type`, `required`)
+# must survive untouched — those are routing/validation signals, not
+# copy that the LLM gets to rewrite.
+
+
+async def test_generate_writes_parameter_notes_into_parameters_schema() -> None:
+    """AC #1: the LLM's per-parameter notes land on properties[*].description."""
+    payload = json.dumps(
+        {
+            "description": "查宠物信息",
+            "typical_use_cases": ["查一下 7 号宠物的信息"],
+            "parameter_notes": {"id": "宠物编号,从宠物列表接口拿到"},
+        },
+        ensure_ascii=False,
+    )
+    generator, _model = _generator(response_text=payload)
+
+    result = await generator.generate(_draft())
+
+    assert result.parameter_notes == {"id": "宠物编号,从宠物列表接口拿到"}
+
+
+async def test_generate_preserves_type_required_and_location_markers() -> None:
+    """AC #2: `__location__`, `type`, and `required` survive the rewrite."""
+    payload = json.dumps(
+        {
+            "description": "查宠物",
+            "typical_use_cases": ["查 7 号宠物"],
+            "parameter_notes": {"id": "宠物编号"},
+        },
+        ensure_ascii=False,
+    )
+    generator, _model = _generator(response_text=payload)
+
+    result = await generator.generate(_draft())
+
+    schema = result.parameters_schema
+    assert schema["properties"]["id"]["__location__"] == "path"
+    assert schema["properties"]["id"]["type"] == "integer"
+    assert "id" in schema["required"]
+    # Description was rewritten to the LLM note.
+    assert schema["properties"]["id"]["description"] == "宠物编号"
+
+
+async def test_generate_keeps_original_description_when_param_omitted_from_notes() -> None:
+    """Partial notes: untouched properties keep their developer-facing text."""
+    payload = json.dumps(
+        {
+            "description": "查宠物",
+            "typical_use_cases": ["查 7 号宠物"],
+            "parameter_notes": {"id": "宠物编号"},
+        },
+        ensure_ascii=False,
+    )
+    draft = _draft(
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "Pet identifier",
+                    "__location__": "path",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Page size limit",
+                    "__location__": "query",
+                },
+            },
+            "required": ["id"],
+        }
+    )
+    generator, _model = _generator(response_text=payload)
+
+    result = await generator.generate(draft)
+
+    props = result.parameters_schema["properties"]
+    assert props["id"]["description"] == "宠物编号"
+    # `limit` was not in parameter_notes → original description preserved.
+    assert props["limit"]["description"] == "Page size limit"
+    assert props["limit"]["type"] == "integer"
+    assert props["limit"]["__location__"] == "query"
+
+
+async def test_generate_ignores_unknown_parameter_names_from_llm() -> None:
+    """The LLM may invent a key that isn't in the schema — silently drop it.
+
+    Validation is the schema's job (ADR-0020); a stray note here can't
+    become a parameter that doesn't exist.
+    """
+    payload = json.dumps(
+        {
+            "description": "查宠物",
+            "typical_use_cases": ["查 7 号宠物"],
+            "parameter_notes": {
+                "id": "宠物编号",
+                "ghost": "LLM hallucinated this",
+            },
+        },
+        ensure_ascii=False,
+    )
+    generator, _model = _generator(response_text=payload)
+
+    result = await generator.generate(_draft())
+
+    assert "ghost" not in result.parameter_notes
+    assert result.parameters_schema["properties"].get("ghost") is None
+
+
+async def test_generate_skips_empty_string_notes() -> None:
+    """Whitespace-only / empty notes would clobber the original text uselessly."""
+    payload = json.dumps(
+        {
+            "description": "查宠物",
+            "typical_use_cases": ["查 7 号宠物"],
+            "parameter_notes": {"id": "   "},
+        },
+        ensure_ascii=False,
+    )
+    generator, _model = _generator(response_text=payload)
+
+    result = await generator.generate(_draft())
+
+    # An empty note counts as "not rewritten" — original text stays.
+    assert result.parameters_schema["properties"]["id"]["description"] == "Pet identifier"
+
+
+async def test_generate_keeps_schema_unchanged_when_parameter_notes_missing() -> None:
+    """AC #3 graceful-degradation parity with description: an LLM that doesn't
+    return `parameter_notes` must not touch the schema."""
+    generator, _model = _generator(
+        response_text='{"description": "查宠物", "typical_use_cases": ["a"]}'
+    )
+    draft = _draft()
+
+    result = await generator.generate(draft)
+
+    assert result.parameter_notes == {}
+    assert result.parameters_schema == draft.parameters_schema
+
+
+async def test_generate_clamps_oversized_parameter_notes() -> None:
+    """A runaway note would defeat the JSON Schema; cap it to a safe length."""
+    long_note = "描" * 1000
+    payload = json.dumps(
+        {
+            "description": "查宠物",
+            "typical_use_cases": ["查 7 号宠物"],
+            "parameter_notes": {"id": long_note},
+        },
+        ensure_ascii=False,
+    )
+    generator, _model = _generator(response_text=payload)
+
+    result = await generator.generate(_draft())
+
+    note = result.parameter_notes["id"]
+    assert len(note) <= 256
+    assert note == long_note[:256]
+
+
+# ---------------------------------------------------------------------------
+# enrich_drafts() — parameter_notes application
+# ---------------------------------------------------------------------------
+
+
+async def test_enrich_swaps_parameter_descriptions_and_preserves_originals() -> None:
+    """AC #1 + AC #3: preview drafts carry rewritten `parameters_schema`,
+    the raw schema lives on `original_parameters_schema` for review."""
+    payload = json.dumps(
+        {
+            "description": "查宠物",
+            "typical_use_cases": ["查 7 号宠物"],
+            "parameter_notes": {"id": "宠物编号"},
+        },
+        ensure_ascii=False,
+    )
+    generator, _model = _generator(response_text=payload)
+    drafts = [_draft()]
+
+    await generator.enrich_drafts(drafts)
+
+    props = drafts[0].parameters_schema["properties"]
+    assert props["id"]["description"] == "宠物编号"
+    # Marker survived.
+    assert props["id"]["__location__"] == "path"
+    # Original schema preserved for review.
+    assert drafts[0].original_parameters_schema is not None
+    assert (
+        drafts[0].original_parameters_schema["properties"]["id"]["description"]
+        == "Pet identifier"
+    )
+    assert drafts[0].parameters_schema_generated is True
+
+
+async def test_enrich_leaves_schema_alone_when_no_parameter_notes_returned() -> None:
+    """No `parameter_notes` → no schema mutation, no flag flip."""
+    generator, _model = _generator(
+        response_text='{"description": "查宠物", "typical_use_cases": ["a"]}'
+    )
+    draft = _draft()
+    original_schema = dict(draft.parameters_schema)
+    drafts = [draft]
+
+    await generator.enrich_drafts(drafts)
+
+    assert drafts[0].parameters_schema == original_schema
+    assert drafts[0].original_parameters_schema is None
+    assert drafts[0].parameters_schema_generated is False
+
+
+async def test_enrich_warns_when_param_notes_left_blank() -> None:
+    """An empty `parameter_notes` is the same signal as missing — note it
+    so the admin knows to add the missing parameter explanations."""
+    generator, _model = _generator(
+        response_text='{"description": "查宠物", "typical_use_cases": ["a"], '
+        '"parameter_notes": {}}'
+    )
+    drafts = [_draft()]
+
+    await generator.enrich_drafts(drafts)
+
+    assert drafts[0].parameters_schema_generated is False
+    assert drafts[0].original_parameters_schema is None
+    # The description rewrite succeeded, but parameter_notes was empty —
+    # a review-warning is the right escalation.
+    assert any("参数说明" in w for w in drafts[0].warnings)
