@@ -179,6 +179,14 @@ CONVERSATION_INDEXES: list[IndexModel] = [
         [("status", ASCENDING), ("last_activity_at", ASCENDING)],
         name="by_status_activity",
     ),
+    # T39 archive sweep: every idle conversation sorted by
+    # `idle_since`. The lifecycle service asks this list every
+    # scan tick; turning it into an index scan keeps the
+    # sweep O(candidates), not O(conversations).
+    IndexModel(
+        [("status", ASCENDING), ("idle_since", ASCENDING)],
+        name="by_status_idle_since",
+    ),
     # Frontend filter for a single conversation's status filter.
     IndexModel(
         [("user_id", ASCENDING), ("status", ASCENDING)],

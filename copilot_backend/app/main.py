@@ -26,6 +26,7 @@ from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
 from app.auth.login import build_state_store
 from app.auth.oidc import OIDCAdapter
+from app.conversations.lifecycle import ConversationLifecycleScheduler
 from app.db.mongo import MongoClient
 from app.exceptions import register_exception_handlers
 from app.health import HealthChecker
@@ -36,6 +37,7 @@ from app.memory.recall import InMemoryMilvusReader
 from app.planner.planner import ToolPlanner
 from app.realtime.bus import SseEventBus
 from app.realtime.stream import router as sse_router
+from app.repositories.conversations import ConversationRepository
 from app.security.crypto import CredentialEncryptor
 from app.security.keys import build_credential_encryptor
 from app.security.logging_filter import install_credential_redaction_filter
@@ -154,10 +156,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.milvus_plan_history_reader = InMemoryMilvusReader(
         milvus_plan_history_writer
     )
+    # T39 / #45 — conversation lifecycle sweep. Started here so
+    # the FastAPI process owns one sweep loop; cancelled in the
+    # `finally` so the lifespan window is clean. The sweep reads
+    # the same Mongo handle `mongo.database`, so any connection-
+    # pool churn is shared with the request handlers. The
+    # scheduler honors `conversation_lifecycle_enabled` from
+    # settings, so test suites that boot the lifespan but want
+    # a frozen clock can disable the background task outright.
+    lifecycle_scheduler = ConversationLifecycleScheduler.from_settings(
+        settings=settings,
+        conversation_repository=ConversationRepository(mongo.database),
+    )
+    app.state.conversation_lifecycle_scheduler = lifecycle_scheduler
     try:
         await _probe_dependencies(settings)
+        await lifecycle_scheduler.start()
         yield
     finally:
+        await lifecycle_scheduler.stop()
         await oidc_adapter.aclose()
         await prompt_http_client.aclose()
         await mongo.close()

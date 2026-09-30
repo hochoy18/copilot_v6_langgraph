@@ -153,13 +153,19 @@ class TestInitDatabase:
 
     @pytest.mark.asyncio
     async def test_conversation_indexes_match_spec(self, mock_db: object) -> None:
-        """`conversations` carries the hot-path + status indexes (ADR-0011)."""
+        """`conversations` carries the hot-path + status indexes (ADR-0011).
+
+        T39 / #45 adds `by_status_idle_since` so the archive sweep
+        can read every `idle` row in `idle_since` order without
+        scanning the whole collection.
+        """
         await init_database(mock_db)  # type: ignore[arg-type]
         info = await mock_db[CONVERSATIONS].index_information()  # type: ignore[index]
         assert set(info.keys()) == {
             "_id_",
             "by_user_last_activity",
             "by_status_activity",
+            "by_status_idle_since",
             "by_user_status",
         }
         assert info["by_user_last_activity"].get("unique") is None

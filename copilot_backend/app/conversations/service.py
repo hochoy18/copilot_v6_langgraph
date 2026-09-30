@@ -31,6 +31,7 @@ from typing import Any
 
 from app.conversations.errors import (
     ConversationAccessDeniedError,
+    ConversationNotArchivedError,
     PlanNotPendingError,
 )
 from app.db.errors import ValidationError
@@ -40,10 +41,12 @@ from app.db.schemas import (
     ConversationCreate,
     ConversationStatus,
     Plan,
+    PlanCreate,
     PlanNode,
     PlanStatus,
     ToolSnapshot,
     Turn,
+    TurnCreate,
 )
 from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
@@ -78,6 +81,25 @@ class ConversationDetail:
     plans: list[Plan]
 
 
+@dataclass(frozen=True)
+class ReactivationResult:
+    """Outcome of `ConversationService.reactivate` (T39 / #45).
+
+    `conversation` is the freshly-active row the user is meant to
+    continue in. `source_conversation_id` is the archived row the
+    service read from — exposed on the wire so the Frontend can
+    render "restored from <source>" without a follow-up read.
+    `copied_turn_ids` and `copied_plan_id` are the FK ids the copy
+    produced; the audit-log row T43 / #38 will eventually surface
+    them so an auditor can replay the reactivate step-for-step.
+    """
+
+    conversation: Conversation
+    source_conversation_id: str
+    copied_turn_ids: list[str]
+    copied_plan_id: str | None
+
+
 class ConversationService:
     """Conversation CRUD with ownership enforcement — T10 / #40.
 
@@ -93,11 +115,13 @@ class ConversationService:
         turn_repository: TurnRepository,
         plan_repository: PlanRepository,
         audit_log_repository: AuditLogRepository,
+        memory_window_k: int = 5,
     ) -> None:
         self._conversations = conversation_repository
         self._turns = turn_repository
         self._plans = plan_repository
         self._audit = audit_log_repository
+        self._memory_window_k = memory_window_k
 
     # ------------------------------------------------------------------
     # Create
@@ -228,6 +252,168 @@ class ConversationService:
             return conversation
 
         return await self._conversations.set_status(conversation_id, "idle")
+
+    # ------------------------------------------------------------------
+    # Reactivate (archived → new active, copies K turns + latest Plan)
+    # ------------------------------------------------------------------
+
+    async def reactivate(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        title: str = "",
+    ) -> ReactivationResult:
+        """Reactivate an archived conversation (T39 / #45, ADR-0011).
+
+        Per ADR-0011 reactivating an archived conversation creates a
+        *new* `active` row that references the archived source. The
+        service copies two things from the source so the user can
+        continue seamlessly:
+
+        1. **The most recent K turns** — same `memory_window_k` the
+           Planner sees verbatim (ADR-0007). Older history stays on
+           the archived source; a future planner-history deep-link
+           can surface it without bloating the new conversation.
+        2. **The latest Plan row** — `get_latest_for_conversation`
+           returns the canonical most-recent Plan; its
+           `tool_snapshots` (ADR-0027) carry the frozen Tool
+           definitions so audit replay survives the reactivate.
+
+        Turn / Plan copies get the new `conversation_id` so the
+        chat panel reads cleanly. The `plan_id` FK on each copied
+        Turn is preserved **only** when the original Turn pointed
+        at the source's latest Plan (the one we copied); turns that
+        referenced any older Plan lose the FK on copy because the
+        older Plan row is in the source conversation the Frontend no
+        longer shows. The Plan copy itself keeps the source Plan's
+        `turn_id` verbatim as provenance — the triggering Turn row
+        lives in the archived source, which the audit chain can
+        still resolve via `reactivated_from_id`. The
+        `reactivated_from_id` FK on the new conversation walks the
+        audit chain back to the source.
+
+        Ownership guard mirrors `archive`: cross-user access raises
+        `ConversationAccessDeniedError` (404 envelope). A non-
+        archived source raises `ConversationNotArchivedError` (409)
+        so callers know to use `POST /conversations/{id}/archive`
+        instead. The freshly-active row is returned to the route
+        so the Frontend can re-mount the chat panel.
+        """
+        source = await self._conversations.get(conversation_id)
+        _assert_owner(source, user_id)
+        if source.status != "archived":
+            raise ConversationNotArchivedError(
+                details={
+                    "conversation_id": source.id,
+                    "current_status": source.status,
+                },
+            )
+
+        # Insert the conversation first so we have a stable FK
+        # for the Turn / Plan copies. The repository stamps the
+        # `reactivated_from_id` pointer + bumps the counter.
+        new_conversation = await self._conversations.create_from_reactivate(
+            source=source,
+            title=title,
+        )
+
+        copied_turn_ids, copied_plan_id = await self._copy_history_into(
+            source=source,
+            destination_id=new_conversation.id,
+            limit=self._memory_window_k,
+        )
+
+        return ReactivationResult(
+            conversation=new_conversation,
+            copied_turn_ids=copied_turn_ids,
+            copied_plan_id=copied_plan_id,
+            source_conversation_id=source.id,
+        )
+
+    async def _copy_history_into(
+        self,
+        *,
+        source: Conversation,
+        destination_id: str,
+        limit: int,
+    ) -> tuple[list[str], str | None]:
+        """Copy the source's recent K turns + latest Plan into the new conversation.
+
+        Returns `(copied_turn_ids, copied_plan_id)` so the service
+        caller can audit the copy. The Plan copy is `None` when the
+        source had no Plans (a freshly-archived conversation that
+        never reached the planner).
+
+        FK rewriting:
+
+        * The new Plan's `turn_id` points at the source's
+          triggering Turn id verbatim. If that Turn is outside the
+          copied K window, the new Plan still exists but no copied
+          Turn references it (the audit UI surfaces the orphaned
+          pointer; the chat panel just renders no DAG for it).
+        * Each copied Turn's `plan_id` is preserved only when the
+          original Turn referenced the latest Plan; turns that
+          referenced older Plans (which we did not copy) get
+          `plan_id=None` on copy to avoid dangling FKs.
+        """
+        # Plans first — the Turn copy decides which FKs to keep.
+        copied_plan_id: str | None = None
+        source_plan: Plan | None = None
+        try:
+            source_plan = await self._plans.get_latest_for_conversation(source.id)
+        except Exception:  # noqa: BLE001 — No Plan is a documented branch
+            source_plan = None
+        if source_plan is not None:
+            new_plan = await self._plans.create(
+                PlanCreate(
+                    conversation_id=destination_id,
+                    turn_id=source_plan.turn_id,
+                    status=source_plan.status,
+                    nodes=list(source_plan.nodes),
+                    edges=list(source_plan.edges),
+                    tool_snapshots=list(source_plan.tool_snapshots),
+                ),
+            )
+            copied_plan_id = new_plan.id
+
+        # Fetch enough source turns to honor the K-window — the repo
+        # is bounded by `limit`, so we may need to widen for the
+        # K-from-tail slice. Use a large but bounded fetch (the
+        # contract is "K most-recent", not "all history"), capped
+        # at the documented `DEFAULT_TURN_LIMIT` to avoid unbounded
+        # scans on long-lived sessions.
+        fetch_limit = max(limit, DEFAULT_TURN_LIMIT)
+        source_turns = await self._turns.list_by_conversation(
+            source.id, limit=fetch_limit
+        )
+
+        copied_turn_ids: list[str] = []
+        # We want the most-recent K turns; the Turn repo returns
+        # ascending order so we slice from the tail.
+        recent = source_turns[-limit:] if limit > 0 else []
+        # `turn.plan_id` points at a `plans._id`; preserve the FK
+        # only when the source Turn pointed at the latest source
+        # Plan (the one we copied). Older Plan pointers are
+        # dangling by construction — the source Plan rows live in
+        # a conversation the Frontend no longer renders.
+        latest_source_plan_id = source_plan.id if source_plan is not None else None
+        for turn in recent:
+            new_plan_id = (
+                copied_plan_id if turn.plan_id == latest_source_plan_id else None
+            )
+            new_turn = await self._turns.create(
+                TurnCreate(
+                    conversation_id=destination_id,
+                    role=turn.role,
+                    content=turn.content,
+                    plan_id=new_plan_id,
+                    extra=dict(turn.extra),
+                ),
+            )
+            copied_turn_ids.append(new_turn.id)
+
+        return copied_turn_ids, copied_plan_id
 
     # ------------------------------------------------------------------
     # Plan approve / reject (T20 / #43)
@@ -589,4 +775,5 @@ __all__ = [
     "ConversationDetail",
     "DEFAULT_TURN_LIMIT",
     "DEFAULT_PLAN_LIMIT",
+    "ReactivationResult",
 ]

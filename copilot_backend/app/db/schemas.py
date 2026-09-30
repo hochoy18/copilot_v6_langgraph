@@ -764,6 +764,14 @@ class ConversationBase(BaseModel):
     The role list is resolved at request time from the user's role
     grants — we deliberately don't embed it here to avoid a
     write-skew with `users.role_ids` (ADR-0006).
+
+    Lifecycle metadata fields (`idle_since` / `archived_since` /
+    `reactivated_from_id` / `reactivate_count`) live on the canonical
+    shape rather than only on the InDB variant so audit / reactivation
+    reads see them without a projection join. They are optional on
+    every read because rows created before T39 / #45 landed don't
+    carry them — the lifecycle sweep backfills `idle_since` /
+    `archived_since` on first transition.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -785,6 +793,44 @@ class ConversationBase(BaseModel):
     status: ConversationStatus = Field(
         default="active",
         description="Lifecycle per ADR-0011: `active` / `idle` / `archived`.",
+    )
+    idle_since: datetime | None = Field(
+        default=None,
+        description=(
+            "Wall-clock instant the row transitioned `active → idle`. "
+            "Stamped by the lifecycle sweep (T39 / #45) so the "
+            "`idle → archived` decision has a single-sourced clock. "
+            "None for rows that have never gone idle (still `active`)."
+        ),
+    )
+    archived_since: datetime | None = Field(
+        default=None,
+        description=(
+            "Wall-clock instant the row transitioned `idle → archived`. "
+            "Stamped by the lifecycle sweep. None for rows that are "
+            "still `active` or `idle`."
+        ),
+    )
+    reactivated_from_id: str | None = Field(
+        default=None,
+        description=(
+            "ObjectId of the archived conversation that this row was "
+            "created from via `POST /conversations/{id}/reactivate` "
+            "(T39 / #45 / ADR-0011). The pointer walks back to the "
+            "audit chain so re-reading the conversation reveals "
+            "which prior session it inherited turns / plans from."
+        ),
+    )
+    reactivate_count: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "How many times this conversation was created via "
+            "reactivate. Currently always `0` for fresh rows and `1` "
+            "for reactivated rows — left as a counter so a future "
+            "chained reactivate (archived → new → archived → new…) "
+            "doesn't need a schema migration."
+        ),
     )
 
 

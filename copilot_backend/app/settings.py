@@ -95,6 +95,56 @@ class Settings(BaseSettings):
     # guards against a misconfiguration that would otherwise disable
     # the window entirely (the LLM would see only the current
     # instruction and lose all cross-turn continuity).
+
+    # ---- Conversation lifecycle (T39 / #45, ADR-0011) ---------------------
+    # The idle / archived transitions live entirely on the conversation
+    # row. The thresholds match ADR-0011 defaults: idle after 15 minutes
+    # of inactivity, archived after 30 days of idleness. Operators
+    # tighten for tighter SLAs (an "always warm" deployment might idle
+    # at 5 min) or loosen for low-touch environments. The sweep job
+    # runs on a fixed cadence; setting the cadence tighter than the
+    # idle window keeps the user-visible "active" status accurate
+    # within one tick.
+    conversation_idle_after_seconds: int = Field(
+        default=900,  # 15 minutes
+        ge=1,
+        le=86_400,
+        description=(
+            "Idle threshold — `active` conversations whose "
+            "`last_activity_at` is older than this flip to `idle` "
+            "on the next sweep tick (ADR-0011). Default 900s (15 min)."
+        ),
+    )
+    conversation_archive_after_seconds: int = Field(
+        default=2_592_000,  # 30 days
+        ge=60,
+        le=31_536_000,  # one year ceiling
+        description=(
+            "Archive threshold — `idle` conversations whose "
+            "`idle_since` is older than this flip to `archived` "
+            "on the next sweep tick (ADR-0011). Default 2_592_000s "
+            "(30 days)."
+        ),
+    )
+    conversation_lifecycle_scan_interval_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=3_600.0,
+        description=(
+            "How often the lifecycle sweep runs. Tighter than the "
+            "idle window keeps the user-visible status accurate "
+            "within one tick. Default 60s."
+        ),
+    )
+    conversation_lifecycle_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for the lifecycle sweep. `False` skips "
+            "the background task entirely (useful for unit tests, "
+            "single-shot CLI runs, and the rare ops drill that "
+            "needs idle / archive transitions frozen in time)."
+        ),
+    )
     memory_window_k: int = Field(
         default=5,
         ge=1,

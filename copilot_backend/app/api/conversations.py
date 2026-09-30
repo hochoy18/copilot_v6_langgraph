@@ -47,6 +47,7 @@ from app.answer.service import AnswerService
 from app.conversations.service import (
     ConversationDetail,
     ConversationService,
+    ReactivationResult,
 )
 from app.db.dependencies import (
     get_answer_service,
@@ -105,6 +106,12 @@ class ConversationResponse(BaseModel):
     `mode='json'` rendering in the router turns BSON ObjectId strings
     and datetimes into JSON-safe values without leaking BSON-specific
     types.
+
+    The lifecycle metadata fields (`idle_since` / `archived_since` /
+    `reactivated_from_id` / `reactivate_count`) are optional on the
+    wire because rows created before T39 / #45 shipped don't carry
+    them — the Frontend renders "—" until the lifecycle sweep
+    stamps them.
     """
 
     id: str = Field(description="ObjectId of the conversation row.")
@@ -114,6 +121,31 @@ class ConversationResponse(BaseModel):
     last_activity_at: str = Field(description="ISO 8601 timestamp.")
     created_at: str
     updated_at: str
+    idle_since: str | None = Field(
+        default=None,
+        description=(
+            "ISO 8601 timestamp the row entered `idle`. `null` for "
+            "rows that have never been idle (still `active`)."
+        ),
+    )
+    archived_since: str | None = Field(
+        default=None,
+        description=(
+            "ISO 8601 timestamp the row entered `archived`. `null` "
+            "for non-archived rows."
+        ),
+    )
+    reactivated_from_id: str | None = Field(
+        default=None,
+        description=(
+            "ObjectId of the archived conversation this row was "
+            "created from via reactivate. `null` for fresh rows."
+        ),
+    )
+    reactivate_count: int = Field(
+        default=0,
+        description="How many times this conversation was created via reactivate.",
+    )
 
 
 class ConversationDetailResponse(BaseModel):
@@ -216,6 +248,12 @@ def _conversation_to_response(conv: Conversation) -> ConversationResponse:
         last_activity_at=conv.last_activity_at.isoformat(),
         created_at=conv.created_at.isoformat(),
         updated_at=conv.updated_at.isoformat(),
+        idle_since=conv.idle_since.isoformat() if conv.idle_since else None,
+        archived_since=(
+            conv.archived_since.isoformat() if conv.archived_since else None
+        ),
+        reactivated_from_id=conv.reactivated_from_id,
+        reactivate_count=conv.reactivate_count,
     )
 
 
@@ -401,6 +439,100 @@ async def archive_conversation(
         user_id=user.id,
     )
     return _conversation_to_response(conv)
+
+
+class ReactivateConversationRequest(BaseModel):
+    """Body of `POST /api/v1/conversations/{id}/reactivate` (T39 / #45).
+
+    `title` is optional; the Frontend can POST an empty body when
+    the user just clicks "重新激活" without picking a new title.
+    The service layer defaults to the empty string, which the
+    Frontend renders as "Untitled" until the Planner or the user
+    sets one.
+    """
+
+    title: str = Field(
+        default="",
+        max_length=256,
+        description="Optional title for the freshly-active conversation.",
+    )
+
+
+class ReactivateConversationResponse(BaseModel):
+    """Wire shape of `POST /api/v1/conversations/{id}/reactivate`.
+
+    Wraps the new conversation in the same `ConversationResponse`
+    envelope as create / detail, plus three audit fields:
+
+    * `source_conversation_id` — the archived row the service read
+      from. The Frontend renders "restored from <source>" so the
+      user can re-find the original via the archived-history tab.
+    * `copied_turn_ids` / `copied_plan_id` — the FKs the service
+      produced. The audit-log UI (T43 / #38) surfaces these so an
+      auditor can replay the reactivate step-for-step.
+    """
+
+    conversation: ConversationResponse
+    source_conversation_id: str
+    copied_turn_ids: list[str] = Field(
+        default_factory=list,
+        description="ObjectIds of the freshly-copied Turn rows.",
+    )
+    copied_plan_id: str | None = Field(
+        default=None,
+        description=(
+            "ObjectId of the freshly-copied Plan row. `null` when "
+            "the source had no Plans."
+        ),
+    )
+
+
+@router.post(
+    "/{conversation_id}/reactivate",
+    response_model=ReactivateConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Reactivate an archived conversation (T39 / #45)",
+)
+async def reactivate_conversation(
+    conversation_id: str,
+    body: ReactivateConversationRequest | None = None,
+    user: User = Depends(get_current_user),  # noqa: B008
+    svc: ConversationService = Depends(get_conversation_service),  # noqa: B008
+) -> ReactivateConversationResponse:
+    """`POST /api/v1/conversations/{id}/reactivate` — restore from archive.
+
+    Per ADR-0011 / T39 / #45 reactivating an archived conversation
+    creates a *new* `active` row that references the archived
+    source. The service copies the source's most recent K turns
+    (where K is the configured `memory_window_k`, default 5) plus
+    its latest Plan so the user can continue seamlessly. The
+    archived row stays untouched — the source conversation remains
+    a tombstone for audit / replay.
+
+    Failure modes (per ADR-0031 envelope):
+
+    * Cross-user access surfaces the same `not_found` envelope as
+      an absent row.
+    * Source not `archived` → 409 `conversation_not_archived`. The
+      Frontend should route the user to `POST /{id}/archive`
+      instead.
+    * Missing source → 404 `not_found`.
+
+    The request body is optional so the Frontend's "重新激活"
+    button can POST an empty body without a JS-side `{}` shim.
+    """
+    title = body.title if body is not None else ""
+    outcome: ReactivationResult = await svc.reactivate(
+        conversation_id=conversation_id,
+        user_id=user.id,
+        title=title,
+    )
+    return ReactivateConversationResponse(
+        conversation=_conversation_to_response(outcome.conversation),
+        source_conversation_id=outcome.source_conversation_id,
+        copied_turn_ids=outcome.copied_turn_ids,
+        copied_plan_id=outcome.copied_plan_id,
+    )
 
 
 @router.post(

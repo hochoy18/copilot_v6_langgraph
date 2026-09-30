@@ -249,6 +249,7 @@ def get_conversation_service(
     turn_repo: TurnRepository = Depends(get_turn_repository),  # noqa: B008
     plan_repo: PlanRepository = Depends(get_plan_repository),  # noqa: B008
     audit_repo: AuditLogRepository = Depends(get_audit_log_repository),  # noqa: B008
+    settings: Settings = Depends(get_settings),  # noqa: B008
 ) -> ConversationService:
     """FastAPI dependency: build a `ConversationService` for this request.
 
@@ -258,12 +259,18 @@ def get_conversation_service(
     without touching the lifespan. The audit-log repository lands
     here for T26 / #44 (Plan-edit endpoint writes a `plan.edit`
     audit row per ADR-0019).
+
+    `memory_window_k` is threaded from settings so the reactivate
+    flow (T39 / #45) copies exactly as many recent turns as the
+    Planner would have seen verbatim — same constant for both
+    consumers.
     """
     return ConversationService(
         conversation_repository=conversation_repo,
         turn_repository=turn_repo,
         plan_repository=plan_repo,
         audit_log_repository=audit_repo,
+        memory_window_k=settings.memory_window_k,
     )
 
 

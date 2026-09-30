@@ -125,6 +125,49 @@ class ConversationRepository(
         cursor = self._collection.find({"status": status}).sort("last_activity_at", 1)
         return [_to_read(doc) async for doc in cursor]
 
+    async def list_idle_candidates(
+        self,
+        *,
+        threshold: datetime,
+    ) -> list[Conversation]:
+        """Every `active` conversation whose `last_activity_at < threshold`.
+
+        Backs the `active → idle` branch of the lifecycle sweep (T39).
+        Filtering on `status='active'` plus the cutoff date lets
+        Mongo use the `by_status_activity` compound index for the
+        cheap lookup; `last_activity_at < threshold` is the second
+        sort key. The sweep then iterates and atomically flips each
+        row via `mark_idle` so concurrent activity doesn't race.
+        """
+        cursor = (
+            self._collection.find(
+                {"status": "active", "last_activity_at": {"$lt": threshold}},
+            )
+            .sort("last_activity_at", 1)
+        )
+        return [_to_read(doc) async for doc in cursor]
+
+    async def list_archive_candidates(
+        self,
+        *,
+        threshold: datetime,
+    ) -> list[Conversation]:
+        """Every `idle` conversation whose `idle_since < threshold`.
+
+        Backs the `idle → archived` branch of the lifecycle sweep
+        (T39). The candidate set is small at any instant (the user
+        must have stopped chatting for 30 days) so an index scan is
+        cheap; a future index `by_status_idle_since` would tighten
+        further if needed.
+        """
+        cursor = (
+            self._collection.find(
+                {"status": "idle", "idle_since": {"$lt": threshold}},
+            )
+            .sort("idle_since", 1)
+        )
+        return [_to_read(doc) async for doc in cursor]
+
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
@@ -153,6 +196,13 @@ class ConversationRepository(
 
         Bumps `updated_at` so audit hooks see the event. Split from
         `update` so subscribers don't have to diff every PATCH.
+
+        Note: lifecycle transitions that need to stamp a side
+        timestamp (`idle_since` / `archived_since`) should reach for
+        `mark_idle` / `mark_archived` instead — `set_status` only
+        touches `status` + `updated_at`, matching the manual-archive
+        path that intentionally doesn't stamp `idle_since` (the
+        sweep job owns that timestamp per ADR-0011).
         """
         oid = self.to_object_id(conversation_id)
         result = await self._collection.find_one_and_update(
@@ -166,6 +216,108 @@ class ConversationRepository(
                 details={"conversation_id": conversation_id},
             )
         return _to_read(result)
+
+    async def mark_idle(
+        self, conversation_id: str, *, now: datetime | None = None
+    ) -> Conversation:
+        """Atomic `active → idle` transition (T39 / ADR-0011).
+
+        Stamps both `status` and `idle_since` in a single
+        `find_one_and_update` so audit log subscribers never see a
+        half-transitioned row (one without the other). The `now`
+        parameter is injectable for deterministic tests; production
+        callers omit it and rely on the repository clock.
+        """
+        oid = self.to_object_id(conversation_id)
+        stamped = now if now is not None else self._now()
+        result = await self._collection.find_one_and_update(
+            {"_id": oid, "status": "active"},
+            {
+                "$set": {
+                    "status": "idle",
+                    "idle_since": stamped,
+                    "updated_at": stamped,
+                },
+            },
+            return_document=True,
+        )
+        if result is None:
+            raise NotFoundError(
+                message_en=f"Conversation {conversation_id} not found or not active",
+                details={"conversation_id": conversation_id},
+            )
+        return _to_read(result)
+
+    async def mark_archived(
+        self, conversation_id: str, *, now: datetime | None = None
+    ) -> Conversation:
+        """Atomic `idle → archived` transition (T39 / ADR-0011).
+
+        Stamps both `status` and `archived_since` in a single write.
+        The `status: 'idle'` filter on the update means a row that
+        raced into `active` again (re-shifted by user activity
+        between the candidate scan and the per-row write) survives
+        the sweep untouched — the next tick will retry.
+        """
+        oid = self.to_object_id(conversation_id)
+        stamped = now if now is not None else self._now()
+        result = await self._collection.find_one_and_update(
+            {"_id": oid, "status": "idle"},
+            {
+                "$set": {
+                    "status": "archived",
+                    "archived_since": stamped,
+                    "updated_at": stamped,
+                },
+            },
+            return_document=True,
+        )
+        if result is None:
+            raise NotFoundError(
+                message_en=f"Conversation {conversation_id} not found or not idle",
+                details={"conversation_id": conversation_id},
+            )
+        return _to_read(result)
+
+    async def create_from_reactivate(
+        self,
+        *,
+        source: Conversation,
+        title: str = "",
+        now: datetime | None = None,
+    ) -> Conversation:
+        """Insert a fresh conversation that inherits from an archived one (T39).
+
+        Per ADR-0011 reactivating an archived conversation creates a
+        new active row that copies the most recent K turns and the
+        latest Plan (the seam in `ConversationService.reactivate`).
+        This repository method only inserts the conversation row —
+        the Turn / Plan copy is a service-layer responsibility
+        because it spans three repositories.
+
+        `reactivated_from_id` is the FK pointer back to `source`;
+        `reactivate_count` is the audit counter. `last_activity_at`
+        is stamped to `now` so the freshly-active row lands outside
+        the idle-sweep window. The row goes through
+        `ConversationCreate` (like `create`) so Pydantic validation
+        runs on the reactivate path too.
+        """
+        data = ConversationCreate(
+            user_id=source.user_id,
+            title=title,
+            status="active",
+            idle_since=None,
+            archived_since=None,
+            reactivated_from_id=source.id,
+            reactivate_count=source.reactivate_count + 1,
+        )
+        doc = data.model_dump()
+        stamped = now if now is not None else self._now()
+        doc["last_activity_at"] = stamped
+        doc["created_at"] = stamped
+        doc["updated_at"] = stamped
+        await self._collection.insert_one(doc)
+        return await refetch_after_insert(self._collection, doc, Conversation)
 
     async def touch_activity(self, conversation_id: str) -> Conversation:
         """Stamp `last_activity_at` so the idle-sweep sees fresh activity.

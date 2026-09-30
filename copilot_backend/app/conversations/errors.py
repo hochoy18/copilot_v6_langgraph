@@ -56,6 +56,24 @@ class ConversationArchivedError(AppError):
     http_status = status.HTTP_409_CONFLICT
 
 
+class ConversationNotArchivedError(AppError):
+    """Raised by `POST /conversations/{id}/reactivate` when the source
+    conversation is not in the `archived` state.
+
+    Per ADR-0011 / T39 reactivate is the inverse of archive: it only
+    applies to conversations that have completed the idle →
+    archived transition. An `active` / `idle` row that needs ending
+    should hit `POST /conversations/{id}/archive` instead. 409
+    because the caller legitimately owns the row — this is a state
+    conflict, not an existence question.
+    """
+
+    code = "conversation_not_archived"
+    message_zh = "会话未归档, 无需重新激活"
+    message_en = "Conversation is not archived; nothing to reactivate"
+    http_status = status.HTTP_409_CONFLICT
+
+
 class PlanNotPendingError(AppError):
     """Raised when approve / reject targets a Plan that's already terminal.
 
@@ -77,5 +95,6 @@ class PlanNotPendingError(AppError):
 __all__ = [
     "ConversationAccessDeniedError",
     "ConversationArchivedError",
+    "ConversationNotArchivedError",
     "PlanNotPendingError",
 ]
