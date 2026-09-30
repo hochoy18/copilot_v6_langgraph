@@ -46,6 +46,7 @@
 | `/api/v1/admin/tools/{id}` | GET / PATCH | 拉取 / 修改 Tool(描述、风险等级、状态) | ADR-0003 / ADR-0018 |
 | `/api/v1/admin/tools/import/openapi` | POST | 上传 / 粘贴 OpenAPI spec,返回预览(每个 operation 派生 draft Tool) | ADR-0003 / ADR-0018 |
 | `/api/v1/admin/tools/import/confirm` | POST | 确认 preview 中的若干 operation 激活 | ADR-0018 |
+| `/api/v1/admin/tools/descriptions/generate` | POST | 单条重新生成 Tool 描述 / 参数说明(预览行 / 被 cap 跳过的长尾草稿) | ADR-0018 |
 | `/api/v1/admin/audit-logs` | GET | 审计日志查询(可过滤) | ADR-0028 |
 | `/api/v1/admin/audit-logs/{id}/recall` | POST | 触发冷存调档 | ADR-0028 |
 | `/api/v1/admin/users` | GET / POST | 用户列表 / 创建 | ADR-0006 |

@@ -432,7 +432,7 @@ async def test_import_preview_carries_llm_generated_parameter_notes(
 
 
 async def test_import_preview_keeps_schema_unchanged_when_no_parameter_notes(
-    client: Any, app: FastAPI, settings: Settings
+    client: Any, app: Any, settings: Settings
 ) -> None:
     """AC #3: an LLM that didn't return `parameter_notes` leaves the schema
     alone — the preview still activates via POST /admin/tools without
@@ -454,3 +454,248 @@ async def test_import_preview_keeps_schema_unchanged_when_no_parameter_notes(
         # Description still uses the LLM-friendly version — only the schema
         # is untouched.
         assert draft["description_generated"] is True
+
+
+# ---------------------------------------------------------------------------
+# T16-followup / #51 — per-draft `POST /admin/tools/descriptions/generate`
+# ---------------------------------------------------------------------------
+#
+# Long-tail companion to the import-time batch generation above. The
+# route reuses `ToolDescriptionGenerator.generate` so the structured
+# contract on the wire mirrors `GeneratedDescription`; what the tests
+# pin down is the route-specific seam: the admin-only guard, the
+# graceful degradation envelopes for LLM-not-configured / LLM-failed,
+# and the warnings derived from the structured fields.
+
+
+_GENERATE_BODY = {
+    "name": "getPetById",
+    "operation_ref": "GET /pets/{id}",
+    "http_method": "GET",
+    "description": "Returns a user by ID. See Swagger section 4.",
+    "parameters_schema": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer", "description": "Pet identifier", "__location__": "path"},
+        },
+        "required": ["id"],
+    },
+}
+
+
+class TestGenerateDescription:
+    """`POST /api/v1/admin/tools/descriptions/generate` — T16-followup / #51."""
+
+    async def test_happy_path_returns_composed_description(
+        self, client: Any, app: Any, settings: Settings
+    ) -> None:
+        # `_GENERATED_JSON` carries both description + use cases; the
+        # per-row endpoint only reads those two (per the spec body's
+        # `{description, typical_use_cases, warnings}` shape), so we get
+        # a clean response with no warnings.
+        _wire_generator(app, settings, _FakeChatModel(response_text=_GENERATED_JSON))
+        headers = await _admin_headers(app, settings)
+
+        resp = await client.post(
+            "/api/v1/admin/tools/descriptions/generate",
+            json=_GENERATE_BODY,
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # AC: result lands as composed text (rewrite + 典型用例).
+        assert body["description"].startswith("按编号查询宠物资料")
+        assert "典型用例:" in body["description"]
+        assert "查一下 7 号宠物的信息" in body["typical_use_cases"]
+        # Use cases present ⇒ no warnings.
+        assert body["warnings"] == []
+        # Spec body shape — only description / typical_use_cases / warnings.
+        assert set(body.keys()) == {"description", "typical_use_cases", "warnings"}
+
+    async def test_warns_when_llm_omits_typical_use_cases(
+        self, client: Any, app: Any, settings: Settings
+    ) -> None:
+        """Empty `typical_use_cases` ⇒ warning mirrors the import-preview wording."""
+        _wire_generator(
+            app,
+            settings,
+            _FakeChatModel(
+                response_text='{"description": "只有描述", "typical_use_cases": []}',
+            ),
+        )
+        headers = await _admin_headers(app, settings)
+
+        resp = await client.post(
+            "/api/v1/admin/tools/descriptions/generate",
+            json=_GENERATE_BODY,
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["typical_use_cases"] == []
+        assert body["warnings"] == ["LLM 生成结果未包含典型用例，请 review 时补充。"]
+
+    async def test_does_not_persist(
+        self, client: Any, app: Any, settings: Settings
+    ) -> None:
+        """AC: regenerating does not touch the Tool registry."""
+        _wire_generator(app, settings, _FakeChatModel(response_text=_GENERATED_JSON))
+        headers = await _admin_headers(app, settings)
+
+        resp = await client.post(
+            "/api/v1/admin/tools/descriptions/generate",
+            json=_GENERATE_BODY,
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        # Registry is empty — the rewrite is advisory only.
+        list_resp = await client.get("/api/v1/admin/tools", headers=headers)
+        assert list_resp.status_code == 200
+        assert list_resp.json()["tools"] == []
+
+    async def test_unconfigured_llm_returns_503_envelope(
+        self, client: Any, app: Any, settings: Settings
+    ) -> None:
+        """AC: LLM not configured → explicit envelope, never a bare 500."""
+        from collections.abc import Callable
+        from typing import cast
+
+        from langchain_core.language_models.chat_models import BaseChatModel as _ChatModel
+
+        from app.db.dependencies import get_description_generator
+        from app.llm.errors import LLMConfigurationError
+
+        unconfigured = Settings(
+            oidc_jwt_signing_key="internal-access-jwt-signing-key-for-tests",
+            llm_provider_supports_no_train=False,
+        )
+
+        def _broken_factory() -> _ChatModel:  # pragma: no cover — body unreachable
+            raise LLMConfigurationError(
+                message_en="Provider does not support the no-train path",
+                details={"reason": "no_train_unsupported"},
+            )
+
+        from app.tools.description_generator import ToolDescriptionGenerator
+
+        generator = ToolDescriptionGenerator(
+            settings=unconfigured,
+            prompt_provider=PromptProvider(
+                settings=unconfigured,
+                http_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={}))
+                ),
+            ),
+            chat_model_factory=cast("Callable[[], BaseChatModel]", _broken_factory),
+        )
+        app.dependency_overrides[get_description_generator] = lambda: generator
+        headers = await _admin_headers(app, settings)
+
+        resp = await client.post(
+            "/api/v1/admin/tools/descriptions/generate",
+            json=_GENERATE_BODY,
+            headers=headers,
+        )
+        assert resp.status_code == 503, resp.text
+        body = resp.json()
+        assert body["code"] == "llm_unavailable"
+        assert body["message_zh"]
+        assert body["message_en"]
+        # The original refusal reason rides through `details`.
+        assert body.get("details", {}).get("reason") == "no_train_unsupported"
+
+    async def test_llm_generation_failure_returns_503_envelope(
+        self, client: Any, app: Any, settings: Settings
+    ) -> None:
+        """A model that crashes mid-call surfaces an explicit envelope, not 500.
+
+        The route catches `LLMGenerationError` (raised by the generator
+        when the upstream call or JSON parsing blows up) and rewraps it
+        as `LLMUnavailableError` (503) so the admin gets the explicit
+        envelope with a stable `code` rather than the bare
+        `LLMGenerationError` 502 (which would confuse the preview UI's
+        retry/error rendering).
+        """
+        _wire_generator(app, settings, _FakeChatModel(should_fail=True))
+        headers = await _admin_headers(app, settings)
+
+        resp = await client.post(
+            "/api/v1/admin/tools/descriptions/generate",
+            json=_GENERATE_BODY,
+            headers=headers,
+        )
+        assert resp.status_code == 503, resp.text
+        body = resp.json()
+        assert body["code"] == "llm_unavailable"
+        assert body["message_en"]
+        assert body["message_zh"]
+        # The wrapped error class rides through `details` (tool name +
+        # underlying exception type) so ops can tell the model-broke
+        # case from the not-configured case at a glance.
+        details = body["details"]
+        assert details.get("tool_name") == "getPetById"
+        assert details.get("error_type") == "RuntimeError"
+
+    async def test_unauthenticated_returns_401(self, client: Any) -> None:
+        resp = await client.post(
+            "/api/v1/admin/tools/descriptions/generate",
+            json=_GENERATE_BODY,
+        )
+        assert resp.status_code == 401
+        assert resp.json()["code"] == "auth_missing_token"
+
+    async def test_non_admin_returns_403(
+        self, client: Any, app: Any, settings: Settings
+    ) -> None:
+        from app.auth.passwords import hash_password
+        from app.db.schemas import RoleCreate, UserCreate
+
+        role_repo = RoleRepository(app.state.database)
+        user_repo = UserRepository(app.state.database)
+        role = await role_repo.create(RoleCreate(name="user", description="user"))
+        user = await user_repo.create(
+            UserCreate(
+                email="user@example.com",
+                display_name="User",
+                source="local",
+                local_username="user",
+                password_hash=hash_password("x"),
+                role_ids=[role.id],
+            )
+        )
+        claims = AccessTokenClaims(
+            sub=user.id,
+            source="local",
+            role_ids=[role.id],
+            issuer=settings.oidc_jwt_issuer,
+            audience=settings.oidc_jwt_audience,
+            issued_at=now_unix(),
+            expires_at=now_unix() + settings.oidc_access_token_ttl_seconds,
+            jti="test-jti",
+        )
+        token, _ = mint_access_token(claims, signing_key=settings.oidc_jwt_signing_key)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = await client.post(
+            "/api/v1/admin/tools/descriptions/generate",
+            json=_GENERATE_BODY,
+            headers=headers,
+        )
+        assert resp.status_code == 403
+        assert resp.json()["code"] == "admin_endpoint_requires_admin_role"
+
+    async def test_missing_required_field_returns_422(
+        self, client: Any, app: Any, settings: Settings
+    ) -> None:
+        """`description` is required — the Prompt needs a non-empty raw text."""
+        _wire_generator(app, settings, _FakeChatModel(response_text=_GENERATED_JSON))
+        headers = await _admin_headers(app, settings)
+        body = {**_GENERATE_BODY}
+        del body["description"]
+
+        resp = await client.post(
+            "/api/v1/admin/tools/descriptions/generate",
+            json=body,
+            headers=headers,
+        )
+        assert resp.status_code == 422

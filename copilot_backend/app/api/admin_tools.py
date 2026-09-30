@@ -18,6 +18,14 @@ ADR-0031. Endpoints:
                                                draft's description with
                                                the LLM before the admin
                                                reviews it.
+* `POST   /api/v1/admin/tools/descriptions/generate` — per-draft LLM
+                                               description rewrite
+                                               (T16-followup / #51);
+                                               the long-tail companion
+                                               to the import-time batch
+                                               generation, for skipped
+                                               drafts and rows the
+                                               admin wants to redo.
 
 Auth is enforced by `require_admin_user` (T12 / #11), which layers on
 top of `get_current_user` to also verify the caller holds the
@@ -58,9 +66,15 @@ from app.db.schemas import (
     ToolUpdate,
     User,
 )
+from app.llm.errors import (
+    LLMConfigurationError,
+    LLMGenerationError,
+    LLMUnavailableError,
+    PromptUnavailableError,
+)
 from app.security.admin import require_admin_user
-from app.tools.description_generator import ToolDescriptionGenerator
-from app.tools.openapi_parser import OpenAPIParser
+from app.tools.description_generator import GeneratedDescription, ToolDescriptionGenerator
+from app.tools.openapi_parser import OpenAPIParser, ToolDraft
 from app.tools.service import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, ToolService
 
 router = APIRouter(prefix="/api/v1/admin/tools", tags=["admin"])
@@ -642,6 +656,258 @@ async def import_openapi(
         server_url=result.server_url,
         source_format=result.source_format,
         warnings=generation_warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-draft description regeneration — T16-followup / #51
+# ---------------------------------------------------------------------------
+#
+# T16 / #14 only auto-generates descriptions for the first 32 operations
+# of an import preview (ADR-0033). Beyond the cap and on per-draft
+# failures, the admin has been stuck editing raw OpenAPI text by hand.
+# This endpoint closes the gap: take one draft's metadata, ask the LLM
+# to rewrite it, and return the result. It does NOT persist anything —
+# the admin reviews / edits the textarea, then activates through the
+# existing create-tool path. The "still reviewable" rule from
+# ADR-0018 carries through unchanged.
+
+
+class GenerateDescriptionRequest(BaseModel):
+    """Body of `POST /api/v1/admin/tools/descriptions/generate`.
+
+    Carries the minimum set of fields the `tool-description-generator`
+    Prompt consumes (per `_draft_variables` in
+    `app.tools.description_generator`):
+
+    * `name` / `method` / `path` — the LLM slug, the HTTP method, and
+      the OpenAPI path (extracted from `operation_ref`).
+    * `description` — the text the LLM rewrites (typically the raw
+      OpenAPI summary/description, or an admin's first edit).
+    * `parameters_schema` — the JSON Schema the Prompt's parameter
+      summary line consumes.
+
+    The spec body of #51 explicitly enumerates "name / method / path /
+    原始描述 / 参数摘要"; the shape here is exactly that. `operation_ref`
+    carries the `METHOD path` pair in a single string so the UI can
+    forward the preview row's label without re-deriving it.
+    """
+
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        description="LLM-facing slug; the operation's `operationId` (or synthesised fallback).",
+    )
+    operation_ref: str = Field(
+        min_length=1,
+        max_length=512,
+        description=(
+            "`METHOD path` pair (e.g. `GET /pets/{id}`); the path segment "
+            "feeds the Prompt's `{{path}}` slot."
+        ),
+    )
+    http_method: str = Field(
+        min_length=1,
+        max_length=16,
+        description="HTTP method for the upstream call; rendered upper-case.",
+    )
+    description: str = Field(
+        min_length=1,
+        max_length=4096,
+        description=(
+            "Raw text the LLM rewrites — typically the OpenAPI "
+            "summary/description, or an admin's first edit on the preview row."
+        ),
+    )
+    parameters_schema: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "JSON Schema for the Tool's arguments; summarised into "
+            "the Prompt via `summarize_parameters`."
+        ),
+    )
+
+
+class GenerateDescriptionResponse(BaseModel):
+    """Wire shape of `POST /api/v1/admin/tools/descriptions/generate`.
+
+    The spec body of #51 pins the response to `{description,
+    typical_use_cases, warnings}`; this is exactly that. `description`
+    is the rewritten text the preview writes back into the textarea;
+    `typical_use_cases` is the structured list the LLM returned
+    (T16 / #14 AC #2 — also appended into `description` as the 典型用例
+    section, mirrored separately so the UI can render the bullets
+    in their own block if it wants to).
+
+    `warnings` is derived from the structured fields using the same
+    rules `enrich_drafts` applies per-draft:
+
+    * empty `typical_use_cases` ⇒ "LLM 生成结果未包含典型用例".
+
+    Per-parameter notes are out of scope for the per-row endpoint;
+    the import-preview batch (T16-followup / #50) and the manual
+    edit path cover the parameter-description use case.
+    """
+
+    description: str = Field(
+        description="Rewritten text — rewrite + 典型用例 section, clamped to 4096 chars.",
+    )
+    typical_use_cases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Structured list the LLM returned; mirrored separately from the composed `description`."
+        ),
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Derived from the structured output: missing use-cases.",
+    )
+
+
+# Warning string derived from the structured output. Matches the wording
+# `enrich_drafts` uses (`LLM 生成结果未包含典型用例，请 review 时补充`) so the
+# admin sees the same text whether the rewrite came from the import-time
+# batch or this per-row endpoint. Per-parameter-notes warnings are out of
+# scope for this endpoint — the import-preview batch path carries them.
+_WARNING_MISSING_USE_CASES = "LLM 生成结果未包含典型用例，请 review 时补充。"
+
+
+def _build_draft_from_request(body: GenerateDescriptionRequest) -> ToolDraft:
+    """Materialise a `ToolDraft` from the wire body.
+
+    The single-draft endpoint doesn't reuse `OpenAPIParser` — there is
+    no spec to walk, just fields the admin already has on a preview
+    row. Building the dataclass here keeps the route one-liner-shaped
+    and lets `ToolDescriptionGenerator.generate` apply its existing
+    template-render + parameter-notes + compose logic unchanged.
+
+    The remaining `ToolDraft` fields (`risk_level`, `status`,
+    `source`, `source_ref`, `credentials_ref`, `http_headers`,
+    `http_body_template`, `original_description`,
+    `description_generated`, `original_parameters_schema`,
+    `parameters_schema_generated`, `warnings`) get sentinel values
+    matching what `OpenAPIParser._build_draft` produces — enough for
+    `generate` to render the Prompt and return the structured
+    rewrite. The route never reads them back. `http_url_template` is
+    derived from `operation_ref` because the spec body of #51 doesn't
+    carry the URL separately; `_draft_variables` falls back to it
+    only when `operation_ref` has no path segment, which is unusual
+    but defensive.
+    """
+    _, _, path = body.operation_ref.partition(" ")
+    http_url_template = path or body.operation_ref
+    return ToolDraft(
+        operation_ref=body.operation_ref,
+        name=body.name,
+        description=body.description,
+        risk_level="read",
+        parameters_schema=body.parameters_schema,
+        http_method=body.http_method.upper(),
+        http_url_template=http_url_template,
+        http_headers={"Accept": "application/json"},
+        http_body_template=None,
+        status="draft",
+        source="openapi",
+        source_ref=body.operation_ref.lower(),
+        credentials_ref=None,
+        warnings=[],
+        original_description=None,
+        description_generated=False,
+        original_parameters_schema=None,
+        parameters_schema_generated=False,
+    )
+
+
+def _derive_warnings(generated: GeneratedDescription) -> list[str]:
+    """Translate the structured LLM result into the per-row warning list.
+
+    Mirrors the use-cases rule `enrich_drafts` applies per draft so the
+    admin sees the same wording on the per-row endpoint and the import
+    preview. Per-parameter-notes warnings stay on the batch path only
+    because the per-row response doesn't carry `parameter_notes` (per the
+    spec body's `{description, typical_use_cases, warnings}` shape).
+    Returning a `list` (never `None`) keeps the wire shape uniform —
+    empty list means nothing to flag.
+    """
+    if not generated.typical_use_cases:
+        return [_WARNING_MISSING_USE_CASES]
+    return []
+
+
+@router.post(
+    "/descriptions/generate",
+    response_model=GenerateDescriptionResponse,
+    summary="Regenerate one Tool description with the LLM (admin only)",
+)
+async def generate_description(
+    body: GenerateDescriptionRequest,
+    _admin: User = Depends(require_admin_user),  # noqa: B008
+    generator: ToolDescriptionGenerator = Depends(get_description_generator),  # noqa: B008
+) -> GenerateDescriptionResponse:
+    """`POST /api/v1/admin/tools/descriptions/generate` — T16-followup / #51.
+
+    Single-draft companion to the import-time batch generation in
+    `import_openapi`. Closes the long-tail story the admission T16 / #14
+    left open: drafts the batch skipped (cap hit on imports with more
+    than 32 operations) and rows whose existing LLM rewrite the admin
+    wants to redo. The endpoint returns the rewrite plus the
+    structured fields; the preview UI writes the rewrite back into the
+    textarea and the admin activates through the existing
+    `POST /admin/tools` flow.
+
+    No row is persisted here — the `descriptions/generate` envelope is
+    purely advisory. Activation is still the two-step
+    `create_tool` → `set_status('active')` path T15 / #13 lays out, so
+    the audit hook (T42) and ADR-0018's `draft` review step keep
+    working unchanged.
+
+    Failure mode contract:
+
+    * **LLM not configured / refused (ADR-0016).** Raised as
+      `LLMUnavailableError` (503) rather than the bare 500 the lower-
+      level `LLMConfigurationError` carries, so the admin UI gets an
+      explicit envelope (the `LLMConfigurationError.details` travel
+      through `LLMUnavailableError.details`).
+    * **LLM transport / JSON-contract failure.** Re-raised as
+      `LLMUnavailableError` (503) with the structured `details` from
+      `LLMGenerationError` / `PromptUnavailableError`. The 503 keeps
+      "service temporarily unavailable" semantics; the `code` differs
+      from the not-configured case via the wrapped `details.error_type`
+      so ops can triage.
+    * **Anything outside the AppError envelope.** FastAPI's
+      `BaseException` handler renders the unified `{code, message_zh,
+      message_en, details}` shape so the response is never a bare 500.
+
+    The route delegates the rewrite to
+    `ToolDescriptionGenerator.generate` (single-draft path) — the
+    batch `enrich_drafts` is for the import preview only.
+    """
+    draft = _build_draft_from_request(body)
+    try:
+        generated = await generator.generate(draft)
+    except LLMConfigurationError as exc:
+        # Not-configured / ADR-0016 refusal — the request was understood
+        # but the provider won't serve it. 503 with the original
+        # `details` so the admin can tell which guard tripped.
+        raise LLMUnavailableError(
+            message_zh="LLM 未配置或被禁用，请联系管理员检查 LLM 设置",
+            message_en=(
+                "LLM provider is not configured or was refused; "
+                "check COPILOT_LLM_BASE_URL / COPILOT_LLM_API_KEY"
+            ),
+            details=exc.details or {},
+        ) from exc
+    except (LLMGenerationError, PromptUnavailableError) as exc:
+        raise LLMUnavailableError(
+            message_zh="LLM 生成失败，请稍后重试",
+            message_en="LLM generation failed; please retry",
+            details=exc.details or {"error_type": type(exc).__name__},
+        ) from exc
+
+    return GenerateDescriptionResponse(
+        description=generated.description,
+        typical_use_cases=list(generated.typical_use_cases),
+        warnings=_derive_warnings(generated),
     )
 
 

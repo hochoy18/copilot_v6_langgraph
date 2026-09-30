@@ -1,7 +1,7 @@
 /**
  * Admin OpenAPI import API client — T15 / #13.
  *
- * Three seams on top of `apiFetch`:
+ * Four seams on top of `apiFetch`:
  *
  * 1. `importOpenAPI` — POST /admin/tools/import/openapi. Returns the
  *    preview drafts; the T14 backend never persists anything on this
@@ -20,6 +20,14 @@
  *    admin reviews the LLM rewrite before the row is ever persisted;
  *    the audit hook (T42) still sits between these two calls.
  *
+ * 4. `regenerateDescription` — POST /admin/tools/descriptions/generate
+ *    (T16-followup / #51). Per-row long-tail companion to the import-
+ *    time batch: lets the admin re-run the generator against an
+ *    existing preview row (skipped by the cap, or whose rewrite they
+ *    don't like). The result is advisory; the preview writes it back
+ *    into the textarea and activation still flows through
+ *    `createTool` → `setToolStatus`.
+ *
  * `detectSourceFormat` decides which arm of the discriminated union
  * the request body hits. JSON parses first because the OpenAPI JSON
  * dialect is a strict subset of YAML; if JSON parsing yields an
@@ -33,6 +41,8 @@ import type {
   CreateToolRequestBody,
   ImportOpenAPIRequestBody,
   ImportOpenAPIResponse,
+  RegenerateDescriptionRequestBody,
+  RegenerateDescriptionResponse,
   ToolDraft,
 } from '@/types/openapi-import'
 
@@ -122,6 +132,73 @@ export async function setToolStatus(params: SetToolStatusParams): Promise<Tool> 
     ? { method: 'PATCH', body: JSON.stringify({ status: params.status }), signal: params.signal }
     : { method: 'PATCH', body: JSON.stringify({ status: params.status }) }
   return apiFetch<Tool>(`/admin/tools/${encodeURIComponent(params.id)}`, init)
+}
+
+export interface RegenerateDescriptionParams {
+  body: RegenerateDescriptionRequestBody
+  signal?: AbortSignal
+}
+
+/**
+ * POST /api/v1/admin/tools/descriptions/generate — T16-followup / #51.
+ *
+ * Re-runs the `tool-description-generator` Prompt against a single
+ * preview row's metadata. The body carries the fields the Prompt
+ * consumes (`name` / `operation_ref` / `http_method` /
+ * `http_url_template` / `description` / `parameters_schema` /
+ * `risk_level`) — see `GenerateDescriptionRequest` in
+ * `app.api.admin_tools`.
+ *
+ * The endpoint does not persist anything; the preview writes the
+ * returned `description` (plus the rewritten `parameters_schema`) back
+ * into local row state, and the existing `createTool` path activates it
+ * like any other draft. Failure surfaces as the standard
+ * `llm_unavailable` envelope — the caller renders a one-line error
+ * and leaves the previous description untouched.
+ */
+export async function regenerateDescription(
+  params: RegenerateDescriptionParams,
+): Promise<RegenerateDescriptionResponse> {
+  const init: RequestInit = params.signal
+    ? {
+        method: 'POST',
+        body: JSON.stringify(params.body),
+        signal: params.signal,
+      }
+    : { method: 'POST', body: JSON.stringify(params.body) }
+  return apiFetch<RegenerateDescriptionResponse>(
+    '/admin/tools/descriptions/generate',
+    init,
+  )
+}
+
+/**
+ * Shape the preview row into the body the regenerate endpoint wants.
+ *
+ * `description` is forwarded as the *current* textarea value (which
+ * may be the LLM rewrite, the raw OpenAPI text, or the admin's first
+ * edit) — that lets the admin re-run the generator against their own
+ * pass without going back to the raw text. `operation_ref` is taken
+ * verbatim from the row, matching what the import preview rendered.
+ *
+ * Pulled out of the component so the route stays declarative and
+ * future "regen with override" affordances can layer on top without
+ * touching `OpenAPIImport`. Mirrors the spec body's enumerated fields
+ * (name / method / path / 原始描述 / 参数摘要); the preview row's
+ * `risk_level` and `http_url_template` stay local to the UI — the
+ * spec body didn't ask for them and the activate flow already has
+ * them on hand.
+ */
+export function draftToRegenerateBody(
+  draft: ToolDraft,
+): RegenerateDescriptionRequestBody {
+  return {
+    name: draft.name,
+    operation_ref: draft.operation_ref,
+    http_method: draft.http_method,
+    description: draft.description,
+    parameters_schema: draft.parameters_schema,
+  }
 }
 
 /**

@@ -39,6 +39,8 @@ function makeDraft(overrides: Partial<ToolDraft> = {}): ToolDraft {
     risk_level: 'read',
     status: 'draft',
     parameters_schema: { type: 'object', properties: {}, required: [] },
+    original_parameters_schema: null,
+    parameters_schema_generated: false,
     http_method: 'GET',
     http_url_template: 'https://api.example.com/pets',
     http_headers: { Accept: 'application/json' },
@@ -459,6 +461,139 @@ describe('OpenAPIImport', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('preview-panel')).not.toBeInTheDocument()
     })
+  })
+
+  it('regenerates a description via POST /admin/tools/descriptions/generate and writes it back', async () => {
+    // T16-followup / #51 — preview rows expose a 重新生成 button; clicking
+    // it fires the new per-draft endpoint and writes the rewrite back
+    // into the textarea.
+    const regenerated = {
+      description: '根据编号查询宠物资料\n\n典型用例:\n- 查一下 7 号宠物的信息',
+      typical_use_cases: ['查一下 7 号宠物的信息'],
+      warnings: [],
+    }
+    const fetchMock = mockFetch([
+      jsonResponse(makePreviewResponse([makeDraft()])),
+      jsonResponse(regenerated),
+    ])
+    const user = userEvent.setup()
+    render(<OpenAPIImport />)
+
+    const file = new File(['{"openapi":"3.0.0"}'], 'openapi.json', { type: 'application/json' })
+    await user.upload(screen.getByTestId('file-input'), file)
+    const row = await screen.findByTestId('draft-row-GET /pets')
+    await user.click(screen.getByTestId('draft-regenerate-GET /pets'))
+
+    // Wire contract — POST the spec-stated fields only to the new endpoint.
+    const [regenUrl, regenInit] = fetchMock.mock.calls[1]
+    expect(regenUrl).toBe('/api/v1/admin/tools/descriptions/generate')
+    expect(regenInit?.method).toBe('POST')
+    const sentBody = JSON.parse(regenInit?.body as string)
+    expect(sentBody).toMatchObject({
+      name: 'listPets',
+      operation_ref: 'GET /pets',
+      http_method: 'GET',
+      description: 'List all pets.',
+    })
+    // Spec body explicitly enumerates the request fields; the wire
+    // shape stays narrow (no risk_level / http_url_template).
+    expect(Object.keys(sentBody).sort()).toEqual(
+      ['description', 'http_method', 'name', 'operation_ref', 'parameters_schema'].sort(),
+    )
+
+    // Rewrite lands on the textarea + the badge flips on.
+    await waitFor(() => {
+      const textarea = within(row).getByTestId(
+        'draft-description-GET /pets',
+      ) as HTMLTextAreaElement
+      expect(textarea.value).toContain('根据编号查询宠物资料')
+    })
+    expect(
+      within(row).getByTestId('draft-description-generated-GET /pets'),
+    ).toBeInTheDocument()
+    expect(
+      within(row).getByTestId('draft-status-regenerated'),
+    ).toHaveTextContent('已重新生成描述')
+  })
+
+  it('surfaces an LLM-unavailable envelope as a regen error without mutating the row', async () => {
+    // The route rewraps LLMConfigurationError / LLMGenerationError as
+    // `llm_unavailable` (503). The preview must not crash, must not
+    // blank the existing description, and must surface the typed code.
+    mockFetch([
+      jsonResponse(makePreviewResponse([makeDraft()])),
+      jsonResponse(
+        {
+          code: 'llm_unavailable',
+          message_en: 'LLM provider is not configured or was refused',
+          details: { reason: 'no_train_unsupported' },
+        },
+        503,
+      ),
+    ])
+    const user = userEvent.setup()
+    render(<OpenAPIImport />)
+
+    const file = new File(['{"openapi":"3.0.0"}'], 'openapi.json', { type: 'application/json' })
+    await user.upload(screen.getByTestId('file-input'), file)
+    const row = await screen.findByTestId('draft-row-GET /pets')
+    await user.click(screen.getByTestId('draft-regenerate-GET /pets'))
+
+    const textarea = within(row).getByTestId(
+      'draft-description-GET /pets',
+    ) as HTMLTextAreaElement
+    expect(textarea.value).toBe('List all pets.')
+    expect(
+      within(row).getByTestId('draft-status-regenerating-error'),
+    ).toBeInTheDocument()
+    // The page-level error banner carries the typed envelope.
+    const alert = await screen.findByTestId('parse-error')
+    expect(alert).toHaveTextContent('LLM provider is not configured')
+  })
+
+  it('regen works on a row whose initial LLM pass was skipped by the import cap', async () => {
+    // T16 / #14 caps import-time generation at MAX_DESCRIPTIONS_PER_IMPORT
+    // (ADR-0033). Rows past the cap arrive with `description_generated`
+    // false; a successful regen flips it on so the badge matches, and
+    // the prior raw text shifts onto `original_description` so the
+    // side-by-side review baseline survives (mirrors the import-time
+    // batch invariant).
+    const cappedDraft = makeDraft({
+      description: 'Raw OpenAPI summary.',
+      original_description: null,
+      description_generated: false,
+      parameters_schema_generated: false,
+    })
+    mockFetch([
+      jsonResponse(makePreviewResponse([cappedDraft])),
+      jsonResponse({
+        description: '改写后的描述\n\n典型用例:\n- 用例 1',
+        typical_use_cases: ['用例 1'],
+        warnings: ['LLM 生成结果未包含典型用例，请 review 时补充。'],
+      }),
+    ])
+    const user = userEvent.setup()
+    render(<OpenAPIImport />)
+
+    const file = new File(['{"openapi":"3.0.0"}'], 'openapi.json', { type: 'application/json' })
+    await user.upload(screen.getByTestId('file-input'), file)
+    const row = await screen.findByTestId('draft-row-GET /pets')
+    await user.click(screen.getByTestId('draft-regenerate-GET /pets'))
+
+    await waitFor(() => {
+      expect(
+        within(row).getByTestId('draft-description-generated-GET /pets'),
+      ).toBeInTheDocument()
+    })
+    expect(
+      within(row).getByTestId('draft-status-regenerated'),
+    ).toHaveTextContent('1 个 warning')
+    // Review baseline survived — the raw text now sits on
+    // `original_description` for side-by-side comparison.
+    const original = within(row).getByTestId(
+      'draft-original-description-GET /pets',
+    )
+    expect(original).toHaveTextContent('Raw OpenAPI summary.')
   })
 
   })

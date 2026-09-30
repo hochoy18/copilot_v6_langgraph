@@ -5,7 +5,9 @@ import { ApiError } from '@/lib/api-client'
 import {
   createTool,
   draftToCreateBody,
+  draftToRegenerateBody,
   importOpenAPI,
+  regenerateDescription,
   setToolStatus,
 } from '@/lib/openapi-import-api'
 import type { ToolRiskLevel } from '@/types/tool'
@@ -65,6 +67,9 @@ type SourceTab = 'file' | 'url'
 
 type DraftStatus =
   | { kind: 'idle' }
+  | { kind: 'regenerating' }
+  | { kind: 'regenerated'; warnings: string[] }
+  | { kind: 'regenerating_error' }
   | { kind: 'activating' }
   | { kind: 'active'; toolId: string }
   | { kind: 'error'; message: string }
@@ -285,6 +290,78 @@ export function OpenAPIImport(): React.ReactElement {
     [preview.drafts],
   )
 
+  /**
+   * T16-followup / #51 — re-run the `tool-description-generator` Prompt
+   * against one preview row. The endpoint is advisory (no row is
+   * persisted) so the success path writes the rewrite back into local
+   * draft state and toggles `description_generated` so the badge stays
+   * accurate. The activate flow that ships the rewritten description to
+   * Mongo is the same `createTool` path as before — the regenerate
+   * button is purely a convenience for re-rolling the textarea.
+   *
+   * Spec body says "回填 textarea" — the success path touches
+   * `description` and the `description_generated` flag (so the
+   * "LLM 改写" badge reflects the rewrite), and shifts the previous
+   * textarea value into `original_description` so the admin's side-by-
+   * side review (T16 / #14) keeps a baseline against the latest LLM
+   * pass, mirroring what the import-time batch does. Per-parameter
+   * fields are intentionally left alone — the per-row endpoint
+   * returns `{description, typical_use_cases, warnings}` only.
+   *
+   * The cap-skip case is handled implicitly: a row whose initial
+   * `description_generated` was `false` because the import batch
+   * skipped it (T16 / #14 cap) now flips to `true` after a successful
+   * regen, mirroring what the batch path would have set.
+   */
+  const regenerateDraft = useCallback(
+    async (operationRef: string) => {
+      const draft = preview.drafts.find((d) => d.operation_ref === operationRef)
+      if (!draft) return
+      setPreview((prev) => ({
+        ...prev,
+        statuses: { ...prev.statuses, [operationRef]: { kind: 'regenerating' } },
+      }))
+      try {
+        const result = await regenerateDescription({ body: draftToRegenerateBody(draft) })
+        setPreview((prev) => ({
+          ...prev,
+          drafts: prev.drafts.map((d) =>
+            d.operation_ref === operationRef
+              ? {
+                  ...d,
+                  description: result.description,
+                  description_generated: true,
+                  // Mirror the import-time batch's review-baseline
+                  // invariant: the textarea's previous value (raw text
+                  // on a cap-skip, or the prior rewrite) becomes the
+                  // `original_description` the admin compares against.
+                  original_description: d.description,
+                  warnings: [...d.warnings, ...result.warnings],
+                }
+              : d,
+          ),
+          statuses: {
+            ...prev.statuses,
+            [operationRef]: { kind: 'regenerated', warnings: result.warnings },
+          },
+        }))
+      } catch (err) {
+        setPreview((prev) => ({
+          ...prev,
+          statuses: {
+            ...prev.statuses,
+            [operationRef]: { kind: 'regenerating_error' },
+          },
+        }))
+        // Surface the failure as a transient error in `parseError` so
+        // the admin sees the underlying message. The draft's previous
+        // description is left untouched.
+        setParseError(formatImportError(err))
+      }
+    },
+    [preview.drafts],
+  )
+
   const hasPreview = preview.drafts.length > 0
 
   return (
@@ -403,6 +480,9 @@ export function OpenAPIImport(): React.ReactElement {
         onActivate={(operationRef) => {
           void activateDraft(operationRef)
         }}
+        onRegenerate={(operationRef) => {
+          void regenerateDraft(operationRef)
+        }}
       /> : null}
     </section>
   )
@@ -442,6 +522,7 @@ interface PreviewPanelProps {
   onUpdateDraft: (operationRef: string, patch: Partial<ToolDraft>) => void
   onDiscard: (operationRef: string) => void
   onActivate: (operationRef: string) => void
+  onRegenerate: (operationRef: string) => void
 }
 
 function PreviewPanel({
@@ -449,6 +530,7 @@ function PreviewPanel({
   onUpdateDraft,
   onDiscard,
   onActivate,
+  onRegenerate,
 }: PreviewPanelProps): React.ReactElement {
   return (
     <div className="flex flex-col gap-4" data-testid="preview-panel">
@@ -473,6 +555,7 @@ function PreviewPanel({
             onUpdate={onUpdateDraft}
             onDiscard={onDiscard}
             onActivate={onActivate}
+            onRegenerate={onRegenerate}
           />
         ))}
       </ul>
@@ -518,6 +601,7 @@ interface DraftRowProps {
   onUpdate: (operationRef: string, patch: Partial<ToolDraft>) => void
   onDiscard: (operationRef: string) => void
   onActivate: (operationRef: string) => void
+  onRegenerate: (operationRef: string) => void
 }
 
 function DraftRow({
@@ -526,8 +610,16 @@ function DraftRow({
   onUpdate,
   onDiscard,
   onActivate,
+  onRegenerate,
 }: DraftRowProps): React.ReactElement {
-  const disabled = status.kind === 'activating' || status.kind === 'active'
+  // Activate + discard lock the row once they're in flight (the create
+  // tool POST is already using the textarea / row state); the
+  // regenerate button additionally locks on its own in-flight status so
+  // a re-roll doesn't overlap itself.
+  const busy =
+    status.kind === 'activating' || status.kind === 'active' || status.kind === 'regenerating'
+  const regenerateDisabled = status.kind === 'regenerating'
+  const disabled = busy
   return (
     <li
       data-testid={`draft-row-${draft.operation_ref}`}
@@ -638,6 +730,16 @@ function DraftRow({
         <Button
           type="button"
           size="sm"
+          variant="outline"
+          disabled={regenerateDisabled}
+          onClick={() => onRegenerate(draft.operation_ref)}
+          data-testid={`draft-regenerate-${draft.operation_ref}`}
+        >
+          {status.kind === 'regenerating' ? '生成中…' : '重新生成'}
+        </Button>
+        <Button
+          type="button"
+          size="sm"
           disabled={disabled}
           onClick={() => onActivate(draft.operation_ref)}
           data-testid={`draft-activate-${draft.operation_ref}`}
@@ -666,6 +768,37 @@ function DraftRow({
 
 function DraftStatus({ status }: { status: DraftStatus }): React.ReactElement | null {
   if (status.kind === 'idle') return null
+  if (status.kind === 'regenerating') {
+    return (
+      <span
+        data-testid="draft-status-regenerating"
+        className="text-xs text-muted-foreground"
+      >
+        重新生成中…
+      </span>
+    )
+  }
+  if (status.kind === 'regenerated') {
+    return (
+      <span
+        data-testid="draft-status-regenerated"
+        className="text-xs text-primary"
+      >
+        已重新生成描述{status.warnings.length > 0 ? ` (${status.warnings.length} 个 warning)` : ''}
+      </span>
+    )
+  }
+  if (status.kind === 'regenerating_error') {
+    return (
+      <span
+        role="alert"
+        data-testid="draft-status-regenerating-error"
+        className="text-xs text-destructive"
+      >
+        重新生成失败(请查看顶部提示,描述保持原值)
+      </span>
+    )
+  }
   if (status.kind === 'activating') {
     return (
       <span

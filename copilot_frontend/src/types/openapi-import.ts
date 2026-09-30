@@ -56,6 +56,8 @@ export interface ToolDraft {
   risk_level: ToolRiskLevel
   status: ToolStatus
   parameters_schema: Record<string, unknown>
+  original_parameters_schema: Record<string, unknown> | null
+  parameters_schema_generated: boolean
   http_method: string
   http_url_template: string
   http_headers: Record<string, string>
@@ -106,4 +108,45 @@ export interface CreateToolRequestBody {
   source?: 'openapi' | 'manual'
   source_ref?: string | null
   credentials_ref?: string | null
+}
+
+/**
+ * Body of `POST /api/v1/admin/tools/descriptions/generate` —
+ * T16-followup / #51.
+ *
+ * Long-tail companion to the import-time batch generation. The
+ * spec body of #51 enumerates "name / method / path / 原始描述 /
+ * 参数摘要"; the body shape here is exactly that. The preview UI
+ * forwards the row's existing fields; the backend reuses the same
+ * `tool-description-generator` Prompt.
+ *
+ * `description` is the text the LLM rewrites — usually the raw
+ * OpenAPI summary, but an admin who has already typed their own
+ * pass can also re-run the generator against their draft. `risk_level`
+ * and `http_url_template` are deliberately omitted: the spec didn't
+ * ask, and the preview row already carries them locally for the
+ * activate flow.
+ */
+export interface RegenerateDescriptionRequestBody {
+  name: string
+  operation_ref: string
+  http_method: string
+  description: string
+  parameters_schema: Record<string, unknown>
+}
+
+/**
+ * Wire shape of `POST /api/v1/admin/tools/descriptions/generate`.
+ *
+ * Spec-pinned to `{description, typical_use_cases, warnings}` — the
+ * per-row endpoint is description-only; per-parameter notes stay on
+ * the import-preview batch (T16-followup / #50). The preview UI
+ * writes `description` back into the textarea, renders `warnings`
+ * next to the row, and shows the 典型用例 section as part of the
+ * rewritten text.
+ */
+export interface RegenerateDescriptionResponse {
+  description: string
+  typical_use_cases: string[]
+  warnings: string[]
 }
