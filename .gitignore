@@ -9,3 +9,8 @@ __pycache__/
 *.egg-info/
 .env
 .env.local
+# T42 / #37 — local-filesystem audit cold-storage default
+# (settings.audit_cold_storage_dir, default ./data/audit_cold).
+# Production deployments swap to S3 / OSS / KMS-backed storage;
+# keep the dev directory out of git either way.
+data/

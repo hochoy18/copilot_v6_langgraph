@@ -213,6 +213,9 @@ class TestInitDatabase:
             "by_actor_id",
             "by_tool_name",
             "by_occurred_at",
+            # T42 / #37 — compound (lifecycle_status, occurred_at) covers
+            # the cold-storage sweep's hot query (ADR-0028).
+            "retention_sweep_by_lifecycle_time",
         }
 
     @pytest.mark.asyncio

@@ -145,6 +145,79 @@ class Settings(BaseSettings):
             "needs idle / archive transitions frozen in time)."
         ),
     )
+
+    # ---- Audit log retention (T42 / #37, ADR-0028) ----------------------
+    # Audit rows migrate from hot (Mongo) to cold (encrypted blobs on
+    # disk / S3 / etc.) once they're older than `audit_hot_retention_seconds`
+    # — the canonical default matches ADR-0028's "1 year hot + 3 years
+    # cold = 4 years total" wording. Operators in regulated environments
+    # (finance / medical) can lift the hot window to keep a larger hot
+    # working set, or shorten it when the cold backend is cheaper than the
+    # Mongo tier.
+    #
+    # Sweep cadence stays deliberately coarser than the conversation
+    # lifecycle (daily vs. 60 s) because the migration is an
+    # archival-quality operation: a 24 h lag between a row crossing the
+    # 1-year boundary and the next sweep tick is acceptable, and running
+    # it more often only churns Mongo without changing the answer.
+    audit_hot_retention_seconds: int = Field(
+        default=31_536_000,  # 365 days (1 year)
+        ge=86_400,  # floor: at least 1 day so the sweep has a meaningful boundary
+        le=157_680_000,  # ceiling: 5 years (longer than the total 4-year default)
+        description=(
+            "Hot-tier window for `audit_logs` (ADR-0028). Active "
+            "rows older than this migrate to cold storage on the "
+            "next sweep tick. Default 31_536_000s (365 days, 1 year)."
+        ),
+    )
+    audit_cold_total_retention_seconds: int = Field(
+        default=126_144_000,  # 1461 days (4 years: 1 hot + 3 cold)
+        ge=86_400,
+        le=630_720_000,  # ceiling: 20 years (medical-grade retention)
+        description=(
+            "Total retention window for `audit_logs` (ADR-0028). "
+            "Operator-facing knob for regulated environments "
+            "(finance 5+ years / medical 6+ years per ADR-0028 §6). "
+            "The hot tier + cold tier together cover this span; the "
+            "actual blob expiry is the cold-storage backend's job "
+            "(S3 lifecycle policy, OSS rule, etc.) per ADR-0028 §5. "
+            "Default 126_144_000s (1461 days, 4 years)."
+        ),
+    )
+    audit_cold_sweep_interval_seconds: float = Field(
+        default=86_400.0,  # daily per ADR-0028
+        ge=60.0,
+        le=86_400.0,
+        description=(
+            "How often the cold-storage sweep runs. ADR-0028 fixes "
+            "the default at daily (86_400s); tightening is safe but "
+            "won't change correctness — only churn Mongo. Default "
+            "86_400s."
+        ),
+    )
+    audit_retention_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for the audit cold-storage sweep. `False` "
+            "skips the background task entirely (useful for unit "
+            "tests and single-shot CLI runs that don't want the "
+            "scheduler to touch cold storage)."
+        ),
+    )
+    audit_cold_storage_dir: str = Field(
+        default="./data/audit_cold",
+        min_length=1,
+        max_length=4096,
+        description=(
+            "Root directory for the local-filesystem cold-storage "
+            "implementation (`FileAuditColdStorage`). Each archived "
+            "audit row is written as one encrypted blob under a "
+            "stable subpath derived from its primary key. Production "
+            "deployments swap the cold-storage impl to an S3 / OSS "
+            "client; the directory setting is unused when no file "
+            "backend is wired."
+        ),
+    )
     memory_window_k: int = Field(
         default=5,
         ge=1,

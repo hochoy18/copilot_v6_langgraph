@@ -20,10 +20,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.answer.generator import AnswerGenerator
+from app.api.admin_audit import router as admin_audit_router
 from app.api.admin_tools import router as admin_tools_router
 from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
+from app.audit.cold_storage import FileAuditColdStorage
+from app.audit.retention import AuditRetentionScheduler
 from app.auth.login import build_state_store
 from app.auth.oidc import OIDCAdapter
 from app.conversations.lifecycle import ConversationLifecycleScheduler
@@ -37,6 +40,7 @@ from app.memory.recall import InMemoryMilvusReader
 from app.planner.planner import ToolPlanner
 from app.realtime.bus import SseEventBus
 from app.realtime.stream import router as sse_router
+from app.repositories.audit_logs import AuditLogRepository
 from app.repositories.conversations import ConversationRepository
 from app.security.crypto import CredentialEncryptor
 from app.security.keys import build_credential_encryptor
@@ -169,11 +173,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         conversation_repository=ConversationRepository(mongo.database),
     )
     app.state.conversation_lifecycle_scheduler = lifecycle_scheduler
+    # T42 / #37 — audit cold-storage sweep. Same pattern as T39's
+    # conversation lifecycle: lifespan owns one sweep loop, cancelled
+    # in the `finally` so the window is clean. The cold-storage
+    # backend is the local-filesystem default — deployments swap in
+    # an S3 / OSS / KMS-backed client here without changing the
+    # scheduler. The scheduler honors `audit_retention_enabled`, so
+    # test suites that boot the lifespan but want a frozen clock
+    # can disable the background task outright.
+    audit_cold_storage = FileAuditColdStorage(settings.audit_cold_storage_dir)
+    audit_retention_scheduler = AuditRetentionScheduler.from_settings(
+        settings=settings,
+        audit_repository=AuditLogRepository(mongo.database),
+        cold_storage=audit_cold_storage,
+        encryptor=encryptor,
+    )
+    app.state.audit_cold_storage = audit_cold_storage
+    app.state.audit_retention_scheduler = audit_retention_scheduler
     try:
         await _probe_dependencies(settings)
         await lifecycle_scheduler.start()
+        await audit_retention_scheduler.start()
         yield
     finally:
+        await audit_retention_scheduler.stop()
         await lifecycle_scheduler.stop()
         await oidc_adapter.aclose()
         await prompt_http_client.aclose()
@@ -234,6 +257,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # so the OpenAPI tag order reads auth → admin-tools; load order
     # has no runtime effect.
     app.include_router(admin_tools_router)
+    # T42 / #37 — admin audit log surface (`GET …/audit-logs`,
+    # `POST …/audit-logs/{id}/recall`). Lives after
+    # `admin_tools_router` so the OpenAPI tag order reads
+    # auth → admin-tools → admin-audit; load order has no runtime
+    # effect.
+    app.include_router(admin_audit_router)
 
     # Unified error contract (ADR-0031).
     register_exception_handlers(app)

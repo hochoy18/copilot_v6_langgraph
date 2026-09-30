@@ -251,6 +251,12 @@ PLAN_EXECUTION_INDEXES: list[IndexModel] = [
 # range). For T06 we cover the four FK lookups + a time index
 # (per-tenant "list my audit rows this month" scans); retention
 # sweeps and recall land with T42 and add their own indexes here.
+#
+# `retention_sweep_by_lifecycle_time` covers the cold-storage sweep's
+# hot query (`lifecycle_status == "active"` + `occurred_at` range) so
+# the daily migration of >1-year rows stays an index scan even on a
+# 4-year-old corpus. `lifecycle_status` leads because it's the equality
+# predicate; `occurred_at` then orders the rows that survive the filter.
 AUDIT_LOG_INDEXES: list[IndexModel] = [
     IndexModel([("conversation_id", ASCENDING)], name="by_conversation_id"),
     IndexModel([("turn_id", ASCENDING)], name="by_turn_id"),
@@ -258,6 +264,10 @@ AUDIT_LOG_INDEXES: list[IndexModel] = [
     IndexModel([("actor_id", ASCENDING)], name="by_actor_id"),
     IndexModel([("tool_name", ASCENDING)], name="by_tool_name"),
     IndexModel([("occurred_at", DESCENDING)], name="by_occurred_at"),
+    IndexModel(
+        [("lifecycle_status", ASCENDING), ("occurred_at", DESCENDING)],
+        name="retention_sweep_by_lifecycle_time",
+    ),
 ]
 
 

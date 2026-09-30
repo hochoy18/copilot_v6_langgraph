@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from fastapi import Depends, Request
@@ -23,6 +23,8 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.answer.generator import AnswerGenerator
 from app.answer.service import AnswerService
+from app.audit.cold_storage import AuditColdStorage
+from app.audit.retention import AuditRetentionService
 from app.auth.local import LocalLoginService
 from app.auth.login import OIDCLoginService, OIDCStateStore
 from app.auth.oidc import OIDCAdapter
@@ -148,6 +150,64 @@ def get_audit_log_repository(
 ) -> AuditLogRepository:
     """FastAPI dependency: build an `AuditLogRepository` for this request."""
     return AuditLogRepository(db)
+
+
+# ---------------------------------------------------------------------------
+# Audit retention (T42 / #37)
+# ---------------------------------------------------------------------------
+
+
+def get_audit_cold_storage(request: Request) -> AuditColdStorage:
+    """FastAPI dependency: return the lifespan-built cold-storage backend.
+
+    The lifespan instantiates `FileAuditColdStorage` (or a
+    deployment-specific swap) and stashes it on `app.state`.
+    Tests override this dependency to swap in a stub; production
+    uses the lifespan-built instance.
+
+    The fallback path raises an `AppError` matching the rest of
+    the codebase's envelope contract rather than a raw
+    `HTTPException` so a missing lifespan-installed backend doesn't
+    bypass the global error handler.
+    """
+    from app.exceptions import AppError
+
+    existing = getattr(request.app.state, "audit_cold_storage", None)
+    if existing is not None:
+        # The cast narrows the static `Any` returned by `getattr`
+        # so mypy sees the typed `AuditColdStorage` interface
+        # rather than `Any`; the `is not None` guard above gives the
+        # runtime confidence.
+        return cast("AuditColdStorage", existing)
+    raise AppError(  # pragma: no cover — defensive
+        code="audit_cold_storage_not_initialised",
+        message_zh="审计冷存未初始化",
+        message_en="Audit cold storage not initialised; missing lifespan?",
+        details={},
+    )
+
+
+def get_audit_retention_service(
+    repo: AuditLogRepository = Depends(get_audit_log_repository),  # noqa: B008
+    cold_storage: AuditColdStorage = Depends(get_audit_cold_storage),  # noqa: B008
+    encryptor: CredentialEncryptor = Depends(get_credential_encryptor),  # noqa: B008
+    settings: Settings = Depends(get_settings),  # noqa: B008
+) -> AuditRetentionService:
+    """FastAPI dependency: build an `AuditRetentionService` per request.
+
+    Composes the four collaborators the service needs (audit repo,
+    cold storage backend, encryptor, retention-window setting). A
+    fresh instance per request is fine — the service holds no
+    I/O buffers beyond the collaborator references. Tests override
+    the dependency to inject a fake-clock service without booting
+    the lifespan scheduler.
+    """
+    return AuditRetentionService(
+        audit_repository=repo,
+        cold_storage=cold_storage,
+        encryptor=encryptor,
+        hot_retention_seconds=settings.audit_hot_retention_seconds,
+    )
 
 
 # ---------------------------------------------------------------------------
