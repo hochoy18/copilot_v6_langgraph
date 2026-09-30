@@ -1,22 +1,26 @@
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
 
+import { AuditLogsTable } from '@/components/admin/AuditLogsTable'
 import { OpenAPIImport } from '@/components/admin/OpenAPIImport'
 import { ToolsTable } from '@/components/admin/ToolsTable'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
 /**
- * Admin shell — T13 / #42 + T15 / #13 (and future admin tickets).
+ * Admin shell — T13 / #42 + T15 / #13 + T43 / #38 (and future
+ * admin tickets).
  *
  * Routes:
  * - `/admin`               — landing summary.
  * - `/admin/tools`         — Tool Registry table (T13).
  * - `/admin/tools/import`  — OpenAPI import preview (T15).
+ * - `/admin/audit-logs`    — Audit log filter table + 调档
+ *                            (T43 / ADR-0028).
  *
- * Each future admin surface (audit log, alerts) lands as a sibling
- * route, keeping `AdminPage.tsx` as the chrome (top nav, layout)
- * only. Pages stay free to assume their own layout needs without
- * inheriting sibling structure.
+ * Each future admin surface lands as a sibling route, keeping
+ * `AdminPage.tsx` as the chrome (top nav, layout) only. Pages stay
+ * free to assume their own layout needs without inheriting sibling
+ * structure.
  */
 export function AdminPage(): React.ReactElement {
   return (
@@ -30,12 +34,14 @@ export function AdminPage(): React.ReactElement {
           <AdminNavLink to="/admin">总览</AdminNavLink>
           <AdminNavLink to="/admin/tools">Tool Registry</AdminNavLink>
           <AdminNavLink to="/admin/tools/import">OpenAPI 导入</AdminNavLink>
+          <AdminNavLink to="/admin/audit-logs">审计日志</AdminNavLink>
         </nav>
       </header>
       <Routes>
         <Route index element={<AdminOverview />} />
         <Route path="tools" element={<ToolsTable />} />
         <Route path="tools/import" element={<OpenAPIImport />} />
+        <Route path="audit-logs" element={<AuditLogsTable />} />
       </Routes>
     </main>
   )
@@ -77,6 +83,9 @@ function AdminOverview(): React.ReactElement {
       </Button>
       <Button asChild variant="outline">
         <Link to="/admin/tools/import">从 OpenAPI spec 导入 Tool</Link>
+      </Button>
+      <Button asChild variant="outline">
+        <Link to="/admin/audit-logs">查看审计日志</Link>
       </Button>
     </section>
   )
