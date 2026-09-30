@@ -31,6 +31,7 @@ from app.security.crypto import AesGcmEncryptor, MasterKey
 from app.tools.worker import (
     DEFAULT_TIMEOUT_SECONDS,
     READ_MAX_RETRIES,
+    RETRY_BACKOFF_CAP_SECONDS,
     RETRY_BACKOFF_SECONDS,
     ToolWorker,
 )
@@ -697,6 +698,269 @@ class TestTimeout:
         details = exc_info.value.details
         assert details is not None
         assert details["cause"]["code"] == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# Timeout × risk-level retry matrix (T35 / #31 — ADR-0026)
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutRetryByRiskLevel:
+    """T35 / #31 — timeout follows the ADR-0017 risk-level matrix.
+
+    Acceptance criteria:
+
+    * read + timeout → retry up to 2 times, then escalate with `code=timeout`.
+    * write / destructive + timeout → stop immediately, no retry.
+
+    The retry logic doesn't distinguish 5xx from timeout — both flow
+    through the same retryable branch in `_call_with_retry`. These
+    tests pin that behaviour so a future refactor can't silently
+    demote timeouts to non-retryable (which would turn transient
+    upstream slowness into a permanent failure).
+    """
+
+    async def test_read_class_retries_on_timeout_then_succeeds(
+        self,
+        credential_repo: CredentialRepository,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """read + intermittent timeout → 1 initial + 2 retries, then succeed."""
+        call_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                raise httpx.TimeoutException("simulated")
+            return httpx.Response(200, json={"echo": "ok"})
+
+        async def _no_sleep(_: float) -> None:
+            return None
+
+        monkeypatch.setattr("app.tools.worker.asyncio.sleep", _no_sleep)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            w = ToolWorker(
+                credential_repository=credential_repo,
+                http_client=client,
+                timeout_seconds=0.01,
+            )
+            result = await w.execute_with_credential(
+                plan_id="p",
+                node=_echo_node({"text": "x"}),
+                snapshot=_echo_snapshot(),  # risk_level=read
+                actor_id="u",
+                credential_ref=None,
+            )
+        # 1 initial + 2 retries = 3 calls; succeeded on the third.
+        assert call_count["n"] == 1 + READ_MAX_RETRIES
+        assert result.status == "succeeded"
+        assert result.retry_count == READ_MAX_RETRIES
+
+    async def test_read_class_exhausts_timeout_retries_then_escalates_to_hitl(
+        self,
+        credential_repo: CredentialRepository,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """read + persistent timeout → 3 attempts, escalate with code='timeout'."""
+        call_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count["n"] += 1
+            raise httpx.TimeoutException("simulated")
+
+        async def _no_sleep(_: float) -> None:
+            return None
+
+        monkeypatch.setattr("app.tools.worker.asyncio.sleep", _no_sleep)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            w = ToolWorker(
+                credential_repository=credential_repo,
+                http_client=client,
+                timeout_seconds=0.01,
+            )
+            with pytest.raises(HITLRequiredError) as exc_info:
+                await w.execute_with_credential(
+                    plan_id="p",
+                    node=_echo_node({"text": "x"}),
+                    snapshot=_echo_snapshot(),
+                    actor_id="u",
+                    credential_ref=None,
+                )
+        # T35 / #31 — read exhausted, hit HITL with `code=timeout`.
+        assert call_count["n"] == 1 + READ_MAX_RETRIES
+        details = exc_info.value.details
+        assert details is not None
+        assert details["cause"]["code"] == "timeout"
+        # The attempts log captures every observed timeout — Planner
+        # / audit UI can show how long the upstream was unresponsive.
+        # 3 attempts total: 1 initial + 2 retries.
+        attempts = details["attempts"]
+        assert len(attempts) == 1 + READ_MAX_RETRIES
+        assert all(a["error"] == "timeout" for a in attempts)
+
+    async def test_write_class_stops_on_timeout_no_retry(
+        self,
+        credential_repo: CredentialRepository,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """write + timeout → exactly 1 attempt, then HITL with code='timeout'.
+
+        Per ADR-0017 the write class never auto-retries — a second
+        POST could re-create the row the user already saw fail, and
+        we don't want to double-charge. T35 / #31 pins this for the
+        timeout path specifically.
+        """
+        call_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count["n"] += 1
+            raise httpx.TimeoutException("simulated")
+
+        async def _no_sleep(_: float) -> None:
+            return None
+
+        monkeypatch.setattr("app.tools.worker.asyncio.sleep", _no_sleep)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            w = ToolWorker(
+                credential_repository=credential_repo,
+                http_client=client,
+                timeout_seconds=0.01,
+            )
+            with pytest.raises(HITLRequiredError) as exc_info:
+                await w.execute_with_credential(
+                    plan_id="p",
+                    node=PlanNode(
+                        node_id="n1",
+                        tool="create_invoice",
+                        parameters={"amount": 100, "customer": "ACME"},
+                    ),
+                    snapshot=_write_snapshot(),
+                    actor_id="u",
+                    credential_ref=None,
+                )
+        # write: exactly one attempt, no retry.
+        assert call_count["n"] == 1
+        details = exc_info.value.details
+        assert details is not None
+        assert details["risk_level"] == "write"
+        assert details["cause"]["code"] == "timeout"
+        # write / destructive don't accumulate an `attempts` array —
+        # they fail on the first call and the human decides from
+        # there.
+        assert "attempts" not in details
+
+    async def test_destructive_class_stops_on_timeout_no_retry(
+        self,
+        credential_repo: CredentialRepository,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """destructive + timeout → exactly 1 attempt, then HITL with code='timeout'."""
+        call_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count["n"] += 1
+            raise httpx.TimeoutException("simulated")
+
+        async def _no_sleep(_: float) -> None:
+            return None
+
+        monkeypatch.setattr("app.tools.worker.asyncio.sleep", _no_sleep)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            w = ToolWorker(
+                credential_repository=credential_repo,
+                http_client=client,
+                timeout_seconds=0.01,
+            )
+            with pytest.raises(HITLRequiredError) as exc_info:
+                await w.execute_with_credential(
+                    plan_id="p",
+                    node=PlanNode(
+                        node_id="n1",
+                        tool="purge_account",
+                        parameters={"account_id": "acct-123"},
+                    ),
+                    snapshot=_destructive_snapshot(),
+                    actor_id="u",
+                    credential_ref=None,
+                )
+        assert call_count["n"] == 1
+        details = exc_info.value.details
+        assert details is not None
+        assert details["risk_level"] == "destructive"
+        assert details["cause"]["code"] == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# Exponential backoff schedule (T35 / #31 — ADR-0017 §1)
+# ---------------------------------------------------------------------------
+
+
+class TestExponentialBackoffSchedule:
+    """T35 / #31 — backoff is 1s → 2s → 4s, capped at 8s.
+
+    The schedule is private to `_backoff`; these tests pin it so an
+    off-by-one (e.g. `2 ** attempt` instead of `2 ** (attempt-1)`)
+    can't silently shift the curve. We invoke `_backoff` directly
+    with a stub `asyncio.sleep` that records the requested delay
+    rather than waiting.
+    """
+
+    async def test_backoff_schedule_1_2_4_then_cap(
+        self,
+        credential_repo: CredentialRepository,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # `_backoff` is pure — it only touches `asyncio.sleep`. We
+        # give the Worker a placeholder http client so the constructor
+        # accepts it; the client is never invoked by this test.
+        worker = ToolWorker(
+            credential_repository=credential_repo,
+            http_client=httpx.AsyncClient(),
+        )
+        delays: list[float] = []
+
+        async def _record_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        # `_backoff` reads `asyncio.sleep` from the module scope; the
+        # cleanest way to stub it is `monkeypatch.setattr` on the
+        # module — `app.tools.worker.asyncio` works because the import
+        # statement puts the module reference on the module's globals.
+        monkeypatch.setattr("app.tools.worker.asyncio.sleep", _record_sleep)
+        for attempt in (1, 2, 3, 4, 5):
+            await worker._backoff(attempt)
+
+        # T35 / #31 — exponential 1s → 2s → 4s, then the 8s cap
+        # absorbs attempt 4 (8 * 1) and any deeper attempt.
+        assert delays == [1.0, 2.0, 4.0, 8.0, 8.0]
+        # Pin the cap constant too — an admin changing the global
+        # `RETRY_BACKOFF_CAP_SECONDS` should break this test loudly.
+        assert RETRY_BACKOFF_CAP_SECONDS == 8.0
+
+    async def test_backoff_uses_capped_formula(
+        self,
+        credential_repo: CredentialRepository,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sanity check: a very large attempt number never exceeds the cap."""
+        worker = ToolWorker(
+            credential_repository=credential_repo,
+            http_client=httpx.AsyncClient(),
+        )
+        delays: list[float] = []
+
+        async def _record_sleep(delay: float) -> None:
+            delays.append(delay)
+
+        monkeypatch.setattr("app.tools.worker.asyncio.sleep", _record_sleep)
+        for attempt in (10, 20):
+            await worker._backoff(attempt)
+
+        assert delays == [RETRY_BACKOFF_CAP_SECONDS, RETRY_BACKOFF_CAP_SECONDS]
 
 
 # ---------------------------------------------------------------------------
