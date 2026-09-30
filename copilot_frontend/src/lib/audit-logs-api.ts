@@ -39,9 +39,9 @@ const DEFAULT_LIMIT = 50
 
 /**
  * Build the query string for the audit-log list endpoint.
- * Pulled out so `fetchAuditLogs` and the test can both inspect the
- * exact URL contract — `URLSearchParams.toString()`'s encoding is
- * the source of truth for which keys reach the wire.
+ * Pulled out so `fetchAuditLogsPage` and the test can both inspect
+ * the exact URL contract — `URLSearchParams.toString()`'s encoding
+ * is the source of truth for which keys reach the wire.
  */
 function buildAuditLogsSearch(params: FetchAuditLogsParams): string {
   const search = new URLSearchParams()
